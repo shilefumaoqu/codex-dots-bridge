@@ -1,0 +1,14 @@
+[
+  {
+    "path": "licenses/standardwebhooks-1.0.0-LICENSE",
+    "source": "https://raw.githubusercontent.com/standard-webhooks/standard-webhooks/929bf0c1928b188287eaf88d0a9f0a4e87df6499/libraries/LICENSE",
+    "name": "standardwebhooks",
+    "version": "1.0.0"
+  },
+  {
+    "path": "licenses/abstract-logging-2.0.1-LICENSE.html",
+    "source": "https://jsumners.mit-license.org/",
+    "name": "abstract-logging",
+    "version": "2.0.1"
+  }
+]

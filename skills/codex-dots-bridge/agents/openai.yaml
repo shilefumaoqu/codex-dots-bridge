@@ -1,0 +1,6 @@
+interface:
+  display_name: "Codex Dots Bridge"
+  short_description: "向自己的 Dot 委派任务，保留任务身份，处理澄清、结果取回和协作取消"
+  default_prompt: "使用 $codex-dots-bridge 把这个任务交给我的 Dot，并按原任务 ID 取回结果。"
+policy:
+  allow_implicit_invocation: true

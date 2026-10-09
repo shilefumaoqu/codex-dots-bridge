@@ -1,0 +1,52 @@
+name: Windows validation
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+          cache: npm
+      - name: Private runtime and dependencies
+        shell: pwsh
+        run: |
+          ./scripts/bootstrap.ps1
+          ./scripts/dev.ps1 install
+      - name: Prepare required Codex CLI maintenance coverage
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $codexDir = Join-Path $env:RUNNER_TEMP ('codex-dots-ci-codex-' + [Guid]::NewGuid().ToString('N'))
+          npm.cmd install --prefix $codexDir --cache (Join-Path $codexDir 'npm-cache') --ignore-scripts --no-save --package-lock=false --no-audit --no-fund --registry=https://registry.npmjs.org '@openai/codex-win32-x64@npm:@openai/codex@0.162.0-alpha.2-win32-x64'
+          if ($LASTEXITCODE -ne 0) { throw 'Required official Codex CLI installation failed.' }
+          $codexExe = Join-Path $codexDir 'node_modules\@openai\codex-win32-x64\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
+          if (-not (Test-Path -LiteralPath $codexExe -PathType Leaf)) { throw 'Required Windows x64 Codex executable is missing.' }
+          $version = & $codexExe --version
+          if ($LASTEXITCODE -ne 0 -or $version -ne 'codex-cli 0.162.0-alpha.2') { throw 'Required Codex CLI version mismatch.' }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "CODEX_DOTS_TEST_CODEX=$codexExe" -Encoding utf8
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CODEX_DOTS_REQUIRE_CODEX_TESTS=1' -Encoding utf8
+      - name: Public source checks
+        shell: pwsh
+        run: ./.runtime/node-v24.21.0-win-x64/node.exe scripts/check-release.mjs
+      - name: Build and test
+        shell: pwsh
+        run: |
+          ./scripts/dev.ps1 build
+          ./scripts/test-ci.ps1
+      - name: Package Windows artifact
+        shell: pwsh
+        run: ./scripts/package.ps1 -IncludeTunnel -SkipTests
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-candidate
+          path: |
+            artifacts/private/packages/*.zip
+            artifacts/private/packages/*.sha256
+          retention-days: 14
