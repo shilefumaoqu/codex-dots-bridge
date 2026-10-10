@@ -170,6 +170,15 @@ try {
   }
   $checks.Add('running_owned_maintenance_and_uninstall_preflight_remain_read_only')
   Bridge @('run','--stop','--data-dir',$data) | Out-Null
+  $modeManifest=[IO.File]::ReadAllText((Join-Path $data 'installation.json'))
+  $modeToml=[IO.File]::ReadAllText((Join-Path $CodexDirectory 'config.toml'))
+  foreach($mode in @('read','read-send','off')) {
+    Bridge @('setup','--no-register','--data-dir',$data,'--codex-home',$CodexDirectory,'--desktop-access',$mode) | Out-Null
+    $modeConfig=Get-Content -LiteralPath (Join-Path $data 'desktop-conversations.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Assert-Condition ($modeConfig.mode -eq 'local' -and $modeConfig.enabled -eq ($mode -ne 'off') -and $modeConfig.read -eq ($mode -ne 'off') -and $modeConfig.send -eq ($mode -eq 'read-send')) 'Documented desktop access mode was not applied.'
+    Assert-Condition ([IO.File]::ReadAllText((Join-Path $data 'installation.json')) -ceq $modeManifest -and [IO.File]::ReadAllText((Join-Path $CodexDirectory 'config.toml')) -ceq $modeToml) 'Desktop access maintenance changed MCP registration or installation identity.'
+  }
+  $checks.Add('documented_desktop_access_modes_preserve_registration')
   Bridge @('setup','--data-dir',$data,'--codex-home',$CodexDirectory,'--codex-command',$CodexCommand,'--desktop-access','read') | Out-Null
   $desktopPath=Join-Path $data 'desktop-conversations.json'; $desktop=[IO.File]::ReadAllText($desktopPath)
   $node=Join-Path $state.payload_root 'runtime\node-v24.21.0-win-x64\node.exe'

@@ -35,7 +35,7 @@ Rejected 'program_inside_data_directory' 'data_program_path_overlap' (Join-Path 
 # Exercise the exact lifecycle functions against locally compiled, synthetic native CLIs.
 $selectionErrors=$null;$selectionTokens=$null
 $selectionAst=[Management.Automation.Language.Parser]::ParseFile($script,[ref]$selectionTokens,[ref]$selectionErrors)
-foreach($name in @('Assert-SafePath','Runtime-Node','Write-Json','Read-Json','Assert-State','Assert-OldCliIdentity','Test-CodexCommand','Rollback-CodexCommand','Read-FallbackState','Rollback-Transaction')) {
+foreach($name in @('Assert-SafePath','Runtime-Node','Write-Json','Read-Json','Assert-State','Assert-OldCliIdentity','Test-CodexCommand','Rollback-CodexCommand','Read-FallbackState','Resolve-OldRuntimeRoot','Rollback-Transaction')) {
   $definition=$selectionAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
   if(-not $definition) { throw ('Lifecycle function missing: '+$name) }
   . ([ScriptBlock]::Create($definition.Extent.Text))

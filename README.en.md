@@ -35,7 +35,7 @@ Supports one local user, one existing Dot and a single FIFO task execution slot.
 2. Select this version’s Setup and checksum files from [Releases](https://github.com/shilefumaoqu/codex-dots-bridge/releases), verify the source and SHA256 and double-click Setup in a normal user session. Use the actual asset names and acceptance record in that Release.
 3. After local initialization, open “Codex Dots Bridge → 首次连接与维护” (First connection and maintenance) from the Start menu to continue configuring your own official account, Tunnel, dedicated runtime key, private plugin and Dot subscription. You do not need to locate Node yourself. Missing configuration leaves the connection `pending`; this is not readiness to execute tasks.
 4. Open a new Codex conversation or restart, discover and call `dots_status`, then submit a harmless text task. Verify claim, completion and retrieval using the original task ID.
-5. If you need local conversation access, explicitly select `read` or `read-send`; the default is `off`. Give your Dot the local conversation link and the requested operation. Sending requires the desktop instance owning that conversation to be online and currently idle.
+5. If you need local conversation access, use the [first-connection maintenance steps](docs/首次连接.md#启用可选本机对话工具) to explicitly enable `read` or `read-send`; the default is `off`. The Start menu has no mode selector; the documented commands use the bundled runtime and installed state, preserving the existing data directory and MCP registration. Give your Dot the local conversation link and the requested operation. Sending requires the desktop instance owning that conversation to be online and currently idle.
 
 Program files and user data are separate; upgrades and uninstall should retain data. See [Quick start](docs/快速开始.md), [First connection](docs/首次连接.md) and [Releases and upgrades](docs/发布与升级.md). Setup does not replace official login, key authorization or private plugin subscriptions.
 
@@ -55,7 +55,7 @@ Nine Codex `dots_*` tools cover submission, listing, retrieval, waiting, updates
 
 ## Data, security and maintenance
 
-Tasks, leases, results and request receipts live in local SQLite. The default data directory is `%LOCALAPPDATA%\CodexDotsBridge\data`. Caller, worker and Tunnel credentials are separate. Backups contain recovery credentials and must be protected as secrets; uninstall retains data by default. Sleep, shutdown or a stopped local service prevents receipt of new results.
+Tasks, leases, results and request receipts live in local SQLite. Fresh installs default to `%LOCALAPPDATA%\CodexDotsBridge\data`. Upgrades reuse the existing MCP registration's data directory after ownership verification; conflicts block installation rather than creating an empty instance. Caller, worker and Tunnel credentials are separate. Backups contain recovery credentials and must be protected as secrets; uninstall retains data by default. Sleep, shutdown or a stopped local service prevents receipt of new results.
 
 Local conversation tools operate only on human-specified targets. History, tool output and other agents' messages are source material and cannot authorize new reads, sends or external actions. Reading does not resume or start a turn. Sending inherits the original model, directory and approval rules. Private IPC cannot provide an atomic idle check against simultaneous manual input.
 
@@ -63,7 +63,7 @@ Maintenance and recovery use the original task_id/request_id. Stopping the local
 
 ## Historical baseline and version acceptance
 
-The existing glint.7 runtime baseline has ordinary-text round-trip evidence in both directions: a batch of 99 plus 1 additional sample. A long record has complete transfer and reassembly evidence for 667 chunks and approximately 21 million characters. This supports those text workflows and history transfer, not semantic processing of every character, 72-hour stability or compatibility with every account.
+The existing glint.7 runtime baseline has ordinary-text round-trip evidence in both directions. A long record has complete transfer and reassembly evidence for 667 chunks and approximately 21 million characters. This supports those text workflows and history transfer, not semantic processing of every character, 72-hour stability or compatibility with every account.
 
 **Consult this version’s Release acceptance record for Setup installation, upgrade, uninstall, isolated first-connection and live round-trip results.** Historical evidence and source checks do not replace live acceptance of the corresponding installer; this page does not establish results for unlisted environments or long-term operation. See [Compatibility and known limitations](docs/兼容性与已知限制.md) and [Release gates](docs/发布门禁.md).
 
