@@ -10,6 +10,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '24.21.0'
@@ -34,7 +36,13 @@ jobs:
           Add-Content -LiteralPath $env:GITHUB_ENV -Value 'CODEX_DOTS_REQUIRE_CODEX_TESTS=1' -Encoding utf8
       - name: Public source checks
         shell: pwsh
-        run: ./.runtime/node-v24.21.0-win-x64/node.exe scripts/check-release.mjs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./.runtime/node-v24.21.0-win-x64/node.exe scripts/check-release.mjs --history
+          if ($LASTEXITCODE -ne 0) { throw 'Public source and history checks failed.' }
+          ./.runtime/node-v24.21.0-win-x64/node.exe --test test/release-check.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Release gate regression tests failed.' }
+          ./test/release-archive.test.ps1
       - name: Build and test
         shell: pwsh
         run: |
@@ -43,10 +51,31 @@ jobs:
       - name: Package Windows artifact
         shell: pwsh
         run: ./scripts/package.ps1 -IncludeTunnel -SkipTests
+      - name: Build and validate single-file Setup
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tools = Join-Path $env:RUNNER_TEMP 'dots-inno-7.1.0'
+          New-Item -ItemType Directory -Path $tools | Out-Null
+          $download = Join-Path $tools 'innosetup-7.1.0-x64.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -OutFile $download
+          if ((Get-FileHash -LiteralPath $download).Hash.ToLowerInvariant() -ne '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f') { throw 'Compiler download digest mismatch.' }
+          $signature = Get-AuthenticodeSignature -FilePath $download
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notlike '*Pyrsys B.V.*') { throw 'Compiler download signature invalid.' }
+          $compilerRoot = Join-Path $tools 'compiler'
+          $process = Start-Process -FilePath $download -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOICONS','/CURRENTUSER',('/DIR="'+$compilerRoot+'"')) -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Compiler installation failed.' }
+          $payload = @(Get-ChildItem artifacts/private/packages -Directory)
+          if ($payload.Count -ne 1) { throw 'Expected one checked payload.' }
+          ./scripts/build-setup.ps1 -Compiler (Join-Path $compilerRoot 'ISCC.exe') -PackageRoot $payload[0].FullName -OutputDirectory artifacts/private/setup
+          $testAppId = 'CodexDotsBridgeSetup.Test.' + [Guid]::NewGuid().ToString()
+          ./scripts/test-ci.ps1 -SetupExecutable artifacts/private/setup/Setup.exe -InstallerAppId $testAppId -TestDirectory (Join-Path $env:RUNNER_TEMP 'dots-install-acceptance')
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-candidate
           path: |
             artifacts/private/packages/*.zip
             artifacts/private/packages/*.sha256
+            artifacts/private/setup/Setup.exe
+            artifacts/private/setup/Setup.exe.sha256
           retention-days: 14

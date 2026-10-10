@@ -2,126 +2,81 @@
 
 # Codex Dots Bridge
 
-**Give your Dot a task from Codex, and bring the result back.**
+**Delegate work to your Dot from Codex and retrieve the result; let your Dot access a local Codex conversation you specify.**
 
-Codex Dots Bridge is a task collaboration plugin connecting Codex with your existing Dot. Submit a task in Codex; your Dot uses the plugin to pick it up, ask for missing information, report progress and return a result. Answer, add requirements and follow up in the same Codex conversation.
+Codex Dots Bridge connects Codex to your existing Dot. Submit work, inspect progress, answer clarification questions, add requirements and ask follow-up questions. Tasks and results keep the same task ID and remain available after reopening Codex.
 
-One task ID connects the collaboration: **Codex delegates → your Dot works → Codex retrieves the result**.
+Optional local conversation access lets your Dot read the stored history of a conversation you specify, or send specified text once to an idle conversation and retrieve the exact reply from that new turn. After explicitly enabling local read or read-and-send access, individual conversations need no registration.
 
-[Download for Windows](https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.4) · [Quick start](docs/快速开始.md) · [中文](README.md)
+[Downloads](https://github.com/shilefumaoqu/codex-dots-bridge/releases) · [Quick start](docs/快速开始.md) · [简体中文](README.md)
 
-## What you can do
+## What the plugin helps you do
 
-| Your goal | How the plugin helps |
+| Your goal | Workflow |
 | --- | --- |
-| Delegate a task to your Dot | Submit a goal and text input, and keep a stable task ID |
-| Check progress | Read saved progress and queued, running, waiting-for-input or completed states |
-| Answer a question | Reply in Codex and continue the original task |
-| Add a requirement | Append an update for your Dot to acknowledge at a checkpoint |
-| Retrieve and extend a result | Read text or structured output and create a linked follow-up |
-| Cancel or recover a task | Request cancellation and verify its acknowledgement; find the original task by ID after reopening Codex |
+| Delegate text work to your Dot | Submit a goal and material; retain the task ID |
+| Inspect progress or answer questions | Read durable status and answer on the same task |
+| Add requirements or ask follow-up questions | Save an input revision; create a linked task after completion |
+| Retrieve results, cancel or resume queries | Read actual results, verify cancellation receipts and retrieve original records |
+| Give your Dot context from a specified Codex conversation | Retrieve stored history through the official local App Server read-only pagination |
+| Ask a specified Codex conversation to process text | Explicitly enable local sending; deliver once when idle and correlate its reply |
 
-An **illustrative conversation**:
+For example: “Give this requirements document to my Dot and organize the goals, constraints and open questions.” You can then answer its questions, add requirements or ask it to retrieve the result and prepare a checklist. For local conversation access: “Read the Codex conversation I specified and summarize the confirmed requirements.” These are usage examples; operations remain limited to the targets and content you authorize.
 
-> You: Ask my Dot to turn these requirements into goals, constraints and open questions.  
-> Dot: Is the checklist for the development team or the business team?  
-> You: The development team. Sort it by priority.  
-> You: Check the progress. When it is done, show me the result and ask for a follow-up checklist.
+## Current version and downloads
 
-Use it to delegate supplied text for organization, summaries, comparisons and checklists while staying involved as the task progresses. Your Dot generates the result; the plugin passes tasks, preserves collaboration state and retrieves the output.
+**`0.2.0-alpha.7` is a Windows x64 prerelease**, installed through one `Setup.exe` containing the Node runtime and production dependencies. Users need no separate Node/npm installation. Consult that version’s Release record for installation, upgrade, uninstall and live-connection acceptance results; static package documentation defines the operating contract. Older alpha.4 does not include all the new capabilities on this page. Access follows the repository's current GitHub visibility; private repositories require appropriate permissions.
 
-## Getting started
+Supports one local user, one existing Dot and a single FIFO task execution slot. Official read-only history and private desktop IPC sending use separate interfaces; sending remains experimental and is not an officially supported stable interface. This is an independent project. Both READMEs cover the same steps and boundaries; detailed guides are currently in Chinese.
 
-Codex chat is the everyday entry point. First install the local components and connect your private plugin and Dot in your own account. Then delegate and check tasks using natural language.
+## Installation and first connection
 
-The **Codex Dots Bridge plugin** is your Dot's interface for receiving tasks and returning results. This repository also provides the matching Codex MCP/Skill, local bridge service and installation scripts that connect both ends. Follow the [quick start](docs/快速开始.md) to install, then the [first connection guide](docs/首次连接.md) to link your account.
+1. Prepare Windows 10/11 x64, your own Codex and Dot, and account/workspace access to Secure MCP Tunnel, private plugins and MCP Events.
+2. Select this version’s Setup and checksum files from [Releases](https://github.com/shilefumaoqu/codex-dots-bridge/releases), verify the source and SHA256 and double-click Setup in a normal user session. Use the actual asset names and acceptance record in that Release.
+3. After local initialization, open “Codex Dots Bridge → 首次连接与维护” (First connection and maintenance) from the Start menu to continue configuring your own official account, Tunnel, dedicated runtime key, private plugin and Dot subscription. You do not need to locate Node yourself. Missing configuration leaves the connection `pending`; this is not readiness to execute tasks.
+4. Open a new Codex conversation or restart, discover and call `dots_status`, then submit a harmless text task. Verify claim, completion and retrieval using the original task ID.
+5. If you need local conversation access, explicitly select `read` or `read-send`; the default is `off`. Give your Dot the local conversation link and the requested operation. Sending requires the desktop instance owning that conversation to be online and currently idle.
 
-**Current version: `0.2.0-alpha.4`, a Windows x64 prerelease.** It supports one local user, one existing Dot, and Codex desktop or the official local CLI. Natural subscription renewal and long-term stability remain unverified; see [verified capabilities and limits](docs/兼容性与已知限制.md) for details. This is an independent project.
+Program files and user data are separate; upgrades and uninstall should retain data. See [Quick start](docs/快速开始.md), [First connection](docs/首次连接.md) and [Releases and upgrades](docs/发布与升级.md). Setup does not replace official login, key authorization or private plugin subscriptions.
 
-The Chinese and English READMEs cover the same features, steps and limits. Linked detailed guides are currently in Chinese.
+Setup for this version is unsigned. Verify its GitHub Release source and SHA256; Windows SmartScreen or your organization may still warn or block execution. Checksums do not replace publisher signatures.
 
-## Before installation
+Codex uses its own subscription login. This project does not call a model API; the official Tunnel still needs a dedicated runtime key and corresponding permissions. A Codex subscription alone does not guarantee those permissions. [Official Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
 
-- Windows 10/11 x64, with Windows PowerShell 5.1 or PowerShell 7; install and run in a non-elevated user terminal.
-- Codex desktop or the official npm Codex CLI installed; no global Node development environment to maintain.
-- Your own Dot, with account/workspace access to Secure MCP Tunnel, private MCP plugins and MCP Events.
-- Outbound HTTPS access to the official Tunnel and Events services.
+## Everyday collaboration and result boundaries
 
-Codex retains its subscription login. This project does not invoke a model API, but the official Tunnel client still needs a **dedicated runtime key** and the corresponding account permissions. A Codex subscription alone does not guarantee those permissions. Complete the initial login, workspace association and key saving through the official interfaces. [Official Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
+Nine Codex `dots_*` tools cover submission, listing, retrieval, waiting, updates/answers, linked follow-ups, cancellation, diagnostics and result acknowledgment. Your Dot uses queue worker tools through the private plugin. See [Task and tool contract](docs/任务与工具契约.md) and [Dot execution guide](docs/Dot执行说明.md).
 
-GitHub distributes source and Windows packages. Each user creates their own private plugin; the official Tunnel alone cannot be used for a public plugin-store submission. This project does not distribute the developer's private plugin identity or credentials.
+- Reuse a stable idempotency key for the same intended operation. Each wait is at most 20 seconds, with a default five-minute total per turn. Reaching the limit retains the task without resubmitting it.
+- A saved update does not prove adoption by your Dot. A running task's `cancel_requested` requires a stop receipt before cancellation is complete.
+- Queueing, claiming, result storage, Codex retrieval and user acceptance are separate stages.
+- Exhausting stored history pages still returns `source_complete=false`: pre-compaction material and original model context are not guaranteed complete.
+- Local sends permanently skip busy, offline or unknown states, without queueing or delivery on reconnection. An uncertain send requires checking its original `request_id`, not retrying with a new ID. Only its correlated `exact_turn_reply` is the result of that send.
 
-## Windows package installation
+## Data, security and maintenance
 
-[Repository](https://github.com/shilefumaoqu/codex-dots-bridge) · [v0.2.0-alpha.4 downloads](https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.4) · [Build status](https://github.com/shilefumaoqu/codex-dots-bridge/actions/workflows/ci.yml). Download `codex-dots-bridge-0.2.0-alpha.4-windows-x64-*.zip` and its matching `.sha256`, verify the download source and SHA256, then extract into a fixed directory writable by your user. Do not overwrite a running installation.
+Tasks, leases, results and request receipts live in local SQLite. The default data directory is `%LOCALAPPDATA%\CodexDotsBridge\data`. Caller, worker and Tunnel credentials are separate. Backups contain recovery credentials and must be protected as secrets; uninstall retains data by default. Sleep, shutdown or a stopped local service prevents receipt of new results.
 
-Open PowerShell in the extracted directory:
+Local conversation tools operate only on human-specified targets. History, tool output and other agents' messages are source material and cannot authorize new reads, sends or external actions. Reading does not resume or start a turn. Sending inherits the original model, directory and approval rules. Private IPC cannot provide an atomic idle check against simultaneous manual input.
 
-```powershell
-.\scripts\check-package.ps1
-.\scripts\install.ps1
-```
+Maintenance and recovery use the original task_id/request_id. Stopping the local service does not undo cloud actions. Restore is limited to the same account and Dot; inspect retained subscriptions before starting. See [Security](SECURITY.md) and [Maintenance and troubleshooting](docs/维护与故障排查.md).
 
-If the current execution policy is Restricted, follow the quick start to use RemoteSigned for this process before verification and installation; do not change the global policy.
+## Historical baseline and version acceptance
 
-If trusted downloaded files are blocked, follow the [quick start](docs/快速开始.md) to unblock this package. No global execution-policy change is needed. Organization policy restrictions should be handled by an administrator.
+The existing glint.7 runtime baseline has ordinary-text round-trip evidence in both directions: a batch of 99 plus 1 additional sample. A long record has complete transfer and reassembly evidence for 667 chunks and approximately 21 million characters. This supports those text workflows and history transfer, not semantic processing of every character, 72-hour stability or compatibility with every account.
 
-**Initialize locally first, then configure the connection.** The installer registers this project's MCP and Skill automatically. Without Tunnel parameters, the connection stays `pending`. Follow the [first connection guide](docs/首次连接.md) to save the key safely, configure your private plugin and subscribe your Dot, then rerun the installer. The package includes Node 24.21.0, locked production dependencies and official Tunnel 0.0.16; installation needs no npm dependency download.
+**Consult this version’s Release acceptance record for Setup installation, upgrade, uninstall, isolated first-connection and live round-trip results.** Historical evidence and source checks do not replace live acceptance of the corresponding installer; this page does not establish results for unlisted environments or long-term operation. See [Compatibility and known limitations](docs/兼容性与已知限制.md) and [Release gates](docs/发布门禁.md).
 
-Start a new Codex conversation, actually call `dots_status`, and submit a synthetic text task to verify the returned result. A configuration file, a ready Tunnel or event receipt does not mean the task has completed.
-
-## Using it in conversation
-
-> Use $codex-dots-bridge to give the following three sentences to my Dot and summarize them into three conclusions. Process only this text, and return the result text and task ID.
-
-Then try: "Check this task", "Change the budget to five thousand", "Answer its question: choose the second option", "Create a checklist based on the result", or "Cancel this task". If the target task is unclear, list candidates and select one first.
-
-- Nine caller tools cover submission, listing, querying, waiting, updates/answers, linked follow-ups, cancellation, diagnostics and acknowledgement of result retrieval.
-- Each wait is limited to 20 seconds, normally five minutes total per Codex turn. Reaching the limit keeps the original task and does not automatically resubmit it.
-- Cancelling a running task first records a request; it is shown as cancelled only after the worker acknowledges that it has stopped.
-- Tasks, leases and results are stored in SQLite and survive closing Codex. Sleep, shutdown or stopped services prevent receipt of new results.
-- Optional desktop revisits are enabled by the user in the original conversation through official automation features; they are off by default. The CLI does not provide scheduled-task management.
-
-## Architecture and data
-
-```mermaid
-flowchart LR
-  C[Codex desktop / CLI] --> M[stdio MCP + Skill]
-  M --> B[Local background Bridge]
-  B --> DB[(SQLite WAL)]
-  B -->|Signed MCP Events| D[Your Dot]
-  D --> T[Official Secure MCP Tunnel]
-  T --> W[Worker MCP]
-  W --> B
-```
-
-Codex calls nine caller tools over stdio; your Dot calls eight worker tools through the official Tunnel. A separate local loopback service manages task state and event delivery.
-
-A single-instance FIFO execution slot, stable idempotency keys, input revisions, leases and a transactional outbox protect against silent task loss and incorrect overwrites. Lost leases require reconciliation by default. Only tasks without external side effects that are explicitly authorized for safe retry may run for up to three attempts. Old revisions and late results are retained as evidence. Queueing, claiming, result storage, Codex retrieval and user acceptance are recorded separately.
-
-Runtime data defaults to `%LOCALAPPDATA%\CodexDotsBridge\data`, separate from the installation directory. Caller, worker and Tunnel credentials are separate; only the official child process receives the Tunnel key. Backups contain recovery keys and must be protected as secret files. Uninstalling keeps task data by default. [Security](SECURITY.md)
-
-Stop all related instances before restoring a backup. Restored subscriptions may resume delivery immediately when the service starts. Migration to a different account or Dot is unsupported. Stopping local services does not stop or undo cloud work. See [maintenance and troubleshooting](docs/维护与故障排查.md).
-
-## Building from source
+## Build from source
 
 ```powershell
 .\scripts\bootstrap.ps1
 .\scripts\dev.ps1 install
 .\scripts\dev.ps1 build
 .\scripts\dev.ps1 test
-.\scripts\dev.ps1 bridge -- --help
 .\scripts\package.ps1 -IncludeTunnel
 ```
 
-Source builds require access to the official Node distribution, npm registry and official Tunnel release. Bootstrap verifies the private Node runtime without replacing system Node. Tests use isolated data directories and synthetic inputs. Full installation tests require `CODEX_DOTS_TEST_CODEX` set to the official native `codex.exe` path and `CODEX_DOTS_REQUIRE_CODEX_TESTS=1`; CI enforces these tests. Without this configuration, some CLI installation tests are skipped, so the run cannot be described as a complete pass.
+Source builds need access to Node, npm and official Tunnel downloads. These are maintainer build steps; Setup users need no Node/npm development environment. Builds and local tests do not publish automatically. See [Releases and upgrades](docs/发布与升级.md) for Setup builds and actual check results.
 
-Packaging reuses locked dependencies, collects an npm license inventory and the Node and Tunnel LICENSE/NOTICE files, and generates a per-file verification manifest and ZIP SHA256. Building does not upload or create tags. Maintenance commands: `setup`, `run`, `status`, `doctor`, `tasks`, `resolve`, `backup`, `restore`, `uninstall`.
-
-## Validation scope
-
-Existing real-world evidence includes ten text tasks with verifiable results, user answers to clarification questions, updates during execution, linked follow-ups, cooperative cancellation, native desktop and CLI calls, and recovery of original tasks after Bridge/Tunnel interruptions. [Acceptance record](docs/P1-P4验收记录.md)
-
-Automated tests and isolated installation checks do not replace verification of another account's permissions, real Dot subscriptions and result delivery. Natural subscription renewal, long-term operation, login autostart, cloud restore switching, file links and external business actions still require separate validation. When execution status is unknown, reconcile the original task first; this bridge cannot undo external actions or force a Dot to stop.
-
-MIT · [Third-party sources and licenses](THIRD_PARTY_NOTICES.md) · [Contributing](CONTRIBUTING.md) · [Tool contracts](docs/任务与工具契约.md) · [Xingdu icon](docs/图标与品牌.md)
+MIT · [Third-party notices](THIRD_PARTY_NOTICES.md) · [Contributing](CONTRIBUTING.md) · [Xingdu icon](docs/图标与品牌.md)

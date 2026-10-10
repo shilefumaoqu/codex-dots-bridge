@@ -1,9 +1,12 @@
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
+import { scanDirectory, scanBytes, isPublicDocument } from './check-public-content.mjs';
 
 const root = process.cwd();
 const failures = [];
+const releasePolicy = JSON.parse(readFileSync(new URL('./public-release-policy.json', import.meta.url), 'utf8'));
 const git = (...args) => execFileSync('git', args, {cwd: root, stdio:'pipe', maxBuffer: 32 * 1024 * 1024});
 function sourceFiles(path='') {
   const excluded = new Set(['.git','.cache','.runtime','node_modules','dist','artifacts','coverage']);
@@ -16,6 +19,11 @@ function sourceFiles(path='') {
 let hasGit=true,files;
 try {if(resolve(git('rev-parse','--show-toplevel').toString().trim())!==root)throw new Error('Not this source root');files=[...new Set(git('ls-files','-z','--cached','--others','--exclude-standard').toString().split('\0').filter(Boolean))];}
 catch {hasGit=false;files=sourceFiles();}
+if (process.argv.includes('--selected-public-documents')) {
+  const selected = files.filter(file => !/^docs\//i.test(file) || isPublicDocument(file));
+  console.log(`Not selected for publication: ${files.length-selected.length} internal documentation files.`);
+  files = selected;
+}
 const forbiddenFile = /(^|\/)(?:\.cache|\.runtime|node_modules|dist|secrets|backups|artifacts)(\/|$)|\.(?:env|sqlite(?:-.*)?|db(?:-.*)?|log|zip|exe|key|pem|pfx)$/i;
 const rules = [
   ['credential', /\bsk-[A-Za-z0-9_-]{24,}/g],
@@ -50,6 +58,9 @@ for (const file of files) {
     if (!existsSync(resolve(dirname(file), path))) failures.push(`${file}: missing link target ${path}`);
   }
 }
+const publicContent = scanDirectory(root, files.filter(file => existsSync(file)));
+for (const finding of publicContent.findings) failures.push(`${finding.path}: ${finding.rule}${finding.line ? ', line '+finding.line : ''}`);
+console.log(`Public content coverage: ${JSON.stringify(publicContent.coverage)}; ${publicContent.warnings.length} files require non-text review.`);
 const pkg = JSON.parse(readFileSync('package.json', 'utf8'));
 const lock = JSON.parse(readFileSync('package-lock.json', 'utf8'));
 const bridge = readFileSync('src/bridge.ts', 'utf8').match(/export const VERSION = '([^']+)'/)?.[1];
@@ -66,7 +77,13 @@ if (process.argv.includes('--history')) {
     blobs.add(sha);
     if (forbiddenFile.test(name)) failures.push(`history:${name}: private/generated file`);
     const bytes = git('cat-file','blob',sha);
-    if (!bytes.includes(0)) scan(bytes.toString('utf8'), `history:${sha.slice(0,8)}:${name}`);
+    const historyScan = scanBytes(bytes, name);
+    // A past technical document review applies only to these exact bytes, never the current tree.
+    const reviewed = releasePolicy.reviewedHistoricalDocuments?.[name] === createHash('sha256').update(bytes).digest('hex');
+    for (const finding of historyScan.findings) {
+      if (reviewed && finding.rule === 'unapproved-public-document') continue;
+      failures.push(`history:${sha.slice(0,8)}:${finding.path}: ${finding.rule}`);
+    }
   }
   console.log(`History scanned: ${blobs.size} unique blobs`);
 }

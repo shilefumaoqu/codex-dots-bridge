@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import Database from 'better-sqlite3';
-import { initProduction, readProductionConfig, writeProductionConfig, protectProductionDirectory } from './runtime.js';
+import { initProduction, readProductionConfig, readOwnerNotificationConfig, writeProductionConfig, protectProductionDirectory } from './runtime.js';
 import { ProbeError } from './store.js';
 
 const digest=(path:string)=>createHash('sha256').update(readFileSync(path)).digest('hex');
@@ -65,6 +65,11 @@ export async function backupData(dir:string,destination:string) {
   initProduction(target);
   const files=['config.json','caller.key','worker.key'];
   for(const name of ['caller.key','worker.key'])copyFileSync(join(dir,name),join(target,name));
+  if(existsSync(join(dir,'owner-notification.json'))) {
+    readOwnerNotificationConfig(dir); // Validate only; never import executable code.
+    copyFileSync(join(dir,'owner-notification.json'),join(target,'owner-notification.json'));
+    files.push('owner-notification.json');
+  }
   if(existsSync(join(dir,'tasks.sqlite'))) {
     const db=new Database(join(dir,'tasks.sqlite'),{readonly:true,fileMustExist:true});
     try {await db.backup(join(target,'tasks.sqlite'));}finally{db.close();}files.push('tasks.sqlite');
@@ -86,16 +91,21 @@ export function restoreData(backup:string,targetDir:string) {
   protectProductionDirectory(source);
   const manifest=JSON.parse(readFileSync(join(source,'backup-manifest.json'),'utf8')) as BackupManifest;
   if(manifest.owner!=='codex-dots-bridge-backup'||manifest.schema_version!==1)throw new ProbeError('invalid_backup_manifest');
-  const allowed=new Set(['config.json','caller.key','worker.key','tasks.sqlite','tunnel-runtime.env']);
+  const allowed=new Set(['config.json','owner-notification.json','caller.key','worker.key','tasks.sqlite','tunnel-runtime.env']);
   if(!manifest.files['config.json']||!manifest.files['caller.key']||!manifest.files['worker.key'])throw new ProbeError('incomplete_backup');
   for(const [name,sum] of Object.entries(manifest.files)) {if(!allowed.has(name))throw new ProbeError('invalid_backup_entry');regular(join(source,name));if(digest(join(source,name))!==sum)throw new ProbeError('backup_integrity_failed');}
   const config=readProductionConfig(source);if(config.instance_id!==manifest.instance_id)throw new ProbeError('backup_instance_mismatch');
   if(config.tunnel&&!manifest.files['tunnel-runtime.env'])throw new ProbeError('backup_key_missing');
+  const notificationConfig=manifest.files['owner-notification.json']?readOwnerNotificationConfig(source):undefined;
   if(existsSync(target)&&readdirSync(target).length)throw new ProbeError('restore_destination_not_empty');
   initProduction(target);
   for(const name of Object.keys(manifest.files))if(name!=='config.json')copyFileSync(join(source,name),join(target,name));
   if(config.tunnel)config.tunnel={...config.tunnel,key_file:join(target,'tunnel-runtime.env')};
-  delete config.endpoint;delete config.installation;writeProductionConfig(target,config);protectProductionDirectory(target);
+  delete config.endpoint;delete config.installation;
+  // Restored adapters refer to local executable code and an external account config.
+  // Preserve the reference as disabled; restoring data never activates it.
+  if(notificationConfig) writeFileSync(join(target,'owner-notification.json'),JSON.stringify({...notificationConfig,enabled:false},null,2)+'\n',{mode:0o600});
+  writeProductionConfig(target,config);protectProductionDirectory(target);
   return {restored_directory:target,instance_id:config.instance_id,mcp_registration:'run_setup_again',dot_binding:'verify_subscription_after_start'};
 }
 export interface InstallOptions {nodePath:string;entryPath:string;skillSource:string;codexHome?:string;codexCommand?:string;autostart?:boolean}
@@ -160,6 +170,7 @@ export function installCodex(dir:string,options:InstallOptions) {
   regular(mcp.command);regular(mcp.args[0]!);const skillFiles=tree(resolve(options.skillSource)),skillPath=join(home,'skills','codex-dots-bridge');
   if(!skillFiles['SKILL.md'])throw new ProbeError('skill_source_missing');
   if(previous&&(previous.codex_home!==home||previous.codex_command!==command||JSON.stringify(previous.mcp)!==JSON.stringify(mcp)))throw new ProbeError('installation_change_requires_uninstall');
+  mkdirSync(home,{recursive:true}); // The official CLI requires CODEX_HOME to exist on first installation.
   const existing=mcpEntry(command,home,mcp.name);
   if(existing&&(!previous||!entryMatches(existing,previous.mcp,previous.mcp_registration)))throw new ProbeError('foreign_mcp_collision');
   if(existsSync(skillPath)&&(!previous||!ownedSkill(tree(skillPath),previous.skill.files)))throw new ProbeError('foreign_or_modified_skill_collision');

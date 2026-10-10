@@ -1,5 +1,10 @@
 [CmdletBinding()]
-param([switch]$CheckOnly)
+param(
+    [switch]$CheckOnly,
+    [string]$SetupExecutable,
+    [string]$InstallerAppId,
+    [string]$TestDirectory
+)
 $ErrorActionPreference = 'Stop'
 if ($env:GITHUB_ACTIONS -ne 'true') { throw 'This harness is only for the disposable GitHub Actions Windows runner.' }
 if (-not $IsWindows) { throw 'Windows CI is required.' }
@@ -51,7 +56,12 @@ Write-Output ('CI child owner verified: '+$owner)
 '@
     & powershell.exe -NoProfile -NonInteractive -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($check)))
     if ($LASTEXITCODE -ne 0) { throw 'CI owner preflight failed.' }
-    if (-not $CheckOnly) { & (Join-Path $PSScriptRoot 'dev.ps1') test }
+    if (-not $CheckOnly) {
+        if ($SetupExecutable) {
+            if (-not $InstallerAppId -or -not $TestDirectory -or -not $env:CODEX_DOTS_TEST_CODEX) { throw 'Installer CI requires explicit isolated paths, test identity and official Codex.' }
+            & (Join-Path (Split-Path -Parent $PSScriptRoot) 'test\windows-setup.test.ps1') -SetupExecutable $SetupExecutable -InstallerAppId $InstallerAppId -CodexCommand $env:CODEX_DOTS_TEST_CODEX -TestDirectory $TestDirectory
+        } else { & (Join-Path $PSScriptRoot 'dev.ps1') test }
+    }
 } finally {
     [DotsCiTokenOwner]::SetOwner($originalOwner)
     $identity.Dispose()

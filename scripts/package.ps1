@@ -18,17 +18,34 @@ $zip = Join-Path $OutputDirectory "$packageName.zip"
 if ((Test-Path -LiteralPath $staging) -or (Test-Path -LiteralPath $zip)) { throw 'Package collision; existing artifacts are never overwritten.' }
 Push-Location $projectRoot
 try {
-  & $nodeExe (Join-Path $PSScriptRoot 'check-release.mjs')
+  & $nodeExe (Join-Path $PSScriptRoot 'check-release.mjs') --selected-public-documents
   if ($LASTEXITCODE -ne 0) { throw 'Public source checks failed.' }
   & (Join-Path $PSScriptRoot 'dev.ps1') build
-  if (-not $SkipTests) { & (Join-Path $PSScriptRoot 'dev.ps1') test }
+  if (-not $SkipTests) {
+    & (Join-Path $PSScriptRoot 'dev.ps1') test
+    & $nodeExe --test (Join-Path $projectRoot 'test\release-check.test.mjs')
+    if ($LASTEXITCODE -ne 0) { throw 'Release gate regression tests failed.' }
+  }
 } finally { Pop-Location }
 New-Item -ItemType Directory -Path $staging | Out-Null
-foreach ($name in @('dist','skills','docs','licenses')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) -Recurse }
+foreach ($name in @('dist','skills','licenses')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) -Recurse }
+$publicPolicy = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'public-release-policy.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+foreach ($relative in $publicPolicy.documents) {
+  $destination=Join-Path $staging $relative
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+  Copy-Item -LiteralPath (Join-Path $projectRoot $relative) -Destination $destination
+}
+foreach ($relative in $publicPolicy.assetPrefixes) {
+  $destination=Join-Path $staging $relative.TrimEnd('/')
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+  Copy-Item -LiteralPath (Join-Path $projectRoot $relative) -Destination $destination -Recurse
+}
 foreach ($name in @('package.json','package-lock.json','LICENSE','THIRD_PARTY_NOTICES.md','README.md','README.en.md','CHANGELOG.md','CONTRIBUTING.md','SECURITY.md')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) }
 New-Item -ItemType Directory -Path (Join-Path $staging 'scripts') | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install.ps1') -Destination (Join-Path $staging 'scripts\install.ps1')
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'setup-lifecycle.ps1') -Destination (Join-Path $staging 'scripts\setup-lifecycle.ps1')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'check-package.ps1') -Destination (Join-Path $staging 'scripts\check-package.ps1')
+foreach ($name in @('check-public-content.mjs','public-release-policy.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $staging ('scripts\'+$name)) }
 $packagedRuntime = Join-Path $staging 'runtime\node-v24.21.0-win-x64'
 New-Item -ItemType Directory -Path $packagedRuntime | Out-Null
 foreach ($name in @('node.exe','LICENSE','README.md')) { Copy-Item -LiteralPath (Join-Path $runtime $name) -Destination (Join-Path $packagedRuntime $name) }
@@ -44,6 +61,13 @@ try {
   & $nodeExe (Join-Path $PSScriptRoot 'collect-licenses.mjs')
   if ($LASTEXITCODE -ne 0) { throw 'Production license collection failed.' }
 } finally { $env:PATH = $previousPath; Pop-Location }
+# Published dependency test fixtures are not used by the Windows runtime. Remove only these
+# known malformed-text/nested-archive fixtures; keep the release scanner's strict coverage.
+foreach ($relative in @('node_modules/fast-uri/test/security-utf8-encoding.test.js','node_modules/thread-stream/test/dir with spaces/test-package.zip','node_modules/thread-stream/test/ts-commonjs-default-export.zip')) {
+  $fixture=[IO.Path]::GetFullPath((Join-Path $staging $relative))
+  if (-not $fixture.StartsWith($staging.TrimEnd('\')+'\',[StringComparison]::OrdinalIgnoreCase)) { throw 'Dependency fixture path outside package.' }
+  if (Test-Path -LiteralPath $fixture -PathType Leaf) { [IO.File]::Delete($fixture) }
+}
 if ($IncludeTunnel) {
   $archiveName = 'tunnel-client-v0.0.16-windows-amd64.zip'
   $archive = Join-Path $projectRoot ".runtime\$archiveName"
@@ -57,9 +81,18 @@ if ($IncludeTunnel) {
 $files = @(Get-ChildItem -LiteralPath $staging -Recurse -File | ForEach-Object { [ordered]@{path=$_.FullName.Substring($staging.Length+1).Replace('\','/');sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()} } | Sort-Object { $_.path })
 $manifest = [ordered]@{schema=1;version=$version;platform='windows-x64';node='24.21.0';tunnel=$(if ($IncludeTunnel) {'0.0.16'} else {$null});files=$files}
 [IO.File]::WriteAllText((Join-Path $staging 'release-manifest.json'), ($manifest | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
-& (Join-Path $PSScriptRoot 'check-package.ps1') -PackageRoot $staging
+& (Join-Path $staging 'scripts\check-package.ps1') -PackageRoot $staging
 # Explicit source allowlist; generated manifest verifies every extracted file.
-Compress-Archive -LiteralPath $staging -DestinationPath $zip
+# PowerShell 5.1 Compress-Archive writes backslashes; ZIP names must use forward slashes.
+Add-Type -AssemblyName System.IO.Compression,System.IO.Compression.FileSystem
+$archive=[IO.Compression.ZipFile]::Open($zip,[IO.Compression.ZipArchiveMode]::Create)
+try {
+  foreach($file in Get-ChildItem -LiteralPath $staging -Recurse -File) {
+    $entryName=$packageName+'/'+$file.FullName.Substring($staging.Length+1).Replace('\','/')
+    [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive,$file.FullName,$entryName,[IO.Compression.CompressionLevel]::Optimal) | Out-Null
+  }
+} finally { $archive.Dispose() }
+& (Join-Path $PSScriptRoot 'check-package.ps1') -ArchivePath $zip -ValidatorNode $nodeExe
 $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 [IO.File]::WriteAllText(($zip+'.sha256'), ($hash+'  '+[IO.Path]::GetFileName($zip)+"`n"), [Text.UTF8Encoding]::new($false))
 Write-Output "Windows prerelease package prepared: $zip"

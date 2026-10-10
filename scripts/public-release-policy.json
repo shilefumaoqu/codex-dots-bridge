@@ -1,0 +1,34 @@
+{
+  "schema": 1,
+  "documents": [
+    "docs/快速开始.md",
+    "docs/首次连接.md",
+    "docs/任务与工具契约.md",
+    "docs/Dot执行说明.md",
+    "docs/维护与故障排查.md",
+    "docs/兼容性与已知限制.md",
+    "docs/发布与升级.md",
+    "docs/图标与品牌.md",
+    "docs/发布门禁.md"
+  ],
+  "assetPrefixes": ["docs/素材/星渡/"],
+  "reviewedHistoricalDocuments": {
+    "docs/P0Dot执行说明.md": "1fb76e45fa1d2b7b05b6afecccd5643a5ee3b52b49a03e314cabe342c62d8d52",
+    "docs/P0官方接入.md": "fe573ea5132e56065cc45a88c1a8cef6a725bf10854dd2cb3b569d0d8b0d9765",
+    "docs/P0真实验收记录.md": "3b45a4a9c6e6907022566a895e6fe02f90767ca94d5aa3dbbef4be2ee8cf3706",
+    "docs/P1-P4验收记录.md": "1abe230d2f38636093673016c03b8838773786f04b1cc703852c115becc6726c",
+    "docs/交付补齐记录.md": "3d29458aa968deab4cc1eb19876d24f30ce306c1c744b168787b95fc4a2a06f3",
+    "docs/候选包验收.md": "e5e10d14b42b7f050adf37c4f42b19256579cf6f4e9959277bd85464520f9688",
+    "docs/公开隐私整理.md": "3d4ab3522538d030633681d754649274120ef5e348379c108198ce1e907ea9fa",
+    "docs/发布前检查记录.md": "30ee298c54e28a173652edcfa40ed114c3873186aab29497daebd1341df4c5c4",
+    "docs/发布说明-v0.2.0-alpha.3.md": "79a124dd255e9825a3d36e1bcc333e1df2010df1e34bfeeff39acfbc2140e3ce",
+    "docs/成熟方案核验.md": "ab92d6cfea5db8573a9d639e3ce9bbedb8b014825a537c5c7ce8e6c9cd5d8b00",
+    "docs/进展.md": "c732bf627f1555821eb84f4d8c62cb4e7caba4ba2e996ea498cd6143c038acc1",
+    "docs/项目接入与后续验收.md": "495ecab9a10477f6180dce6f68d8409a41c3bd58939e5edfcf3870b66dba15e9",
+    "docs/项目规划.md": "07c26324f3774d8c059098b2786259f7b5a6367e5f0ae0874376199e99dfb5fa"
+  },
+  "verifiedVendorFiles": {
+    "vendor/tunnel-client-v0.0.16-windows-amd64/cloudflared.exe": "cd0bc49aec24d0d62a37b6e842dad46000f7b401f6167b4cbace4e170819c9a2",
+    "vendor/tunnel-client-v0.0.16-windows-amd64/tunnel-client.exe": "4226bb74a72388147882881f29f79801b95e285d731a138071812e3aa6766571"
+  }
+}

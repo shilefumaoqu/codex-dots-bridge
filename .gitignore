@@ -21,4 +21,7 @@ backups/
 *.pem
 *.pfx
 *.zip
+*.exe
+.test-tmp/
+.it/
 

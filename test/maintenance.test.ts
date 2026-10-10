@@ -4,10 +4,12 @@ import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync
 import { join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
+import { spawnSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { initProduction, readProductionConfig, writeProductionConfig, readToken, init, protectProductionDirectory } from '../src/runtime.js';
 import { backupData, restoreData, statusData, installCodex, uninstallCodex, resolveCodexNpmShim } from '../src/maintenance.js';
 import { isolatedEnvironment, parseTunnelEnvironment, startSupervisor, stopSupervisor } from '../src/supervisor.js';
+import { configureDesktopAccess } from '../src/desktop-conversation-settings.js';
 
 if(process.env.CODEX_DOTS_REQUIRE_CODEX_TESTS==='1') {
   assert.equal(process.platform,'win32','Required Codex maintenance coverage needs Windows.');
@@ -69,6 +71,52 @@ test('owned Codex MCP/Skill install is idempotent, preserves unrelated TOML and 
     const options={nodePath:process.execPath,entryPath:entry,skillSource:source,codexHome:home,codexCommand:process.env.CODEX_DOTS_TEST_CODEX!};
     assert.equal(installCodex(dir,options).mcp,'registered');unlinkSync(join(home,'skills','codex-dots-bridge','SKILL.md'));assert.equal(installCodex(dir,options).mcp,'registered');assert.equal(readFileSync(join(home,'skills','codex-dots-bridge','SKILL.md'),'utf8'),readFileSync(join(source,'SKILL.md'),'utf8'));const toml=readFileSync(join(home,'config.toml'),'utf8');assert.ok(toml.includes('approval_policy = "on-request"'));assert.ok(toml.includes('preserve-command'));assert.ok(toml.includes('literal space'));
     writeFileSync(join(home,'skills','codex-dots-bridge','SKILL.md'),'user modified');const result=uninstallCodex(dir);assert.ok(result.removed.includes('mcp'));assert.ok(result.retained.includes('modified_or_foreign_skill'));assert.equal(readFileSync(join(home,'skills','codex-dots-bridge','SKILL.md'),'utf8'),'user modified');assert.ok(existsSync(join(dir,'caller.key')));
+  }finally{cleanup(root);}
+});
+
+test('real Codex CLI installs into a new nested CODEX_HOME and uninstalls without losing data',{skip:!process.env.CODEX_DOTS_TEST_CODEX},()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots new home '));try {
+    const dir=join(root,'data'),home=join(root,'new nested','codex home'),source=join(root,'skill'),entry=join(root,'main.mjs');
+    initProduction(dir);mkdirSync(source);writeFileSync(join(source,'SKILL.md'),'owned synthetic skill');writeFileSync(entry,'// synthetic entry');
+    assert.ok(!existsSync(home));
+    assert.equal(installCodex(dir,{nodePath:process.execPath,entryPath:entry,skillSource:source,codexHome:home,codexCommand:process.env.CODEX_DOTS_TEST_CODEX!}).mcp,'registered');
+    assert.ok(existsSync(join(home,'config.toml')));assert.ok(uninstallCodex(dir).removed.includes('mcp'));assert.ok(existsSync(join(dir,'caller.key')));
+  }finally{cleanup(root);}
+});
+
+test('failed setup registration preserves installation, Tunnel and desktop access settings',{skip:!process.env.CODEX_DOTS_TEST_CODEX},()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots setup failure '));try {
+    for(const failure of ['foreign','owned-change','cli'] as const) {
+      const fixture=join(root,failure),dir=join(fixture,'data'),home=join(fixture,'codex home'),source=join(fixture,'skill'),entry=join(fixture,'old main.mjs');
+      initProduction(dir);mkdirSync(home);mkdirSync(source);writeFileSync(join(source,'SKILL.md'),'owned synthetic skill');writeFileSync(entry,'// prior entry');
+      const config=readProductionConfig(dir);writeProductionConfig(dir,{...config,installation:{root:fixture,node_path:process.execPath},tunnel:{tunnel_id:'tunnel_original',organization_id:'original-org',client_path:process.execPath,key_file:join(dir,'tunnel-runtime.env')}});
+      configureDesktopAccess(dir,'read-send',home);
+      const cli=process.env.CODEX_DOTS_TEST_CODEX!;
+      if(failure==='owned-change')installCodex(dir,{nodePath:process.execPath,entryPath:entry,skillSource:source,codexHome:home,codexCommand:cli});
+      else writeFileSync(join(home,'config.toml'),failure==='foreign'?'approval_policy = "on-request"\n[mcp_servers.codex-dots-bridge]\ncommand = "foreign-command"\nargs = []\n':'approval_policy = "on-request"\n');
+      const before=Object.fromEntries(['config.json','desktop-conversations.json'].map(name=>[name,readFileSync(join(dir,name),'utf8')])),toml=readFileSync(join(home,'config.toml'),'utf8');
+      const result=spawnSync(process.execPath,[resolve('dist/main.js'),'setup','--data-dir',dir,'--codex-home',home,'--codex-command',failure==='cli'?join(fixture,'missing codex.exe'):cli,'--desktop-access','off','--tunnel-id','tunnel_replacement'],{encoding:'utf8',windowsHide:true,timeout:30000});
+      assert.equal(result.status,1);assert.match(result.stdout,new RegExp(failure==='foreign'?'foreign_mcp_collision':failure==='owned-change'?'installation_change_requires_uninstall':'codex_cli_operation_failed'));
+      for(const [name,text] of Object.entries(before))assert.equal(readFileSync(join(dir,name),'utf8'),text);
+      assert.equal(readFileSync(join(home,'config.toml'),'utf8'),toml);
+    }
+  }finally{cleanup(root);}
+});
+
+test('setup validates connection settings and stopped state before registration',{skip:!process.env.CODEX_DOTS_TEST_CODEX},()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots setup preflight '));try {
+    for(const failure of ['access','home','configuration','running','tunnel'] as const) {
+      const fixture=join(root,failure),dir=join(fixture,'data'),home=join(fixture,'codex home');initProduction(dir);mkdirSync(home);
+      writeFileSync(join(home,'config.toml'),'approval_policy = "on-request"\n');
+      if(failure==='configuration')writeFileSync(join(dir,'desktop-conversations.json'),'{}');
+      if(failure==='running')writeFileSync(join(dir,'service.lock'),JSON.stringify({pid:process.pid}));
+      const before=readFileSync(join(dir,'config.json'),'utf8');
+      const tunnelArgs=failure==='tunnel'?['--tunnel-id','invalid','--organization-id','fixture-org','--tunnel-client',process.execPath,'--tunnel-env',join(dir,'tunnel-runtime.env')]:[];
+      const result=spawnSync(process.execPath,[resolve('dist/main.js'),'setup','--data-dir',dir,'--codex-home',failure==='home'?join(fixture,'missing home'):home,'--codex-command',process.env.CODEX_DOTS_TEST_CODEX!,'--desktop-access',failure==='access'?'invalid':'read',...tunnelArgs],{encoding:'utf8',windowsHide:true,timeout:30000});
+      assert.equal(result.status,1);assert.match(result.stdout,new RegExp({access:'invalid_desktop_access',home:'codex_home_unavailable',configuration:'invalid_desktop_configuration',running:'stop_service_first',tunnel:'invalid_parameters'}[failure]));
+      assert.equal(readFileSync(join(dir,'config.json'),'utf8'),before);assert.ok(!existsSync(join(dir,'installation.json')));
+      assert.equal(readFileSync(join(home,'config.toml'),'utf8'),'approval_policy = "on-request"\n');
+    }
   }finally{cleanup(root);}
 });
 test('setup without autostart flag preserves a user-modified owned startup script',{skip:process.platform!=='win32'||!process.env.CODEX_DOTS_TEST_CODEX},()=>{

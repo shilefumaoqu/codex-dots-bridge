@@ -2,6 +2,8 @@
 
 核心代码为独立实现，没有复制其他桥接项目代码；星渡图标作为项目资产集成，随本项目MIT许可提供。MIT仅约束本项目代码，各第三方仍适用其自己的许可证，不构成OpenAI授权或商标背书。
 
+桌面 IPC 实验及可选固定回声模块参考 [Destiny-Rul/codex-desktop-control](https://github.com/Destiny-Rul/codex-desktop-control/tree/ed5bbc505cb77e2d15fbc4b63b51b1b90722f98d)（MIT，固定提交）及 [melompeel/codex-desktop-remote](https://github.com/melompeel/codex-desktop-remote)（MIT）的协议说明。均为独立实现，不捆绑其代码、不运行其安装或认证流程；不是 OpenAI 公开稳定 API。可选插件入口默认关闭，仅供明确授权的固定文本实验。
+
 | 组件 | 当前锁定版本 | 许可证 / 官方来源 |
 | --- | --- | --- |
 | MCP SDK server / node | 2.3.1 / 2.1.1 | Apache-2.0 · [TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) |
@@ -18,3 +20,5 @@
 Windows包内 `runtime/node-v24.21.0-win-x64/LICENSE` 保留Node声明，`vendor/tunnel-client-v0.0.16-windows-amd64/` 保留官方整包及cloudflared伴随文件。构建核对官方Tunnel ZIP SHA256，不替换第三方原文。源码仓库不提交运行时、node_modules或Tunnel二进制，分发校验见 `scripts/check-package.ps1`。
 
 生产 npm 包 abstract-logging 2.0.1 与 standardwebhooks 1.0.0 缺少独立许可正文，本项目补收录其上游原文。abstract-logging README 指向作者 MIT 许可网页，保留完整网页原文件；standardwebhooks 使用固定发布 gitHead 的 libraries/LICENSE（MIT），不混用仓库根的 Apache 许可。来源见 licenses/supplemental.json。
+
+Windows Setup.exe 使用 Inno Setup 7.1.0 编译。构建工具来自官方不可变发布，校验发布摘要和 Pyrsys B.V. Authenticode 签名；不随软件分发编译器。安装引擎保留 Jordan Russell 与 Martijn Laan 的原版权及网站信息，遵循 [Inno Setup License](https://jrsoftware.org/files/is/license.txt)。本项目未修改安装引擎。

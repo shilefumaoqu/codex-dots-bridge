@@ -3,6 +3,7 @@ param(
   [string]$DataDir = (Join-Path $env:LOCALAPPDATA 'CodexDotsBridge\data'),
   [string]$CodexHome,
   [string]$CodexCommand,
+  [ValidateSet('off','read','read-send')][string]$DesktopAccess,
   [switch]$Autostart,
   [string]$TunnelId,
   [string]$OrganizationId,
@@ -47,6 +48,15 @@ $registration = Invoke-BridgeJson $setupArgs
 $config = Get-Content -LiteralPath (Join-Path $DataDir 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($config.owner -ne 'codex-dots-bridge') { throw 'Owned production configuration is required.' }
 Write-Output '本机 MCP/Skill 注册已完成；当前 Codex 对话是否加载仍为 pending。'
+if ($DesktopAccess) {
+  $desktopStatus = Invoke-BridgeJson @('status', '--data-dir', $DataDir)
+  if ($desktopStatus.supervisor -eq 'stopped' -and $desktopStatus.service -eq 'stopped') {
+    $registration = Invoke-BridgeJson ($setupArgs + @('--desktop-access', $DesktopAccess))
+    Write-Output ('本机原对话访问设置：{0}；启用后按用户给出的链接定位，无需逐对话登记。' -f $DesktopAccess)
+  } else {
+    Write-Output '原对话访问设置 pending：请先停止本实例再重跑 -DesktopAccess；未更改运行中的访问范围。'
+  }
+}
 if (-not $TunnelId -and $config.tunnel) { $TunnelId = $config.tunnel.tunnel_id }
 if (-not $OrganizationId -and $config.tunnel) { $OrganizationId = $config.tunnel.organization_id }
 if (-not $TunnelEnv -and $config.tunnel) { $TunnelEnv = $config.tunnel.key_file }

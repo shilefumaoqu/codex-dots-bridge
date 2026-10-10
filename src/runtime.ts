@@ -5,6 +5,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { z } from 'zod';
 import { ProbeError } from './store.js';
+import { ownerNotificationConfigSchema, type OwnerNotificationConfig } from './owner-notification.js';
 
 export const defaultDataDir=()=>join(process.env.LOCALAPPDATA??join(homedir(),'.local','share'),'CodexDotsBridge','p0');
 const configSchema=z.object({owner:z.literal('codex-dots-bridge-p0'),instance_id:z.string().uuid(),endpoint:z.string().optional()}).strict();
@@ -167,8 +168,8 @@ const productionSchema=z.object({
   plugin:z.object({subscription_verified_at:z.string().datetime().optional()}).strict().optional(),
 }).strict();
 export type ProductionConfig=z.infer<typeof productionSchema>;
-const productionFiles=new Set(['config.json','caller.key','worker.key','tasks.sqlite','tasks.sqlite-wal','tasks.sqlite-shm','service.lock','supervisor.lock','supervisor-state.json','supervisor.stop','tunnel-health.url','installation.json','backup-manifest.json','tunnel-runtime.env']);
-const productionTempName=/^(?:supervisor-state|config)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tmp$/;
+const productionFiles=new Set(['config.json','desktop-echo.json','desktop-conversations.json','owner-notification.json','caller.key','worker.key','tasks.sqlite','tasks.sqlite-wal','tasks.sqlite-shm','service.lock','supervisor.lock','supervisor-state.json','supervisor.stop','tunnel-health.url','installation.json','backup-manifest.json','tunnel-runtime.env']);
+const productionTempName=/^(?:supervisor-state|config|desktop-conversations)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tmp$/;
 export function readProductionConfig(dir:string):ProductionConfig {
   const config=productionSchema.parse(JSON.parse(readFileSync(join(dir,'config.json'),'utf8')));
   if(config.endpoint) {
@@ -176,6 +177,19 @@ export function readProductionConfig(dir:string):ProductionConfig {
     if(u.protocol!=='http:' || u.hostname!=='127.0.0.1' || !u.port || u.pathname!=='/' || u.search || u.hash || u.username || u.password) throw new ProbeError('invalid_local_endpoint');
   }
   return config;
+}
+// Optional local executable binding is separate so already-running strict callers
+// keep reading exactly the original production schema. Reading never creates it.
+export function readOwnerNotificationConfig(dir:string):OwnerNotificationConfig|undefined {
+  const path=join(dir,'owner-notification.json');
+  let info:ReturnType<typeof lstatSync>;
+  try {info=lstatSync(path);} catch(error) {
+    if((error as NodeJS.ErrnoException).code==='ENOENT') return undefined;
+    throw new ProbeError('owner_notification_config_invalid');
+  }
+  if(info.isSymbolicLink() || !info.isFile()) throw new ProbeError('owner_notification_config_invalid');
+  try {return ownerNotificationConfigSchema.parse(JSON.parse(readFileSync(path,'utf8')));}
+  catch {throw new ProbeError('owner_notification_config_invalid');}
 }
 export function writeProductionConfig(dir:string,config:ProductionConfig) {
   productionSchema.parse(config);

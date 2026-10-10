@@ -19,7 +19,7 @@ try {
         }
         'build' { & $nodeExe 'node_modules\typescript\bin\tsc' -p tsconfig.json }
         'typecheck' { & $nodeExe 'node_modules\typescript\bin\tsc' --noEmit -p tsconfig.json }
-        'test' { & $nodeExe --import tsx --test 'test/*.test.ts' }
+        'test' { & $nodeExe --import tsx --test --test-concurrency=1 'test/*.test.ts' }
         'bridge' { & $nodeExe --import tsx src/main.ts @forward }
         'probe' { & $nodeExe --import tsx src/cli.ts @forward }
         default { throw 'Usage: dev.ps1 install|build|typecheck|test|bridge|probe [-- command arguments]' }
