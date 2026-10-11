@@ -29,7 +29,22 @@ $priorAppData=$env:APPDATA; $env:APPDATA=$startup
 $checks=[Collections.Generic.List[string]]::new()
 $installed=$false
 $productionKey='HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CodexDotsBridgeSetup_is1'
-$productionKeyBefore=if(Test-Path -LiteralPath $productionKey){Get-ItemProperty -LiteralPath $productionKey | ConvertTo-Json -Depth 10 -Compress}else{'absent'}
+function Get-RegistryValueSnapshot([string]$Path) {
+  if(-not (Test-Path -LiteralPath $Path)) { return 'absent' }
+  $key=Get-Item -LiteralPath $Path -ErrorAction Stop
+  try {
+    # Snapshot actual values, not PowerShell's recursive PSDrive/PSProvider metadata.
+    $values=[ordered]@{}
+    foreach($name in @($key.GetValueNames() | Sort-Object)) {
+      $values[$name]=[ordered]@{
+        kind=$key.GetValueKind($name).ToString()
+        value=$key.GetValue($name,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+      }
+    }
+    return ($values | ConvertTo-Json -Depth 4 -Compress)
+  } finally { $key.Close() }
+}
+$productionKeyBefore=Get-RegistryValueSnapshot $productionKey
 function Assert-Condition([bool]$Condition,[string]$Message) { if(-not $Condition) { throw $Message } }
 function Run-Executable([string]$Path,[string[]]$Arguments,[bool]$Success=$true) {
   $info=New-Object Diagnostics.ProcessStartInfo
@@ -356,7 +371,7 @@ public static class OneAddFailure {
   Assert-Condition (Test-Path -LiteralPath (Join-Path $data 'tasks.sqlite')) 'Uninstall deleted SQLite data.'
   Assert-Condition ([IO.File]::ReadAllText($desktopPath) -ceq $desktop) 'Uninstall changed desktop settings.'
   Assert-Condition ([IO.File]::ReadAllText((Join-Path $data 'caller.key')) -ceq $caller) 'Uninstall changed credentials.'
-  $productionKeyAfter=if(Test-Path -LiteralPath $productionKey){Get-ItemProperty -LiteralPath $productionKey | ConvertTo-Json -Depth 10 -Compress}else{'absent'}
+  $productionKeyAfter=Get-RegistryValueSnapshot $productionKey
   Assert-Condition ($productionKeyBefore -ceq $productionKeyAfter) 'Production Inno uninstall key changed.'
   $checks.Add('real_uninstall_owned_entries_program_registration_and_data_retention')
   $acceptance=[ordered]@{mode='real';setupSha256=$buildReceipt.setup_sha256;fromVersion=$fromVersion;toVersion=$buildReceipt.version;installed=$true;upgraded=[bool]($LegacyPackageRoot -or $UpgradeSetupExecutable);uninstalled=$true;uninstallPreservedData=$true;checks=@($checks);production_registry='not_touched';tunnel_cloud_acceptance='not_tested';cancel_confirmation_ui='not_tested'}
