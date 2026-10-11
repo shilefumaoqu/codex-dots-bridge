@@ -9,7 +9,7 @@ import { processIsAlive } from './maintenance.js';
 import { ProbeError } from './store.js';
 
 export interface SupervisorOptions {nodePath:string;entryPath:string}
-interface SupervisorState {owner:string;pid:number;bridge_pid?:number;tunnel_pid?:number;guardian_pid?:number;phase:'starting'|'running'|'stopping'|'failed';error?:string}
+interface SupervisorState {owner:string;pid:number;bridge_pid?:number;tunnel_pid?:number;guardian_pid?:number;phase:'starting'|'running'|'stopping'|'failed';error?:string;cleanup_complete?:boolean}
 const delay=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
 export function parseTunnelEnvironment(contents:string) {
   if(contents.length>16384)throw new ProbeError('invalid_tunnel_key_file');
@@ -26,12 +26,20 @@ function readState(dir:string):SupervisorState|undefined {
 }
 export function supervisorStatus(dir:string) {
   readProductionConfig(dir);const state=readState(dir);
+  // Completed cleanup is authoritative after the owner releases its lock; old PIDs can be reused.
+  if(state?.cleanup_complete===true){
+    const stopped={supervisor:'stopped',bridge:'stopped',tunnel:'stopped',guardian:'stopped',error:state.error??null};
+    try{
+      const lock=JSON.parse(readFileSync(join(dir,'supervisor.lock'),'utf8')) as {owner:string;pid:number};
+      return {...stopped,supervisor:lock.owner===state.owner&&lock.pid===state.pid?'stopping':'unknown',error:lock.owner===state.owner&&lock.pid===state.pid?state.error??null:'supervisor_ownership_mismatch'};
+    }catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return stopped;throw error;}
+  }
   const bridge=state?.bridge_pid&&processIsAlive(state.bridge_pid)?'running':'stopped',tunnel=state?.tunnel_pid&&processIsAlive(state.tunnel_pid)?'running':'stopped',guardian=state?.guardian_pid&&processIsAlive(state.guardian_pid)?'running':'stopped';
   return {supervisor:state&&processIsAlive(state.pid)?state.phase:(bridge==='running'||tunnel==='running'||guardian==='running'?'orphaned_children':'stopped'),bridge,tunnel,guardian,error:state?.error??null};
 }
 export async function startSupervisor(dir:string,options:SupervisorOptions) {
   protectProductionDirectory(dir);
-  const previous=readState(dir);if(previous&&processIsAlive(previous.pid))throw new ProbeError('supervisor_already_running');
+  const previous=readState(dir);if(previous&&!previous.cleanup_complete&&processIsAlive(previous.pid))throw new ProbeError('supervisor_already_running');
   if(existsSync(join(dir,'supervisor.lock')))throw new ProbeError('stale_supervisor_lock');
   const child=spawn(resolve(options.nodePath),[resolve(options.entryPath),'run','--supervisor','--data-dir',resolve(dir)],{detached:true,stdio:'ignore',windowsHide:true,env:isolatedEnvironment()});
   let failed=false;child.once('error',()=>{failed=true;});child.unref();
@@ -44,14 +52,14 @@ export async function startSupervisor(dir:string,options:SupervisorOptions) {
 }
 export async function stopSupervisor(dir:string) {
   readProductionConfig(dir);const state=readState(dir);
-  if(!state||!processIsAlive(state.pid)) {
+  if(!state||state.cleanup_complete===true||!processIsAlive(state.pid)) {
     for(let i=0;i<50;i++){if(supervisorStatus(dir).supervisor==='stopped')return {supervisor:'stopped',dot_tasks:'not_cancelled'};await delay(100);}
     throw new ProbeError('orphaned_children_require_recovery');
   }
   const lock=JSON.parse(readFileSync(join(dir,'supervisor.lock'),'utf8')) as {owner:string;pid:number};
   if(lock.owner!==state.owner||lock.pid!==state.pid)throw new ProbeError('supervisor_ownership_mismatch');
   writeFileSync(join(dir,'supervisor.stop'),JSON.stringify({owner:state.owner}),{mode:0o600});
-  for(let i=0;i<300;i++){await delay(100);if(!processIsAlive(state.pid)&&supervisorStatus(dir).supervisor==='stopped')return {supervisor:'stopped',dot_tasks:'not_cancelled'};}
+  for(let i=0;i<300;i++){await delay(100);if(supervisorStatus(dir).supervisor==='stopped')return {supervisor:'stopped',dot_tasks:'not_cancelled'};}
   throw new ProbeError('supervisor_stop_pending');
 }
 async function terminate(child:ChildProcess|undefined,graceful=false) {
@@ -88,10 +96,11 @@ export async function runSupervisor(dir:string,options:SupervisorOptions) {
     const code=(error as NodeJS.ErrnoException).code;
     lastError=error instanceof ProbeError?error.code:(typeof code==='string'&&/^[A-Z_]+$/.test(code)?`supervisor_io_${code}`:'supervisor_operation_failed');
   };
-  const cleanupStep=async(action:()=>void|Promise<void>)=>{try{await action();}catch(error){recordError(error);}};
-  const state=(phase:SupervisorState['phase'],error?:string)=>{
+  let resourceCleanupFailed=false;
+  const cleanupStep=async(action:()=>void|Promise<void>,resource=true)=>{try{await action();}catch(error){if(resource)resourceCleanupFailed=true;recordError(error);}};
+  const state=(phase:SupervisorState['phase'],error?:string,cleanupComplete=false)=>{
     const path=join(dir,`supervisor-state.${randomUUID()}.tmp`);
-    writeFileSync(path,JSON.stringify({owner,pid:process.pid,bridge_pid:bridge?.pid,tunnel_pid:tunnelPid,guardian_pid:guardian?.pid,phase,...(error?{error}:{})}),{mode:0o600,flag:'wx'});
+    writeFileSync(path,JSON.stringify({owner,pid:process.pid,...(!cleanupComplete?{bridge_pid:bridge?.pid,tunnel_pid:tunnelPid,guardian_pid:guardian?.pid}:{cleanup_complete:true}),phase,...(error?{error}:{})}),{mode:0o600,flag:'wx'});
     renameSync(path,join(dir,'supervisor-state.json'));
   };
   const stop=()=>{stopping=true;};process.once('SIGINT',stop);process.once('SIGTERM',stop);
@@ -130,7 +139,7 @@ export async function runSupervisor(dir:string,options:SupervisorOptions) {
     }
   }catch(error){recordError(error);}
   finally {
-    if(!lastError)await cleanupStep(()=>state('stopping'));
+    if(!lastError)await cleanupStep(()=>state('stopping'),false);
     // State I/O is advisory. Each resource cleanup runs even if an earlier step fails.
     await cleanupStep(()=>{guardian?.stdin?.end();});
     await cleanupStep(()=>terminate(guardian,true));
@@ -142,10 +151,21 @@ export async function runSupervisor(dir:string,options:SupervisorOptions) {
     await cleanupStep(()=>{
       if(existsSync(join(dir,'supervisor.stop'))){try{const stop=JSON.parse(readFileSync(join(dir,'supervisor.stop'),'utf8')) as {owner:string};if(stop.owner===owner)unlinkSync(join(dir,'supervisor.stop'));}catch{/* preserve unknown */}}
     });
+    await cleanupStep(async()=>{
+      const exited=(child:ChildProcess|undefined)=>!child?.pid||child.exitCode!==null||child.signalCode!==null;
+      // The Windows Job may finish terminating the Tunnel shortly after its guardian exits.
+      for(let i=0;tunnelPid&&processIsAlive(tunnelPid)&&i<200;i++)await delay(25);
+      const cleanupComplete=!resourceCleanupFailed&&exited(bridge)&&exited(guardian)&&(!tunnelPid||!processIsAlive(tunnelPid));
+      if(!cleanupComplete)recordError(new ProbeError('supervisor_children_stop_pending'));
+      const lock=JSON.parse(readFileSync(lockPath,'utf8')) as {owner:string;pid:number};
+      if(lock.owner!==owner||lock.pid!==process.pid)throw new ProbeError('supervisor_ownership_mismatch');
+      // Publish before unlocking: a later instance must never be overwritten by this one.
+      state(lastError?'failed':'stopping',lastError,cleanupComplete);
+    },false);
     await cleanupStep(()=>{
       if(existsSync(lockPath)){const lock=JSON.parse(readFileSync(lockPath,'utf8')) as {owner:string};if(lock.owner===owner)unlinkSync(lockPath);}
     });
     process.removeListener('SIGINT',stop);process.removeListener('SIGTERM',stop);
   }
-  if(lastError){try{state('failed',lastError);}catch{/* Cleanup is complete; keep the original safe diagnostic. */}throw new ProbeError(lastError);}
+  if(lastError)throw new ProbeError(lastError);
 }

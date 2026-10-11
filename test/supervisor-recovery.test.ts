@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, existsSync, rmSync, unlinkSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -14,14 +14,17 @@ import { processIsAlive } from '../src/maintenance.js';
 const delay=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
 async function until(check:()=>boolean,timeout=10000){const end=Date.now()+timeout;while(Date.now()<end){if(check())return;await delay(25);}assert.fail('condition timed out');}
 function cleanup(path:string){assert.ok(resolve(path).startsWith(resolve(tmpdir())+sep));rmSync(path,{recursive:true,force:true,maxRetries:6,retryDelay:150});}
-function fixture(root:string,stateFault?:'starting'|'stopping'){
+function fixture(root:string,stateFault?:'starting'|'stopping'|'starting-handoff'|'tunnel-alive'){
   const dir=join(root,'data'),vendor=join(root,"vendor 空格 O'Brien"),entry=join(root,'fixture main.mjs');initProduction(dir);mkdirSync(vendor);
   const exe=join(vendor,'fake-tunnel.exe'),key=join(dir,'tunnel-runtime.env');copyFileSync(process.execPath,exe);writeFileSync(key,'CONTROL_PLANE_API_KEY=synthetic_recovery_key');
   const probe=join(vendor,'probe.json');
   writeFileSync(join(vendor,'run'),`const fs=require('node:fs'),cp=require('node:child_process');const child=cp.spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{detached:true,stdio:'ignore',windowsHide:true});child.unref();fs.writeFileSync(${JSON.stringify(probe)},JSON.stringify({pid:process.pid,descendant:child.pid,key_present:process.env.CONTROL_PLANE_API_KEY==='synthetic_recovery_key'}));console.log(process.env.CONTROL_PLANE_API_KEY);setInterval(()=>{},1000);`);
   const runtime=pathToFileURL(resolve('dist/supervisor.js')).href;
   const configRuntime=pathToFileURL(resolve('dist/runtime.js')).href,diagnostic=join(root,'diagnostic.json');
-  const injection=stateFault?`const original=fs.writeFileSync;fs.writeFileSync=(path,value,...options)=>{if(String(path).includes('supervisor-state.')&&String(path).endsWith('.tmp')&&JSON.parse(String(value)).phase===${JSON.stringify(stateFault)}){const error=new Error('synthetic state I/O fault');error.code='EIO';throw error;}return original(path,value,...options);};syncBuiltinESMExports();`:'';
+  const faultPhase=stateFault==='starting-handoff'?'starting':stateFault;
+  let injection=stateFault&&stateFault!=='tunnel-alive'?`const original=fs.writeFileSync;fs.writeFileSync=(path,value,...options)=>{if(String(path).includes('supervisor-state.')&&String(path).endsWith('.tmp')&&JSON.parse(String(value)).phase===${JSON.stringify(faultPhase)}){const error=new Error('synthetic state I/O fault');error.code='EIO';throw error;}return original(path,value,...options);};syncBuiltinESMExports();`:'';
+  if(stateFault==='starting-handoff')injection+=`const remove=fs.unlinkSync;fs.unlinkSync=(path)=>{remove(path);if(String(path)===join(dir,'supervisor.lock')){const next={owner:'next-owner',pid:process.pid,phase:'running'};writeFileSync(join(dir,'supervisor.lock'),JSON.stringify(next));writeFileSync(join(dir,'supervisor-state.json'),JSON.stringify(next));}};syncBuiltinESMExports();`;
+  if(stateFault==='tunnel-alive')injection+=`const kill=process.kill;process.kill=function(pid,signal){if(signal===0&&fs.existsSync(${JSON.stringify(probe)})&&pid===JSON.parse(readFileSync(${JSON.stringify(probe)},'utf8')).pid)return true;return kill.call(process,pid,signal);};`;
   writeFileSync(entry,`import fs,{readFileSync,writeFileSync,unlinkSync} from 'node:fs';import {syncBuiltinESMExports} from 'node:module';import {join} from 'node:path';import {createServer} from 'node:http';const args=process.argv.slice(2),dir=args[args.indexOf('--data-dir')+1];if(args.includes('--supervisor')){${injection}const {runSupervisor}=await import(${JSON.stringify(runtime)});try{await runSupervisor(dir,{nodePath:process.execPath,entryPath:process.argv[1]});}catch(error){writeFileSync(${JSON.stringify(diagnostic)},JSON.stringify({error:error.code}));process.exitCode=1;}}else {const {readProductionConfig,writeProductionConfig}=await import(${JSON.stringify(configRuntime)});const lock=join(dir,'service.lock');try{writeFileSync(lock,JSON.stringify({pid:process.pid,owner:'fixture'}),{flag:'wx'});}catch{process.exit(1);}const server=createServer((_,res)=>res.end('alive'));let stopping=false;const stop=()=>{if(stopping)return;stopping=true;server.close(()=>{unlinkSync(lock);if(process.connected)process.disconnect();});};process.on('message',m=>{if(m.type==='shutdown')stop();});process.once('disconnect',stop);server.listen(0,'127.0.0.1',()=>{const cfg=readProductionConfig(dir);cfg.endpoint='http://127.0.0.1:'+server.address().port+'/';writeProductionConfig(dir,cfg);process.send?.({type:'bridge_ready',endpoint:cfg.endpoint});});}`);
   writeProductionConfig(dir,{...readProductionConfig(dir),tunnel:{tunnel_id:'tunnel_test',organization_id:'org_test',client_path:exe,key_file:key}});protectProductionDirectory(dir);
   return {dir,exe,key,probe,entry,diagnostic};
@@ -60,7 +63,48 @@ test('state observers see complete JSON throughout real supervisor start and sto
     const f=fixture(root);const cfg=readProductionConfig(f.dir);delete cfg.tunnel;writeProductionConfig(f.dir,cfg);
     reader=(async()=>{while(!stop){if(existsSync(join(f.dir,'supervisor-state.json'))){assert.doesNotThrow(()=>supervisorStatus(f.dir));}await delay(1);}})();
     await startSupervisor(f.dir,{nodePath:process.execPath,entryPath:f.entry});await stopSupervisor(f.dir);stop=true;await reader;
+    const final=JSON.parse(readFileSync(join(f.dir,'supervisor-state.json'),'utf8'));
+    assert.equal(final.cleanup_complete,true);for(const field of ['bridge_pid','tunnel_pid','guardian_pid'])assert.equal(final[field],undefined);
   }finally{stop=true;await reader;cleanup(root);}
+});
+
+test('completed cleanup ignores a reused live PID and allows a new start',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots completed cleanup '));let dir:string|undefined;
+  try{
+    const f=fixture(root);dir=f.dir;const cfg=readProductionConfig(dir);delete cfg.tunnel;writeProductionConfig(dir,cfg);
+    writeFileSync(join(dir,'supervisor-state.json'),JSON.stringify({owner:randomUUID(),pid:process.pid,phase:'stopping',cleanup_complete:true}));
+    assert.equal(supervisorStatus(dir).supervisor,'stopped');assert.equal((await stopSupervisor(dir)).supervisor,'stopped');assert.ok(!existsSync(join(dir,'supervisor.stop')));
+    assert.equal((await startSupervisor(dir,{nodePath:process.execPath,entryPath:f.entry})).supervisor,'running');await stopSupervisor(dir);
+  }finally{if(dir){try{await stopSupervisor(dir);}catch{}}cleanup(root);}
+});
+
+test('completed cleanup waits for its lock release and does not accept a foreign lock',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots cleanup lock '));
+  try{
+    const dir=join(root,'data');initProduction(dir);const state={owner:randomUUID(),pid:process.pid,phase:'stopping',cleanup_complete:true};
+    const lock=join(dir,'supervisor.lock');writeFileSync(join(dir,'supervisor-state.json'),JSON.stringify(state));writeFileSync(lock,JSON.stringify(state));
+    assert.equal(supervisorStatus(dir).supervisor,'stopping');const stopped=stopSupervisor(dir);setTimeout(()=>unlinkSync(lock),50);await stopped;
+    const foreign=JSON.stringify({...state,owner:randomUUID()});writeFileSync(lock,foreign);
+    assert.equal(supervisorStatus(dir).supervisor,'unknown');await assert.rejects(()=>stopSupervisor(dir),/orphaned_children_require_recovery/);
+    assert.equal(readFileSync(lock,'utf8'),foreign);assert.ok(!existsSync(join(dir,'supervisor.stop')));
+  }finally{cleanup(root);}
+});
+
+test('a failed old owner never overwrites the replacement state after releasing its lock',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots cleanup handoff '));let child:ChildProcess|undefined;
+  try{
+    const f=fixture(root,'starting-handoff');child=spawn(process.execPath,[f.entry,'run','--supervisor','--data-dir',f.dir],{env:isolatedEnvironment(),windowsHide:true,stdio:'ignore'});await until(()=>child!.exitCode!==null);
+    assert.equal(child.exitCode,1);for(const file of ['supervisor.lock','supervisor-state.json'])assert.equal(JSON.parse(readFileSync(join(f.dir,file),'utf8')).owner,'next-owner');
+  }finally{if(child?.exitCode===null)child.kill('SIGKILL');cleanup(root);}
+});
+
+test('an unconfirmed live Tunnel prevents the completed cleanup marker',{skip:process.platform!=='win32'},async()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots incomplete cleanup '));let dir:string|undefined;
+  try{
+    const f=fixture(root,'tunnel-alive');dir=f.dir;await startSupervisor(dir,{nodePath:process.execPath,entryPath:f.entry});await until(()=>existsSync(f.probe),45000);await stopSupervisor(dir);
+    const state=JSON.parse(readFileSync(join(dir,'supervisor-state.json'),'utf8'));assert.notEqual(state.cleanup_complete,true);assert.equal(state.error,'supervisor_children_stop_pending');assert.ok(state.tunnel_pid);
+    assert.equal(processIsAlive(state.tunnel_pid),false);assert.ok(!existsSync(join(dir,'supervisor.lock')));
+  }finally{if(dir){try{await stopSupervisor(dir);}catch{}}cleanup(root);}
 });
 test('owned crash temporaries are retained without adopting them or blocking startup',async()=>{
   const root=mkdtempSync(join(tmpdir(),'dots crash temp '));let dir:string|undefined;

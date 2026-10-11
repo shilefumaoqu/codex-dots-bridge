@@ -47,6 +47,11 @@ function Get-RegistryValueSnapshot([string]$Path) {
 $productionKeyBefore=Get-RegistryValueSnapshot $productionKey
 function Assert-Condition([bool]$Condition,[string]$Message) { if(-not $Condition) { throw $Message } }
 function Run-Executable([string]$Path,[string[]]$Arguments,[bool]$Success=$true) {
+  $callerLine=(Get-PSCallStack | Select-Object -Skip 1 -First 1).ScriptLineNumber
+  $runId=[Guid]::NewGuid().ToString('N')
+  $logPath=Join-Path $work ('installer-'+$runId+'.log')
+  $Arguments+=('/LOG='+$logPath)
+  $watch=[Diagnostics.Stopwatch]::StartNew()
   $info=New-Object Diagnostics.ProcessStartInfo
   $info.FileName=[IO.Path]::GetFullPath($Path); $info.UseShellExecute=$false; $info.CreateNoWindow=$true
   # Filesystem paths cannot contain double quotes. Each argument reaches Inno directly, without a shell.
@@ -54,7 +59,9 @@ function Run-Executable([string]$Path,[string[]]$Arguments,[bool]$Success=$true)
   $process=[Diagnostics.Process]::Start($info)
   try {
     if(-not $process.WaitForExit(180000)) { throw 'Installer test timed out; retaining test workspace for diagnosis.' }
-    if($Success) { Assert-Condition ($process.ExitCode -eq 0) ('Expected installer success, exit='+$process.ExitCode) }
+    $entry=[ordered]@{source_line=$callerLine;executable=[IO.Path]::GetFileName($Path);exit_code=$process.ExitCode;expected_success=$Success;elapsed_ms=$watch.ElapsedMilliseconds;log=[IO.Path]::GetFileName($logPath)}
+    [IO.File]::AppendAllText((Join-Path $work 'lifecycle-commands.ndjson'),(($entry | ConvertTo-Json -Compress)+"`n"),[Text.UTF8Encoding]::new($false))
+    if($Success) { Assert-Condition ($process.ExitCode -eq 0) ('Expected installer success: '+$entry.executable+', source line='+$callerLine+', exit='+$process.ExitCode) }
     else { Assert-Condition ($process.ExitCode -ne 0) 'Expected ownership blocker to reject installation.' }
     $script:lastInstallerExitCode=$process.ExitCode
   } finally { $process.Dispose() }
