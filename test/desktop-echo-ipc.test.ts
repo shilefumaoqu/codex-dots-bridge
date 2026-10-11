@@ -14,12 +14,15 @@ class FakeSocket extends EventEmitter {
   destroy() { if (!this.destroyed) { this.destroyed = true; queueMicrotask(() => { this.closed = true; this.emit('close'); }); } return this; }
 }
 function idle(id: string) { return { id, resumeState: 'resumed', threadRuntimeStatus: { type: 'idle' }, turnHistory: { kind: 'legacy' }, turns: [] }; }
-function setup(mode: 'idle' | 'busy' | 'unknown' | 'race' | 'wrong_owner' | 'ack_loss' | 'ack_timeout' | 'oversize' = 'idle', options: { ackDelayMs?: number; deadlineMs?: number; rolloutPath?: string } = {}) {
+function setup(mode: 'idle' | 'busy' | 'unknown' | 'race' | 'wrong_owner' | 'ack_loss' | 'ack_timeout' | 'owner_timeout' | 'oversize' = 'idle', options: { ackDelayMs?: number; ownerDelayMs?: number; ownerError?: 'no-client-found'; deadlineMs?: number; rolloutPath?: string } = {}) {
   const threadId = randomUUID(), requestId = randomUUID(), turnId = randomUUID(); const controller = new AbortController(); let sends = 0, lateAck: (() => void) | undefined; const metadata: (DesktopThreadMetadata | undefined)[] = [];
   const socket = new FakeSocket((message, s) => {
     const reply = (result: object, handledByClientId = 'owner') => s.receive({ type: 'response', requestId: message.requestId, resultType: 'success', method: message.method, handledByClientId, result });
     if (message.method === 'initialize') reply({ clientId: 'follower' });
-    else if (message.method === 'thread-owner-discovery') reply({});
+    else if (message.method === 'thread-owner-discovery' && mode !== 'owner_timeout') {
+      const ownerReply = () => options.ownerError ? s.receive({ type: 'response', requestId: message.requestId, resultType: 'error', error: options.ownerError }) : reply({});
+      if (options.ownerDelayMs) setTimeout(ownerReply, options.ownerDelayMs); else ownerReply();
+    }
     else if (message.method === 'thread-stream-following-changed' && message.params.following) {
       const state = { ...idle(threadId), ...(options.rolloutPath !== undefined ? { rolloutPath: options.rolloutPath } : {}) };
       if (mode === 'busy') state.threadRuntimeStatus.type = 'active'; if (mode === 'unknown') state.resumeState = 'restoring';
@@ -74,7 +77,34 @@ test('start ACK arriving after two seconds is accepted once within its fifteen-s
   const result = await f.run(); assert.deepEqual(result, { status: 'accepted', turnId: f.turnId });
   assert.equal(f.sends(), 1); assert.equal(f.socket.frames.filter(value => value.method === 'thread-follower-start-turn').length, 1);
   const start = f.socket.frames.find(value => value.method === 'thread-follower-start-turn'); assert.equal(start.timeoutMs, 15000); assert.equal(start.params.turnStart.request.input[0].text, fixedEchoPrompt(f.requestId));
-  assert(f.socket.frames.filter(value => ['initialize', 'thread-owner-discovery'].includes(value.method)).every(value => value.timeoutMs <= 2000)); assert.equal(f.socket.closed, true);
+  assert.equal(f.socket.frames.find(value => value.method === 'initialize').timeoutMs, 2000);
+  assert.equal(f.socket.frames.find(value => value.method === 'thread-owner-discovery').timeoutMs, 12000); assert.equal(f.socket.closed, true);
+});
+test('owner discovery after two seconds succeeds within its twelve-second budget and starts once', async () => {
+  const f = setup('idle', { ownerDelayMs: 2100, deadlineMs: 20000 });
+  assert.deepEqual(await f.run(), { status: 'accepted', turnId: f.turnId });
+  assert.equal(f.socket.frames.find(value => value.method === 'initialize').timeoutMs, 2000);
+  assert.equal(f.socket.frames.find(value => value.method === 'thread-owner-discovery').timeoutMs, 12000);
+  assert.equal(f.sends(), 1); assert.equal(f.socket.frames.filter(value => value.method === 'thread-owner-discovery').length, 1);
+  assert.equal(f.socket.frames.filter(value => value.method === 'thread-follower-start-turn').length, 1); assert.equal(f.socket.closed, true);
+});
+test('explicit no-client-found after the router ten-second wait remains native_owner_unavailable without sending', async () => {
+  const f = setup('idle', { ownerDelayMs: 10010, ownerError: 'no-client-found', deadlineMs: 20000 });
+  assert.deepEqual(await f.run(), { status: 'skipped_unknown', reason: 'native_owner_unavailable' });
+  assert.equal(f.sends(), 0); assert.equal(f.socket.frames.filter(value => value.method === 'thread-owner-discovery').length, 1);
+  assert(!f.socket.frames.some(value => ['thread-stream-following-changed', 'thread-follower-start-turn'].includes(value.method))); assert.equal(f.socket.closed, true);
+});
+test('owner discovery still obeys a shorter overall deadline or abort without retry or send', async () => {
+  for (const cause of ['deadline', 'signal'] as const) {
+    const f = setup('owner_timeout', { deadlineMs: cause === 'deadline' ? 80 : 20000 }); const startedAt = Date.now(), pending = f.run();
+    const timer = cause === 'signal' ? setTimeout(() => f.controller.abort(), 20) : undefined;
+    try {
+      assert.deepEqual(await pending, { status: 'skipped_unknown', reason: 'ipc_aborted' }); assert(Date.now() - startedAt < 2000);
+      const discovery = f.socket.frames.filter(value => value.method === 'thread-owner-discovery'); assert.equal(discovery.length, 1);
+      assert(discovery[0].timeoutMs > 0); assert(discovery[0].timeoutMs <= (cause === 'deadline' ? 80 : 12000));
+      assert.equal(f.sends(), 0); assert(!f.socket.frames.some(value => ['thread-stream-following-changed', 'thread-follower-start-turn'].includes(value.method))); assert.equal(f.socket.closed, true);
+    } finally { clearTimeout(timer); }
+  }
 });
 test('real ACK timeout obeys the overall deadline, closes, and a late ACK never retransmits', async () => {
   const f = setup('ack_timeout', { deadlineMs: 80 }); const result = await f.run();
@@ -105,7 +135,7 @@ async function probeFailure(stopAt: 'initialize' | 'thread-owner-discovery' | 't
     if (message.method === 'initialize') s.receive({ type: 'response', requestId: message.requestId, resultType: 'success', result: { clientId: 'follower' } });
     else if (message.method === 'thread-owner-discovery') s.receive({ type: 'response', requestId: message.requestId, resultType: 'success', handledByClientId: 'owner' });
   });
-  const result = await runDesktopReadIpc({ threadId, signal: new AbortController().signal, deadline: Date.now() + (response === 'timeout' ? 3000 : 150) }, { connect: () => { connections++; return socket as unknown as net.Socket; } });
+  const result = await runDesktopReadIpc({ threadId, signal: new AbortController().signal, deadline: Date.now() + (response === 'timeout' ? stopAt === 'thread-owner-discovery' ? 13000 : 3000 : 150) }, { connect: () => { connections++; return socket as unknown as net.Socket; } });
   assert.equal(connections, 1); assert.equal(socket.closed, true);
   assert(!socket.frames.some(value => value.method === 'thread-follower-start-turn'));
   assert(!JSON.stringify(result).includes('SECRET')); assert(!JSON.stringify(result).includes('private'));

@@ -75,9 +75,10 @@ async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boo
   const request = (method: IpcMethod, params: State, version = 1, targetClientId?: string): Promise<State> => {
     const requestId = randomUUID();
     return new Promise((resolve, reject) => {
-      // Starting a turn can take longer than lightweight owner discovery. Keep
-      // the same single transmission and let only its ACK use the longer tail.
-      const timeoutMs = Math.max(1, Math.min(method === 'thread-follower-start-turn' ? 15000 : 2000, input.deadline - Date.now()));
+      // Router discovery itself can wait ten seconds. Allow its terminal reply
+      // a bounded margin; initialization and start ACK retain their own budgets.
+      const requestBudgetMs = method === 'thread-owner-discovery' ? 12000 : method === 'thread-follower-start-turn' ? 15000 : 2000;
+      const timeoutMs = Math.max(1, Math.min(requestBudgetMs, input.deadline - Date.now()));
       const timer = setTimeout(() => { pending.delete(requestId); reject(failure('request_timeout', method)); }, timeoutMs);
       pending.set(requestId, { method, resolve, reject, timer });
       try { write({ type: 'request', requestId, sourceClientId: clientId ?? 'initializing-client', ...(targetClientId ? { targetClientId } : {}), version, method, timeoutMs, params }); }
