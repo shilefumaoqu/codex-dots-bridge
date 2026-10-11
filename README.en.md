@@ -25,7 +25,7 @@ For example: “Give this requirements document to my Dot and organize the goals
 
 ## Current version and downloads
 
-**`0.2.0-alpha.7` is a Windows x64 prerelease**, installed through one `Setup.exe` containing the Node runtime and production dependencies. Users need no separate Node/npm installation. Consult that version’s Release record for installation, upgrade, uninstall and live-connection acceptance results; static package documentation defines the operating contract. Older alpha.4 does not include all the new capabilities on this page. Access follows the repository's current GitHub visibility; private repositories require appropriate permissions.
+**`0.2.0-alpha.8` is a Windows x64 prerelease**, installed through one `Setup.exe` containing the Node runtime and production dependencies. Users need no separate Node/npm installation. Consult that version’s Release record for installation, upgrade, uninstall and live-connection acceptance results; static package documentation defines the operating contract. Older alpha.4 does not include all the new capabilities on this page. Access follows the repository's current GitHub visibility; private repositories require appropriate permissions.
 
 Supports one local user, one existing Dot and a single FIFO task execution slot. Official read-only history and private desktop IPC sending use separate interfaces; sending remains experimental and is not an officially supported stable interface. This is an independent project. Both READMEs cover the same steps and boundaries; detailed guides are currently in Chinese.
 

@@ -144,7 +144,7 @@ export function verifyReleaseEvidence(evidence, expected, evidenceRoot) {
   if (!['busy', 'offline', 'timeout', 'duplicate', 'wrongTarget'].every(name => evidence.basicErrors?.cases?.[name] === 'passed')) fail('basic-error-cases-missing');
   if (evidence.basicErrors?.uncertainAutoRetry !== false) fail('uncertain-send-may-retry');
   // Older ZIP-only releases remain compatible; declared Setup releases bind the exact installer too.
-  const requiresSetup = expected.requiresSetup === true || expected.setupSha256 !== undefined || evidence.setupSha256 !== undefined || evidence.installUpgradeUninstall !== undefined || expected.version === '0.2.0-alpha.7';
+  const requiresSetup = expected.requiresSetup === true || expected.setupSha256 !== undefined || evidence.setupSha256 !== undefined || evidence.installUpgradeUninstall !== undefined || ['0.2.0-alpha.7','0.2.0-alpha.8'].includes(expected.version);
   if (requiresSetup) {
     if (!/^[a-f0-9]{64}$/.test(expected.setupSha256 ?? '')) fail('missing-setup-artifact');
     if (!expected.setupSha256 || evidence.setupSha256 !== expected.setupSha256) fail('candidate-mismatch:setupSha256');

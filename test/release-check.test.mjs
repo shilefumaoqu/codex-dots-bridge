@@ -141,8 +141,8 @@ test('declared Setup evidence binds installer bytes and real install upgrade uni
   const setupExpected = { ...expected, setupSha256: sha('synthetic setup bytes') };
   assert.deepEqual(verifyReleaseEvidence(setupEvidence(setupExpected), setupExpected, dir), []);
 }));
-test('alpha.7 and explicitly required Setup releases reject absent installers', () => scratch(dir => {
-  for (const setupExpected of [{ ...expected, version: '0.2.0-alpha.7' }, { ...expected, requiresSetup: true }]) {
+test('alpha.7, alpha.8 and explicitly required Setup releases reject absent installers', () => scratch(dir => {
+  for (const setupExpected of [{ ...expected, version: '0.2.0-alpha.7' }, { ...expected, version: '0.2.0-alpha.8' }, { ...expected, requiresSetup: true }]) {
     const value = { ...evidence(), version: setupExpected.version };
     assert.ok(verifyReleaseEvidence(value, setupExpected, dir).includes('missing-setup-artifact'));
   }
