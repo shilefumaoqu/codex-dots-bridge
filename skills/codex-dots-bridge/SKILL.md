@@ -5,7 +5,7 @@ description: 通过已配置的 Codex Dots Bridge 向自己的 Dot 委派任务�
 
 # Codex Dots Bridge
 
-本 Skill 使用本机 dots_* caller 工具完成 Codex → Dot → Codex 协作。可选 Dot → 指定本机 Codex 对话入口使用 codex_* worker 工具，需本机显式启用。alpha.7 是 Windows x64 预发布版本，Setup 自带 Node 运行时与生产依赖；安装和真实闭环验收以该版本 Release 记录为准。执行以实际发现的工具 schema 和运行版本为准，不能将静态文档或旧基线实测当作当前安装已通过。
+本 Skill 使用本机 dots_* caller 工具完成 Codex → Dot → Codex 协作。可选 Dot → 指定本机 Codex 对话入口使用 codex_* worker 工具，需本机显式启用。当前为 Windows x64 预发布版本，Setup 自带 Node 运行时与生产依赖；具体版本以 dots_status.version 为准，安装和真实闭环验收以对应版本 Release 记录为准。执行以实际发现的工具 schema 和运行版本为准，不能将静态文档或旧基线实测当作当前安装已通过。
 
 ## 开始与定位
 
