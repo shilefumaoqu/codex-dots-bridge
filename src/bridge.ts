@@ -16,7 +16,7 @@ import { CallbackError } from './webhook.js';
 import { readProductionConfig, readToken } from './runtime.js';
 import { notifyOwnerSchema, notifyOwner, submitNotificationReply, notificationConfigurationCurrent, type OwnerNotificationOptions } from './owner-notification.js';
 
-export const VERSION = '0.2.0-alpha.8';
+export const VERSION = '0.2.0-alpha.9';
 export type RuntimeStatusProvider = () => unknown | Promise<unknown>;
 const runtimeStatusSchema = z.object({
   tunnel_configured: z.boolean().nullable(),
