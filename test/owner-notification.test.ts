@@ -235,3 +235,49 @@ test('adapter receipt error codes retain accepted-save failures and strip privat
   assert.deepEqual(await notifyOwner(f.store,f.options,{notification_id:'n',text:'a'}),{status:'unknown',notificationId:'n'});
   }finally{f.close();}
 });
+
+test('adapter safe causes and phases survive only validated preparation and receipt contracts',async()=>{
+  const f=fixture();try{f.subscribe();
+    f.options.notifier={async send(){throw Object.assign(Error('PRIVATE path token body'),{
+      code:'BRIDGE_NOTIFICATION_PREPARE_FAILED',phase:'prepare',definitelyNotSent:true,causeCode:'EACCES',
+      account:'PRIVATE',response:'PRIVATE',cause:Error('PRIVATE')});}};
+    assert.deepEqual(await notifyOwner(f.store,f.options,{notification_id:'n',text:'a'}),{
+      status:'failed',notificationId:'n',code:'BRIDGE_NOTIFICATION_PREPARE_FAILED',phase:'prepare',sent:false,causeCode:'EACCES'});
+    for(const [status,errorCode,phase,causeCode] of [
+      ['unknown','BRIDGE_NOTIFICATION_SEND_UNCONFIRMED','transport','ENOTFOUND'],
+      ['failed','BRIDGE_NOTIFICATION_PROVIDER_REJECTED','transport','ABORTED'],
+      ['accepted','BRIDGE_NOTIFICATION_RECEIPT_SAVE_FAILED','receipt','ENOSPC']]) {
+      f.options.notifier={async send(){return {status,errorCode,phase,causeCode,receiptPersisted:false,
+        message:'PRIVATE',path:'PRIVATE',account:'PRIVATE',response:'PRIVATE',cause:{code:'PRIVATE'}};}};
+      assert.deepEqual(await notifyOwner(f.store,f.options,{notification_id:'n',text:'a'}),{
+        status,receiptPersisted:false,notificationId:'n',code:errorCode,phase,causeCode});
+    }
+  }finally{f.close();}
+});
+
+test('adapter unknown diagnostics and invalid phases never leak or change acceptance facts',async()=>{
+  const f=fixture();try{f.subscribe();
+    for(const causeCode of ['PRIVATE C:/credential token',{code:'EACCES'},['ENOSPC'],null,1]) {
+      f.options.notifier={async send(){return {status:'accepted',errorCode:'BRIDGE_NOTIFICATION_RECEIPT_SAVE_FAILED',
+        receiptPersisted:false,phase:'PRIVATE',causeCode,text:'PRIVATE'};}};
+      assert.deepEqual(await notifyOwner(f.store,f.options,{notification_id:'n',text:'a'}),{
+        status:'accepted',receiptPersisted:false,notificationId:'n',code:'BRIDGE_NOTIFICATION_RECEIPT_SAVE_FAILED'});
+      f.options.notifier={async send(){throw Object.assign(Error('PRIVATE'),{
+        code:'BRIDGE_NOTIFICATION_PREPARE_FAILED',phase:'prepare',definitelyNotSent:true,causeCode});}};
+      assert.deepEqual(await notifyOwner(f.store,f.options,{notification_id:'n',text:'a'}),{
+        status:'failed',notificationId:'n',code:'BRIDGE_NOTIFICATION_PREPARE_FAILED',phase:'prepare',sent:false});
+    }
+    // A safe filesystem code is not proof that transport never started.
+    f.options.notifier={async send(){throw {code:'BRIDGE_NOTIFICATION_PREPARE_FAILED',
+      phase:'transport',definitelyNotSent:true,causeCode:'EACCES'};}};
+    assert.deepEqual(await notifyOwner(f.store,f.options,{notification_id:'n',text:'a'}),{
+      status:'unknown',notificationId:'n',code:'owner_notification_unconfirmed',causeCode:'EACCES'});
+    for(const phase of ['prepare','receipt']) {
+      f.options.notifier={async send(){return {status:'unknown',errorCode:'BRIDGE_NOTIFICATION_SEND_UNCONFIRMED',phase,causeCode:'ENOTFOUND'};}};
+      assert.deepEqual(await notifyOwner(f.store,f.options,{notification_id:'n',text:'a'}),{
+        status:'unknown',notificationId:'n',code:'BRIDGE_NOTIFICATION_SEND_UNCONFIRMED',causeCode:'ENOTFOUND'});
+    }
+    f.options.notifier={async send(){return {status:'accepted',phase:'receipt',causeCode:'EACCES'};}};
+    assert.deepEqual(await notifyOwner(f.store,f.options,{notification_id:'n',text:'a'}),{status:'accepted',notificationId:'n'});
+  }finally{f.close();}
+});

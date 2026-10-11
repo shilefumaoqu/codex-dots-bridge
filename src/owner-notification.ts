@@ -47,6 +47,15 @@ const prepareErrorCodes = new Set(['BRIDGE_OWNER_CONFIG_INVALID','BRIDGE_OWNER_C
   'BRIDGE_NOTIFICATION_ID_CONFLICT','BRIDGE_NOTIFICATION_PREPARE_FAILED']);
 const receiptErrorCodes = new Set(['BRIDGE_NOTIFICATION_SEND_UNCONFIRMED','BRIDGE_NOTIFICATION_PROVIDER_REJECTED',
   'BRIDGE_NOTIFICATION_RECEIPT_SAVE_FAILED']);
+// The adapter boundary accepts fixed diagnostic vocabulary, never messages,
+// paths, credentials or arbitrary provider codes.
+const causeCodes = new Set(['EACCES','EPERM','ENOENT','ENOTDIR','EISDIR','EROFS','ENOSPC',
+  'EMFILE','ENFILE','EIO','EEXIST','ENOTEMPTY','ENOTFOUND','EAI_AGAIN','ECONNRESET',
+  'ECONNREFUSED','EHOSTUNREACH','ENETUNREACH','ETIMEDOUT','UND_ERR_CONNECT_TIMEOUT',
+  'UND_ERR_HEADERS_TIMEOUT','UND_ERR_BODY_TIMEOUT','UND_ERR_SOCKET','INVALID_JSON','ABORTED']);
+function safeCauseCode(value: unknown): string | undefined {
+  return typeof value === 'string' && causeCodes.has(value) ? value : undefined;
+}
 
 export async function loadOwnerNotifier(config?: OwnerNotificationConfig, importer: (url: string) => Promise<unknown> = url => import(url)): Promise<OwnerNotifier | undefined> {
   if (!config?.enabled) return undefined;
@@ -88,18 +97,25 @@ export async function notifyOwner(store: TaskStore, options: OwnerNotificationOp
     const parsed = z.object({ status: z.enum(['accepted','unknown','failed']), duplicate: z.boolean().optional(),
       messageId: z.string().regex(/^[1-9]\d{0,63}$/).nullable().optional(), receiptPersisted: z.boolean().optional(),
       alias: z.string().regex(/^T[1-9]\d*$/).nullable().optional(), quoteRouting: z.boolean().optional(),
-      quoteMessageIdRouting: z.boolean().optional(), errorCode: z.string().optional() }).strip().safeParse(result);
+      quoteMessageIdRouting: z.boolean().optional(), errorCode: z.string().optional(),
+      phase: z.unknown().optional(), causeCode: z.unknown().optional() }).strip().safeParse(result);
     if (!parsed.success) return { status: 'unknown', notificationId: input.notification_id, code: 'owner_notification_unconfirmed' };
-    const {errorCode,...safe} = parsed.data;
+    const {errorCode,phase,causeCode:rawCauseCode,...safe} = parsed.data;
+    const causeCode=safeCauseCode(rawCauseCode);
+    const code=errorCode && receiptErrorCodes.has(errorCode) ? errorCode : undefined;
+    const expectedPhase=code==='BRIDGE_NOTIFICATION_RECEIPT_SAVE_FAILED'?'receipt':'transport';
     return { ...safe, notificationId: input.notification_id,
-      ...(errorCode && receiptErrorCodes.has(errorCode) ? {code:errorCode} : {}) };
+      ...(code ? {code,...(phase===expectedPhase?{phase}:{}),...(causeCode?{causeCode}:{})} : {}) };
   } catch (error) {
-    const tagged = error as {code?:unknown;phase?:unknown;definitelyNotSent?:unknown}|null;
+    const tagged = error as {code?:unknown;phase?:unknown;definitelyNotSent?:unknown;causeCode?:unknown}|null;
+    const causeCode=safeCauseCode(tagged?.causeCode);
     if (tagged && typeof tagged.code === 'string' && prepareErrorCodes.has(tagged.code)
         && tagged.phase === 'prepare' && tagged.definitelyNotSent === true) {
-      return { status: 'failed', notificationId: input.notification_id, code: tagged.code, phase: 'prepare', sent: false };
+      return { status: 'failed', notificationId: input.notification_id, code: tagged.code, phase: 'prepare', sent: false,
+        ...(causeCode?{causeCode}:{}) };
     }
-    return { status: 'unknown', notificationId: input.notification_id, code: 'owner_notification_unconfirmed' };
+    return { status: 'unknown', notificationId: input.notification_id, code: 'owner_notification_unconfirmed',
+      ...(causeCode?{causeCode}:{}) };
   }
 }
 
