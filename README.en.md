@@ -69,7 +69,7 @@ Then query the original task and retrieve its result. Tunnel readiness, an accep
 Local conversation reading and sending are separate optional capabilities and default to `off`. After enabling `read` or `read-send` once, you do not need to register conversations individually. You still specify the conversation and content for each operation.
 
 <p align="center">
-  <img src="docs/素材/星渡/conversation-handoff.svg" alt="Read saved history through the official local App Server, or experimentally send text and retrieve its correlated new-turn reply" width="760">
+  <img src="docs/素材/星渡/conversation-handoff-alpha21.svg" alt="Read saved history through the official local App Server, or experimentally send text and retrieve its correlated new-turn reply" width="760">
 </p>
 
 Reading uses the official local App Server to page through saved history. Sending remains experimental and only retrieves the correlated reply from the specified conversation's new turn.

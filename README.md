@@ -69,7 +69,7 @@ Codex Dots Bridge 是连接 Codex 与你已有 Dot 的协作插件。派出一�
 本机对话读取与发送是独立的可选能力，默认 `off`。首次启用 `read` 或 `read-send` 后无需逐对话登记；操作仍需由你明确指定对话和内容。
 
 <p align="center">
-  <img src="docs/素材/星渡/conversation-handoff.svg" alt="读取官方本机 App Server 已保存的对话历史，或实验性发送并取回关联的新回合回复" width="760">
+  <img src="docs/素材/星渡/conversation-handoff-alpha21.svg" alt="读取官方本机 App Server 已保存的对话历史，或实验性发送并取回关联的新回合回复" width="760">
 </p>
 
 读取通过官方本机 App Server 分页获取已保存历史；发送能力仍属实验，仅关联指定对话返回的新回合回复。
