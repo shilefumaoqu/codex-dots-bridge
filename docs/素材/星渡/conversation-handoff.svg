@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="460" viewBox="0 0 1040 460" role="img" aria-labelledby="title desc">
+  <title id="title">本机 Codex 对话接入 / Local Codex conversation access</title>
+  <desc id="desc">Optional access has two paths: read saved conversation history through the official local App Server, or experimentally send text and retrieve the correlated reply from a new turn.</desc>
+  <defs>
+    <marker id="readArrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L8 4.5L0 9" fill="none" stroke="#9cd5d4" stroke-width="1.7"/></marker>
+    <marker id="sendArrow" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto"><path d="M0 0L8 4.5L0 9" fill="none" stroke="#e6c783" stroke-width="1.7"/></marker>
+  </defs>
+  <rect width="1040" height="420" rx="18" fill="#1b2d38"/>
+  <g font-family="Segoe UI,Arial,sans-serif">
+    <text x="36" y="42" fill="#f6f3e9" font-size="21" font-weight="600">可选的本机对话能力 / Optional local conversation access</text>
+    <text x="36" y="67" fill="#b4c5cd" font-size="14">本机首次启用，默认关闭 / Enable locally when needed; off by default</text>
+    <rect x="36" y="94" width="968" height="119" rx="13" fill="#243d49" stroke="#4b6571"/>
+    <rect x="52" y="111" width="103" height="27" rx="13" fill="#31525b"/>
+    <text x="68" y="130" fill="#9cd5d4" font-size="12" font-weight="700">READ · 读取</text>
+    <rect x="70" y="153" width="196" height="42" rx="9" fill="#1b2d38" stroke="#4b6571"/>
+    <text x="87" y="180" fill="#f6f3e9" font-size="16" font-weight="600">你的 Dot / Your Dot</text>
+    <rect x="414" y="153" width="245" height="42" rx="9" fill="#f6f3e9"/>
+    <text x="430" y="171" fill="#1b2d38" font-size="14" font-weight="600">官方本机 App Server</text>
+    <text x="430" y="188" fill="#49616b" font-size="12">Official local App Server</text>
+    <rect x="794" y="153" width="190" height="42" rx="9" fill="#1b2d38" stroke="#4b6571"/>
+    <text x="810" y="171" fill="#f6f3e9" font-size="13" font-weight="600">已保存的对话历史</text>
+    <text x="810" y="188" fill="#b4c5cd" font-size="12">Saved conversation history</text>
+    <path d="M275 174H400" fill="none" stroke="#9cd5d4" stroke-width="2" marker-end="url(#readArrow)"/>
+    <path d="M664 174H780" fill="none" stroke="#9cd5d4" stroke-width="2" marker-end="url(#readArrow)"/>
+    <text x="52" y="203" fill="#b4c5cd" font-size="11">按指定链接读取 / Read a specified link</text>
+    <rect x="36" y="229" width="968" height="136" rx="13" fill="#243d49" stroke="#4b6571"/>
+    <rect x="52" y="246" width="147" height="27" rx="13" fill="#5b4c35"/>
+    <text x="66" y="265" fill="#e6c783" font-size="12" font-weight="700">EXPERIMENT · 实验</text>
+    <rect x="70" y="286" width="196" height="46" rx="9" fill="#1b2d38" stroke="#4b6571"/>
+    <text x="86" y="305" fill="#f6f3e9" font-size="14" font-weight="600">你的 Dot / Your Dot</text>
+    <text x="86" y="322" fill="#b4c5cd" font-size="11">指定文本 / Specified text</text>
+    <rect x="414" y="286" width="245" height="46" rx="9" fill="#1b2d38" stroke="#4b6571"/>
+    <text x="430" y="305" fill="#f6f3e9" font-size="14" font-weight="600">指定的 Codex 对话</text>
+    <text x="430" y="322" fill="#b4c5cd" font-size="11">Specified conversation</text>
+    <rect x="794" y="286" width="190" height="46" rx="9" fill="#1b2d38" stroke="#4b6571"/>
+    <text x="807" y="305" fill="#f6f3e9" font-size="13" font-weight="600">关联的新回合回复</text>
+    <text x="807" y="322" fill="#b4c5cd" font-size="11">Correlated new-turn reply</text>
+    <path d="M275 309H400" fill="none" stroke="#e6c783" stroke-width="2" marker-end="url(#sendArrow)"/>
+    <path d="M664 309H780" fill="none" stroke="#e6c783" stroke-width="1.7" marker-end="url(#sendArrow)"/>
+    <text x="36" y="390" fill="#e6c783" font-size="13">忙碌时由你选择是否等下一回合；当前回合追加不支持。</text>
+    <text x="36" y="407" fill="#b4c5cd" font-size="12">When busy, you choose whether to wait for the next turn; current-turn append is unsupported.</text>
+    <text x="36" y="430" fill="#e6c783" font-size="13">历史读取仅限已保存记录，不保证原始上下文完整。</text>
+    <text x="36" y="447" fill="#b4c5cd" font-size="12">History is limited to saved records and may not include the full original context.</text>
+  </g>
+</svg>
