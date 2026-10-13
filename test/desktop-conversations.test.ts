@@ -29,6 +29,172 @@ function localFixture(transport: DesktopConversationsTransport, capabilities = {
 }
 async function finish(f: ReturnType<typeof fixture>, request_id = f.request): Promise<DesktopConversationResult> { return f.service.get({ request_id, wait_seconds: 1 }); }
 
+test('IPC diagnostics are fixed metadata bound to the original request and absent from public results',async()=>{
+  const observed:unknown[]=[];
+  const f=fixture({runRead:noRead,runSend:async input=>{
+    input.onDiagnostic?.({phase:'ipc_snapshot_unavailable',diagnostic_code:'invalid_json',received_frames:2,state_frames:0,matched_state_frames:0,largest_frame_bytes:400,private_body:'PRIVATE_DIAGNOSTIC_TEXT'} as any);
+    input.onDiagnostic?.({phase:'PRIVATE_STAGE',diagnostic_code:'other',received_frames:2,state_frames:0,matched_state_frames:0,largest_frame_bytes:400} as any);
+    return {status:'skipped_unknown',reason:'ipc_snapshot_unavailable'};
+  }},{onIpcDiagnostic:(request,event)=>observed.push({request,event})});
+  try{
+    f.service.send({request_id:f.request,thread_id:f.thread,text:'PRIVATE_REQUEST_BODY'});const result=await finish(f);
+    assert.equal(result.status,'skipped_unknown');assert.equal(result.reason,'ipc_snapshot_unavailable');
+    assert.deepEqual(observed,[{request:f.request,event:{phase:'ipc_snapshot_unavailable',diagnostic_code:'invalid_json',received_frames:2,state_frames:0,matched_state_frames:0,largest_frame_bytes:400}}]);
+    assert(!JSON.stringify(observed).includes('PRIVATE'));assert(!JSON.stringify(result).includes('diagnostic'));
+  }finally{await f.cleanup();}
+});
+
+test('advisory sink failure preserves the accepted exact reply and idempotent single send',async()=>{
+  let f:ReturnType<typeof fixture>,sends=0;
+  f=fixture({runRead:noRead,runSend:async input=>{
+    input.onDiagnostic?.({phase:'ipc_snapshot_unavailable',diagnostic_code:'snapshot_timeout',received_frames:2,state_frames:0,matched_state_frames:0,largest_frame_bytes:400});
+    input.beforeSend();sends++;input.onAccepted(f.turn);return {status:'completed',turn_id:f.turn,reply:'verified_reply'};
+  }},{onIpcDiagnostic:()=>{throw new Error('PRIVATE_SINK_ERROR');}});
+  try{
+    const args={request_id:f.request,thread_id:f.thread,text:'synthetic'};f.service.send(args);const result=await finish(f);
+    assert.equal(result.status,'completed');assert.equal(result.verification,'exact_turn_reply');assert.equal(result.reply,'verified_reply');
+    assert.equal(f.service.send(args).turn_id,f.turn);assert.equal(sends,1);
+  }finally{await f.cleanup();}
+});
+
+test('ACK after most of the pre-send budget still gets a fresh reply budget', async () => {
+  let f: ReturnType<typeof fixture>, sends = 0;
+  f = fixture({ runRead: noRead, runSend: async input => {
+    // Scale 55s preparation + 10s reply into 220ms + 40ms, with 240ms per phase.
+    await new Promise(resolve => setTimeout(resolve, 220));
+    input.beforeSend(); sends++; input.onAccepted(f.turn);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    return { status: 'completed', turn_id: f.turn, reply: 'fresh budget reply' };
+  } }, { timeoutMs: 240 });
+  try {
+    const args = { request_id: f.request, thread_id: f.thread, text: 'one send' };
+    f.service.send(args); const result = await finish(f);
+    assert.equal(result.status, 'completed'); assert.equal(result.reply, 'fresh budget reply');
+    assert.equal(f.service.send(args).status, 'completed'); assert.equal(sends, 1);
+  } finally { await f.cleanup(); }
+});
+
+test('fresh reply deadline is capped by the current caller window and guard refusal never resends', async () => {
+  for (const mode of ['short', 'expired', 'refused'] as const) {
+    let f: ReturnType<typeof fixture>, accepted = false, sends = 0, guardCalls = 0;
+    f = fixture({ runRead: noRead, runSend: async input => {
+      input.beforeSend(); sends++; accepted = true;
+      const deadline = input.onAccepted(f.turn);
+      assert.equal(typeof deadline, 'number'); assert(deadline! - Date.now() <= 20);
+      await new Promise<void>(resolve => input.signal.addEventListener('abort', () => resolve(), { once: true }));
+      return { status: 'uncertain', reason: 'closed' };
+    } });
+    const guard = () => {
+      guardCalls++;
+      if (!accepted) return { remaining_ms: 1000 };
+      if (mode === 'refused') throw Object.assign(new Error('private guard'), { code: 'delivery_window_interrupted' });
+      return { remaining_ms: mode === 'short' ? 20 : 0 };
+    };
+    try {
+      const args = { request_id: f.request, thread_id: f.thread, text: 'one' };
+      f.service.send(args, guard); const result = await finish(f);
+      assert.equal(result.status, 'uncertain'); assert.equal(result.reason, mode === 'refused' ? 'delivery_window_interrupted' : 'delivery_window_expired');
+      const stored = JSON.parse((f.db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id=?').get(f.request) as {data:string}).data);
+      assert.equal(stored.accepted_turn_id, f.turn); assert.equal(guardCalls, 4);
+      f.service.send(args, guard); assert.equal(sends, 1); assert.equal(guardCalls, 4);
+    } finally { await f.cleanup(); }
+  }
+});
+
+test('ACK persistence failure cannot open reply budget; durable reservation reconciles after restart', async () => {
+  let f: ReturnType<typeof fixture>, sends = 0, guardCalls = 0;
+  f = fixture({ runRead: noRead, runSend: async input => {
+    input.beforeSend(); sends++;
+    f.db.exec("CREATE TRIGGER reject_ack BEFORE UPDATE ON desktop_conversation_requests WHEN json_extract(NEW.data, '$.accepted_turn_id') IS NOT NULL BEGIN SELECT RAISE(FAIL, 'synthetic ACK save failure'); END");
+    assert.throws(() => input.onAccepted(f.turn), /synthetic ACK save failure/);
+    return { status: 'uncertain', reason: 'acceptance_not_persisted' };
+  } });
+  let reopened: DesktopConversationsService | undefined;
+  try {
+    const args = { request_id: f.request, thread_id: f.thread, text: 'only once' };
+    f.service.send(args, () => { guardCalls++; return { remaining_ms: 1000 }; });
+    assert.equal((await finish(f)).status, 'pending'); assert.equal(guardCalls, 3);
+    const stored = JSON.parse((f.db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id=?').get(f.request) as {data:string}).data);
+    assert.equal(stored.sent, true); assert.equal(stored.accepted_turn_id, undefined);
+    f.service.send(args); assert.equal(sends, 1);
+    await f.service.close(); f.db.exec('DROP TRIGGER reject_ack');
+    reopened = new DesktopConversationsService(f.db, f.config, { transport: { runRead: noRead, runSend: noSend } });
+    assert.equal(reopened.send(args).status, 'reconciliation_required'); assert.equal(sends, 1);
+  } finally { await reopened?.close(); await f.cleanup(); }
+});
+
+for (const mode of ['slow_save', 'slow_guard'] as const) test(`synchronous ACK ${mode} crossing pre-send deadline retains ACK without opening reply time`, async () => {
+    let f: ReturnType<typeof fixture>, sends = 0, ackArrived = false, replyPhaseOpened = false;
+    const blockPastDeadline = () => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 90); return 1; };
+    f = fixture({ runRead: noRead, runSend: async input => {
+      input.beforeSend(); sends++; ackArrived = true;
+      replyPhaseOpened = typeof input.onAccepted(f.turn) === 'number';
+      return { status: 'completed', turn_id: f.turn, reply: 'must not complete' };
+    } }, { timeoutMs: 60 });
+    if (mode === 'slow_save') {
+      f.db.function('slow_ack_save', blockPastDeadline);
+      f.db.exec("CREATE TRIGGER slow_ack BEFORE UPDATE ON desktop_conversation_requests WHEN json_extract(NEW.data, '$.accepted_turn_id') IS NOT NULL AND json_extract(OLD.data, '$.accepted_turn_id') IS NULL BEGIN SELECT slow_ack_save(); END");
+    }
+    const guard = () => { if (mode === 'slow_guard' && ackArrived) blockPastDeadline(); return { remaining_ms: 1000 }; };
+    try {
+      const args = { request_id: f.request, thread_id: f.thread, text: 'only original turn' };
+      f.service.send(args, guard); const result = await finish(f);
+      assert.equal(result.status, 'uncertain', mode); assert.equal(result.reason, 'timeout'); assert.equal(replyPhaseOpened, false);
+      const stored = JSON.parse((f.db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id=?').get(f.request) as {data:string}).data);
+      assert.equal(stored.sent, true); assert.equal(stored.accepted_turn_id, f.turn); assert.equal(stored.result.status, 'uncertain');
+      assert.equal(f.service.send(args, guard).status, 'uncertain'); assert.equal(sends, 1);
+    } finally { await f.cleanup(); }
+});
+
+test('stage timing accumulates measured calls, preserves zero and remains optional on old receipts', async () => {
+  let f: ReturnType<typeof fixture>;
+  f = fixture({ runRead: noRead, runSend: async input => {
+    input.onStageTiming?.('owner_lookup', 3); input.onStageTiming?.('owner_lookup', 5);
+    input.onStageTiming?.('busy_wait', 0); input.onStageTiming?.('autoload', -1);
+    input.onStageTiming?.('reply_wait', Number.NaN); input.onStageTiming?.('private-owner' as any, 1);
+    input.beforeSend(); input.onAccepted(f.turn);
+    return { status: 'completed', turn_id: f.turn, reply: 'done' };
+  } });
+  let reopened: DesktopConversationsService | undefined;
+  try {
+    const args = { request_id: f.request, thread_id: f.thread, text: 'timing' };
+    f.service.send(args); const result = await finish(f);
+    assert.deepEqual(result.timing.stages_ms, { owner_lookup: 8, busy_wait: 0 });
+    result.timing.stages_ms!.owner_lookup = 999;
+    assert.equal((await f.service.get({ request_id: f.request })).timing.stages_ms?.owner_lookup, 8);
+    await f.service.close();
+    const stored = JSON.parse((f.db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id=?').get(f.request) as {data:string}).data);
+    delete stored.result.timing.stages_ms; f.db.prepare('UPDATE desktop_conversation_requests SET data=? WHERE request_id=?').run(JSON.stringify(stored), f.request);
+    reopened = new DesktopConversationsService(f.db, f.config, { transport: { runRead: noRead, runSend: noSend } });
+    assert.equal(reopened.send(args).timing.stages_ms, undefined);
+  } finally { await reopened?.close(); await f.cleanup(); }
+});
+
+test('close after durable ACK aborts the fresh reply phase and an expired pre-send phase cannot reopen', async () => {
+  for (const mode of ['close_reply', 'late_ack'] as const) {
+    let f: ReturnType<typeof fixture>, ready!: () => void, sends = 0;
+    const ackReached = new Promise<void>(resolve => { ready = resolve; });
+    f = fixture({ runRead: noRead, runSend: async input => {
+      input.beforeSend(); sends++;
+      if (mode === 'late_ack') {
+        await new Promise<void>(resolve => input.signal.addEventListener('abort', () => resolve(), { once: true }));
+        assert.throws(() => input.onAccepted(f.turn), /closed/);
+      } else {
+        assert.equal(typeof input.onAccepted(f.turn), 'number'); ready();
+        await new Promise<void>(resolve => input.signal.addEventListener('abort', () => resolve(), { once: true }));
+      }
+      return { status: 'uncertain', reason: 'closed' };
+    } });
+    try {
+      const args = { request_id: f.request, thread_id: f.thread, text: 'abort' };
+      f.service.send(args);
+      if (mode === 'close_reply') { await ackReached; await f.service.close(); }
+      const result = await finish(f); assert.equal(result.status, 'uncertain'); assert.equal(result.verification, 'not_verified');
+      f.service.send(args); assert.equal(sends, 1);
+    } finally { await f.cleanup(); }
+  }
+});
+
 test('local stored read binds home and exact ID without sender path, persists all pages and reopens without rereading', async () => {
   let calls = 0, f: ReturnType<typeof localFixture>, context: string | undefined;
   f = localFixture({ runSend: noSend, runRead: async input => { calls++; assert.equal(input.codexHome, f.home); const result = storedRead(input.threadId, '完整历史🌟'.repeat(20000)); context = result.context_json; return result; } });
@@ -55,9 +221,54 @@ test('local stored read stays independent while sends retain per-thread busy res
   try {
     f.service.send({ request_id: f.request, thread_id: f.thread, text: 'first' }); await new Promise(resolve => setImmediate(resolve));
     const readId = randomUUID(); assert.equal(f.service.read({ request_id: readId, thread_id: f.thread }).status, 'pending'); assert.equal((await f.service.get({ request_id: readId, wait_seconds: 1 })).verification, 'native_stored_history');
-    const blocked = f.service.send({ request_id: randomUUID(), thread_id: f.thread, text: 'second' }); assert.equal(blocked.status, 'skipped_busy'); assert.equal(sends, 1);
+    const blocked = f.service.send({ request_id: randomUUID(), thread_id: f.thread, text: 'second' }); assert.equal(blocked.status, 'awaiting_delivery_choice'); assert.equal(sends, 1);
     release(); assert.equal((await f.service.get({ request_id: f.request, wait_seconds: 1 })).verification, 'exact_turn_reply');
   } finally { release?.(); await f.cleanup(); }
+});
+
+test('local busy guides a human choice; same ID/text next choice preserves durable send and exact new turn', async () => {
+  let calls = 0, f: ReturnType<typeof localFixture>; const activeTurn = randomUUID(), startedAtMs = Date.now() - 1000;
+  f = localFixture({ runRead: noRead, runSend: async input => {
+    calls++;
+    if (!input.afterTurn) return { status: 'skipped_busy', reason: 'turn_in_progress', busy_owner: 'a'.repeat(64), busy_state: { status: 'busy', observed_at: new Date().toISOString(), checked_by: 'native_desktop_owner', scope: 'observation_snapshot', active_turn_id: activeTurn, active_turn_started_at_ms: startedAtMs } };
+    assert.deepEqual(input.afterTurn, { id: activeTurn, startedAtMs, ownerHash: 'a'.repeat(64) }); input.onWaiting?.();
+    assert.equal((await f.service.get({ request_id: f.request })).status, 'waiting_next_turn');
+    input.onResolvedTarget?.(f.resolved()); input.beforeSend(); input.onAccepted(f.turn);
+    const accepted = await f.service.get({ request_id: f.request }); assert.equal(accepted.status, 'pending'); assert.equal(accepted.reason, undefined); assert.equal(accepted.busy_state, undefined);
+    return { status: 'completed', turn_id: f.turn, reply: 'correct next-turn reply' };
+  } });
+  const send = (delivery_mode?: 'current_turn' | 'next_turn') => f.service.send({ request_id: f.request, thread_id: f.thread, text: 'original text', ...(delivery_mode ? { delivery_mode } : {}) });
+  try {
+    assert.throws(() => send('next_turn'), /delivery_choice_required/); assert.equal(calls, 0);
+    send(); const guide = await f.service.get({ request_id: f.request, wait_seconds: 1 });
+    assert.equal(guide.status, 'awaiting_delivery_choice'); assert.equal(guide.busy_state?.active_turn_id, activeTurn);
+    assert(!JSON.stringify(guide).includes('a'.repeat(64))); // Native owner binding stays private.
+    assert.deepEqual(guide.delivery_options, [{ mode: 'current_turn', supported: false }, { mode: 'next_turn', supported: true }]); assert.equal(calls, 1);
+    assert.equal(send().status, 'awaiting_delivery_choice'); assert.equal(send('current_turn').reason, 'current_turn_delivery_unsupported'); assert.equal(calls, 1);
+    assert.throws(() => f.service.send({ request_id: f.request, thread_id: f.thread, text: 'changed', delivery_mode: 'next_turn' }), /idempotency_conflict/);
+    assert.equal(send('next_turn').status, 'pending'); assert(['pending','waiting_next_turn'].includes(send('next_turn').status));
+    const result = await f.service.get({ request_id: f.request, wait_seconds: 1 }); assert.equal(result.status, 'completed'); assert.equal(result.turn_id, f.turn); assert.equal(result.reply, 'correct next-turn reply'); assert.equal(calls, 2);
+    assert.equal(send('next_turn').status, 'completed'); assert.equal(calls, 2); assert.throws(() => send('current_turn'), /delivery_choice_conflict/);
+  } finally { await f.cleanup(); }
+});
+
+test('local waiting terminates on close/restart, never resumes or sends automatically', async () => {
+  let f: ReturnType<typeof localFixture>, calls = 0;
+  f = localFixture({ runRead: noRead, runSend: async input => {
+    calls++;
+    if (!input.afterTurn) return { status: 'skipped_busy', reason: 'turn_in_progress', busy_owner: 'a'.repeat(64), busy_state: { status: 'busy', observed_at: new Date().toISOString(), checked_by: 'native_desktop_owner', scope: 'observation_snapshot', active_turn_id: randomUUID(), active_turn_started_at_ms: 1 } };
+    input.onWaiting?.(); await new Promise<void>(resolve => input.signal.addEventListener('abort', () => resolve(), { once: true }));
+    return { status: 'skipped_unknown', reason: 'closed' };
+  } });
+  try {
+    const args = { request_id: f.request, thread_id: f.thread, text: 'not sent' };
+    f.service.send(args); await f.service.get({ request_id: f.request, wait_seconds: 1 });
+    f.service.send({ ...args, delivery_mode: 'next_turn' }); await new Promise(resolve => setImmediate(resolve));
+    assert.equal((await f.service.get({ request_id: f.request })).status, 'waiting_next_turn');
+    await f.service.close();
+    const reopened = new DesktopConversationsService(f.db, f.config, { transport: { runRead: noRead, runSend: noSend } });
+    try { assert.equal(reopened.send(args).status, 'skipped_unknown'); assert.equal(calls, 2); } finally { await reopened.close(); }
+  } finally { await f.cleanup(); }
 });
 test('stored read source cannot mix idle evidence, omit source proof or mismatch the requested ID', async () => {
   for (const mode of ['idle', 'missing_source', 'missing_complete', 'wrong_source', 'full_claim', 'wrong_id'] as const) {

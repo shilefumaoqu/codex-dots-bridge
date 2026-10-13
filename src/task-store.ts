@@ -2,6 +2,9 @@ import Database from 'better-sqlite3';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { ProbeError, type Delivery, type Subscription } from './store.js';
 import { observeDatabase } from './observe.js';
+import { CallerDispatchStore, DispatchContextError, type DeliveryWindow } from './caller-dispatch.js';
+import { z } from 'zod';
+import { DESKTOP_IPC_DIAGNOSTIC_CODES, DESKTOP_IPC_FAILURE_REASONS } from './desktop-echo-ipc.js';
 
 export type TaskStatus = 'queued'|'running'|'waiting_input'|'cancel_requested'|'reconciliation_required'|'completed'|'failed'|'cancelled'|'expired';
 export interface Link { url: string; label?: string }
@@ -46,6 +49,7 @@ function resultValid(result: TaskResult) { if (!result || typeof result!=='objec
 /** Persistent P1 queue. All business changes and their Events hints commit in the same transaction. */
 export class TaskStore {
   readonly db: Database.Database;
+  readonly dispatch: CallerDispatchStore;
   private replySubscriptionGuard?: (subscriptionId: string, bindingKey: string) => boolean;
   setReplySubscriptionGuard(guard: (subscriptionId: string, bindingKey: string) => boolean) { this.replySubscriptionGuard=guard; }
   subscriptionCurrent(id: string) { return this.subscriptions().some(s=>s.id===id && s.active && s.expires_at>this.now()); }
@@ -63,6 +67,7 @@ export class TaskStore {
       CREATE TABLE IF NOT EXISTS task_events(id TEXT PRIMARY KEY,payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_deliveries(id INTEGER PRIMARY KEY,event_id TEXT NOT NULL REFERENCES task_events(id),subscription_id TEXT NOT NULL REFERENCES task_subscriptions(id),attempts INTEGER NOT NULL DEFAULT 0,next_at INTEGER NOT NULL,status TEXT NOT NULL DEFAULT 'pending',last_status INTEGER,UNIQUE(event_id,subscription_id));
       CREATE TABLE IF NOT EXISTS task_evidence(id INTEGER PRIMARY KEY,at TEXT NOT NULL,kind TEXT NOT NULL,task_id TEXT,detail TEXT NOT NULL);`);
+    this.dispatch = new CallerDispatchStore(this.db, this.now);
   }
   close() { this.db.close(); }
   observe(request: unknown, instanceId: string) { return observeDatabase(this.db, request, instanceId, this.now); }
@@ -72,7 +77,20 @@ export class TaskStore {
     const allowed=new Set(['event_id','subscription_id','generation','id','expires_at','revision','input_revision','attempt','retry_count','change_sequence','acknowledged','status','attempts','parent_task_id','safe_to_retry','accepted_as_final','result_id','question_id','decision','user_accepted','disposition','method']);
     return (this.db.prepare('SELECT * FROM task_evidence ORDER BY id').all() as {id:number;at:string;kind:string;task_id:string|null;detail:string}[]).map(row=>{
       const detail=JSON.parse(row.detail) as Record<string,unknown>;
-      return {...row,detail:canonical(Object.fromEntries(Object.entries(detail).filter(([key,value])=>allowed.has(key)&&(value===null||['string','number','boolean'].includes(typeof value)))))};
+      const protocolField=(key:string,value:unknown) => ['worker_protocol_request','worker_protocol_response'].includes(row.kind) && (
+        key==='tool_name' && typeof value==='string' && /^(list_tasks|get_task|claim_task|checkpoint_task|request_input|complete_task|fail_task|ack_cancel|notify_owner|codex_desktop_echo|codex_desktop_echo_status|codex_read_conversation|codex_send_message|codex_conversation_status)$/.test(value)
+        || key==='request_id' && z.string().uuid().safeParse(value).success
+        || key==='bridge_version' && typeof value==='string' && value.length<=64 && /^\d+\.\d+\.\d+(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?$/.test(value)
+        || key==='phase' && (value==='received'||value==='responded')
+        || key==='http_status' && typeof value==='number' && Number.isInteger(value) && value>=100 && value<=599
+      );
+      const ipcField=(key:string,value:unknown) => row.kind==='desktop_ipc_failure' && (
+        key==='request_id' && z.string().uuid().safeParse(value).success
+        || key==='phase' && typeof value==='string' && ([...DESKTOP_IPC_FAILURE_REASONS,'send_ack'] as readonly string[]).includes(value)
+        || key==='diagnostic_code' && typeof value==='string' && (DESKTOP_IPC_DIAGNOSTIC_CODES as readonly string[]).includes(value)
+        || ['received_frames','state_frames','matched_state_frames','largest_frame_bytes'].includes(key) && typeof value==='number' && Number.isSafeInteger(value) && value>=0
+      );
+      return {...row,detail:canonical(Object.fromEntries(Object.entries(detail).filter(([key,value])=>(allowed.has(key)&&(value===null||['string','number','boolean'].includes(typeof value)))||protocolField(key,value)||ipcField(key,value))))};
     });
   }
   private raw(id: string): StoredTask { const row=this.db.prepare('SELECT data FROM tasks WHERE id=?').get(id) as {data:string}|undefined; if(!row) throw new ProbeError('task_not_found'); return JSON.parse(row.data); }
@@ -110,7 +128,43 @@ export class TaskStore {
     this.save(t); this.audit('enqueued',t.task_id,{safe_to_retry:t.safe_to_retry,parent_task_id:t.parent_task_id}); this.enqueue(t.task_id); return this.publicTask(t);
   }
   submit(args: SubmitInput) { this.sweep(); return this.db.transaction(()=>this.operation('submit',args.idempotency_key,args,()=>this.create(args)))(); }
+  /** Called only after authenticating the local Codex caller. Provenance and enqueue commit together. */
+  submitFromCaller(args: SubmitInput & {delivery_window?: DeliveryWindow}) {
+    const {delivery_window, ...input} = args;
+    this.sweep(); return this.db.transaction(() => {
+      const existing = this.db.prepare('SELECT 1 FROM task_operations WHERE scope=? AND key=?').get('submit', input.idempotency_key);
+      const task = this.submit(input);
+      this.dispatch.recordSubmission({taskId:task.task_id, method:'dots_submit', inputRevision:task.input_revision, deliveryWindow:delivery_window, isNewSubmission:!existing});
+      return task;
+    })();
+  }
   followup(args: SubmitInput & {parent_task_id:string}) { this.sweep(); return this.db.transaction(()=>this.operation('submit',args.idempotency_key,args,()=>{ const parent=this.raw(args.parent_task_id); if(parent.status!=='completed') throw new ProbeError('parent_not_completed'); return this.create(args,parent); }))(); }
+  followupFromCaller(args: SubmitInput & {parent_task_id:string; delivery_window?:DeliveryWindow}) {
+    const {delivery_window, ...input} = args;
+    this.sweep(); return this.db.transaction(() => {
+      const existing = this.db.prepare('SELECT 1 FROM task_operations WHERE scope=? AND key=?').get('submit', input.idempotency_key);
+      const task = this.followup(input);
+      this.dispatch.recordSubmission({taskId:task.task_id, method:'dots_followup', inputRevision:task.input_revision, deliveryWindow:delivery_window, isNewSubmission:!existing});
+      return task;
+    })();
+  }
+  messageFromCaller(args: MessageInput) {
+    this.sweep(); return this.db.transaction(() => {
+      const existing = this.db.prepare('SELECT 1 FROM task_operations WHERE scope=? AND key=?').get(`message:${args.task_id}`, args.message_key);
+      const task = this.message(args), message = task.messages.find(message => message.message_key === args.message_key)!;
+      this.dispatch.recordMessage({taskId:task.task_id, messageKey:args.message_key, inputRevision:message.input_revision, receivedAt:message.at, isNewMessage:!existing});
+      return task;
+    })();
+  }
+  guardDesktopDispatch(args: {request_id:string; thread_id:string; text:string}, expected?:{task_id:string;attempt:number}) {
+    const context = this.dispatch.guardSend({request_id:args.request_id, thread_id:args.thread_id, text:args.text});
+    if (!context) return undefined;
+    const task = this.get(context.task_id), attempt = task.attempts.find(attempt => attempt.number === task.attempt);
+    if (expected && (expected.task_id !== task.task_id || expected.attempt !== task.attempt)) throw new DispatchContextError('delivery_attempt_changed');
+    if (task.status !== 'running' || attempt?.status !== 'running') throw new DispatchContextError('delivery_task_not_running');
+    if (attempt.acknowledged_revision !== task.input_revision) throw new DispatchContextError('delivery_input_not_acknowledged');
+    return {...context,attempt:task.attempt};
+  }
   get(task_id: string, options: {record_read?:boolean;worker?:boolean} = {}) { if(options.worker) this.assertWorkerTarget(task_id); this.sweep(); return this.db.transaction(()=>{ const t=this.raw(task_id); const result=t.results.find(r=>r.result_id===t.result_id); if(options.record_read && result && !result.result_read_at) { result.result_read_at=iso(this.now()); this.changed(t,'result_read',{result_id:result.result_id}); } return this.publicTask(t); })(); }
   markRead(task_id: string) { return this.get(task_id,{record_read:true}); }
   list(filter?: {status?: TaskStatus;logical_session_id?:string;parent_task_id?:string;limit?:number}, options: {worker?:boolean} = {}) { this.sweep(); if(filter?.limit!==undefined && (!Number.isInteger(filter.limit)||filter.limit<1||filter.limit>1000)) throw new ProbeError('invalid_limit'); return this.all().filter(t=>(!options.worker || this.workerTargetCurrent(t)) && (!filter?.status||t.status===filter.status)&&(!filter?.logical_session_id||t.logical_session_id===filter.logical_session_id)&&(!filter?.parent_task_id||t.parent_task_id===filter.parent_task_id)).sort((a,b)=>filter?.status==='queued'?a.queued_order-b.queued_order:b.updated_at.localeCompare(a.updated_at)||b.queued_order-a.queued_order).slice(0,filter?.limit??1000).map(t=>this.publicTask(t)); }

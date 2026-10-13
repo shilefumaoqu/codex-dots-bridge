@@ -34,7 +34,8 @@ DisableProgramGroupPage=yes
 UsePreviousLanguage=no
 CloseApplications=no
 RestartApplications=no
-UninstallDisplayIcon={app}\payload\{#InstallerVersion}\runtime\node-v24.21.0-win-x64\node.exe
+UninstallDisplayIcon={app}\payload\{#InstallerVersion}\CodexDotsBridge.ico
+SetupIconFile={#PackageRoot}\CodexDotsBridge.ico
 UninstallDisplayName=Codex Dots Bridge
 LicenseFile={#PackageRoot}\LICENSE
 SetupLogging=yes
@@ -49,8 +50,13 @@ Name: "autostart"; Description: "登录 Windows 时启动（升级保留既有�
 Source: "{#PackageRoot}\*"; DestDir: "{app}\payload\{#InstallerVersion}"; Flags: ignoreversion recursesubdirs createallsubdirs; Check: ShouldInstallPayload
 Source: "setup-lifecycle.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "setup-lifecycle.ps1"; DestName: "setup-lifecycle-runner.ps1"; Flags: dontcopy
+Source: "{#PackageRoot}\scripts\launch-background.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PackageRoot}\scripts\launch-background.ps1"; Flags: dontcopy
+Source: "{#PackageRoot}\scripts\recover-reboot-locks.ps1"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PackageRoot}\scripts\recover-reboot-locks.ps1"; Flags: dontcopy
 
 [Icons]
+Name: "{code:GetShortcutsDirectory}\Codex Dots Bridge"; Filename: "{app}\payload\{#InstallerVersion}\CodexDotsBridge.Tray.exe"; Parameters: "{code:GetTrayParameters}"; WorkingDir: "{app}\payload\{#InstallerVersion}"; IconFilename: "{app}\payload\{#InstallerVersion}\CodexDotsBridge.ico"
 Name: "{code:GetShortcutsDirectory}\首次连接与维护"; Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -NoExit -ExecutionPolicy Bypass -File ""{app}\setup-lifecycle.ps1"" -Action Connect -InstallDirectory ""{app}"""; WorkingDir: "{app}"
 Name: "{code:GetShortcutsDirectory}\卸载 Codex Dots Bridge"; Filename: "{uninstallexe}"
 
@@ -61,6 +67,7 @@ Type: files; Name: "{app}\.setup-result.txt"
 [Code]
 var
   Prepared, Committed, InstallPayload: Boolean;
+  PreparedDataDirectory: String;
 
 function IsStrictGuid(const Value: String): Boolean;
 var
@@ -121,14 +128,36 @@ begin
 end;
 
 function InitializeSetup: Boolean;
+var
+  RuntimeRelease: Cardinal;
 begin
   Result := TestIsolationValid;
   if not Result then SuppressibleMsgBox('隔离验收参数不完整或 TESTINSTANCE 不是标准 GUID；未执行安装。', mbError, MB_OK, IDOK);
+  if Result then begin
+    Result := RegQueryDWordValue(HKLM64, 'SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full', 'Release', RuntimeRelease) and (RuntimeRelease >= 528040);
+    if not Result then SuppressibleMsgBox('托盘程序需要 Microsoft .NET Framework 4.8 或更高版本。请安装运行环境后重新运行安装器。', mbError, MB_OK, IDOK);
+  end;
 end;
 
 function Quoted(const Value: String): String;
 begin
   Result := '"' + Value + '"';
+end;
+
+function GetTrayParameters(Param: String): String;
+var
+  Value: String;
+  I: Integer;
+begin
+  if PreparedDataDirectory = '' then RaiseException('prepared_data_directory_missing');
+  Value := PreparedDataDirectory;
+  { Windows argv quoting requires doubling trailing backslashes before the closing quote. }
+  I := Length(Value);
+  while (I > 0) and (Value[I] = '\') do begin
+    Value := Value + '\';
+    I := I - 1;
+  end;
+  Result := '--show --data-dir ' + Quoted(Value);
 end;
 
 function RunnerParameters(const Action: String): String;
@@ -165,9 +194,13 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Params, Value: String;
+  PreparedData: AnsiString;
 begin
   Result := '';
+  PreparedDataDirectory := '';
   ExtractTemporaryFile('setup-lifecycle-runner.ps1');
+  ExtractTemporaryFile('launch-background.ps1');
+  ExtractTemporaryFile('recover-reboot-locks.ps1');
   Params := RunnerParameters('Prepare') + ' -NewVersion ' + Quoted('{#InstallerVersion}') +
     ' -PackageFingerprint ' + Quoted('{#PackageFingerprint}') +
     ' -InstallerIdentity ' + Quoted(GetInstallerAppId(''));
@@ -179,10 +212,21 @@ begin
   if Value <> '' then Params := Params + ' -CodexCommand ' + Quoted(Value);
   Value := ExpandConstant('{param:APPDATADIR|}');
   if Value <> '' then Params := Params + ' -AppDataDirectory ' + Quoted(Value);
+  Params := Params + ' -ShortcutDirectory ' + Quoted(GetShortcutsDirectory(''));
   if WizardIsTaskSelected('autostart') then Params := Params + ' -Autostart';
   Prepared := RunLifecycle(Params);
-  if Prepared then
+  if Prepared then begin
+    if not LoadStringFromFile(ExpandConstant('{app}\.setup-result.txt'), PreparedData) then begin
+      Result := 'prepared_data_directory_missing';
+      Exit;
+    end;
+    PreparedDataDirectory := UTF8Decode(PreparedData);
+    if PreparedDataDirectory = '' then begin
+      Result := 'prepared_data_directory_missing';
+      Exit;
+    end;
     InstallPayload := not FileExists(ExpandConstant('{app}\payload\{#InstallerVersion}\release-manifest.json'));
+  end;
   if not Prepared then Result := OperationError;
 end;
 

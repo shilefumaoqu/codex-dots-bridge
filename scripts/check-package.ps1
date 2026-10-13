@@ -87,10 +87,18 @@ foreach ($file in Get-ChildItem -LiteralPath $PackageRoot -Recurse -File) {
   if ($relative -ne 'release-manifest.json' -and -not $seen.ContainsKey($relative)) { throw "Unlisted package file: $relative" }
 }
 foreach ($required in @('runtime/node-v24.21.0-win-x64/LICENSE','scripts/install.ps1','dist/main.js','skills/codex-dots-bridge/SKILL.md','LICENSE','THIRD_PARTY_NOTICES.md','licenses/npm-inventory.json')) { if (-not $seen.ContainsKey($required)) { throw "Required file missing: $required" } }
+if ($seen.ContainsKey('dist/desktop-warm-load.js') -and -not $seen.ContainsKey('scripts/desktop-warm-load.ps1')) { throw 'Warm-load runtime requires its packaged PowerShell helper.' }
+if ($seen.ContainsKey('dist/reboot-recovery.js') -and -not $seen.ContainsKey('scripts/recover-reboot-locks.ps1')) { throw 'Reboot recovery requires its packaged PowerShell helper.' }
+if ($seen.ContainsKey('dist/windows-background.js') -and -not $seen.ContainsKey('scripts/launch-background.ps1')) { throw 'Windows background launch requires its packaged PowerShell helper.' }
+if ($seen.ContainsKey('dist/tray-status.js') -and (-not $seen.ContainsKey('CodexDotsBridge.Tray.exe') -or -not $seen.ContainsKey('CodexDotsBridge.ico'))) { throw 'Tray runtime requires the matching Windows executable and icon.' }
 $inventory = Get-Content -LiteralPath (Join-Path $PackageRoot 'licenses/npm-inventory.json') -Raw | ConvertFrom-Json
 foreach ($dependency in $inventory.packages) { foreach ($notice in $dependency.notices) { if (-not $seen.ContainsKey($notice)) { throw "Dependency notice missing: $($dependency.name)" } } }
 if ($manifest.tunnel) { foreach ($notice in @('LICENSE','NOTICE','tunnel-client-v0.0.16-windows-amd64-licenses.txt','tunnel-client-v0.0.16-windows-amd64.spdx.json')) { if (-not $seen.ContainsKey('vendor/tunnel-client-v0.0.16-windows-amd64/'+$notice)) { throw "Tunnel notice missing: $notice" } } }
 $node = Join-Path $PackageRoot 'runtime\node-v24.21.0-win-x64\node.exe'
 $actual = (& $node (Join-Path $PackageRoot 'dist\main.js') --version) -join ''
 if ($LASTEXITCODE -ne 0 -or ($actual | ConvertFrom-Json).version -ne $package.version) { throw 'Compiled runtime version mismatch.' }
+if ($seen.ContainsKey('CodexDotsBridge.Tray.exe')) {
+  $trayVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $PackageRoot 'CodexDotsBridge.Tray.exe')).ProductVersion
+  if ($trayVersion -cne $package.version) { throw 'Compiled tray version mismatch.' }
+}
 Write-Output "Verified release $($package.version): $($seen.Count) files, $($inventory.packages.Count) npm licenses."

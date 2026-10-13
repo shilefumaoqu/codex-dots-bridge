@@ -45,6 +45,7 @@ $originalConfig=[IO.File]::ReadAllText($configPath)
 $transactionPath=Join-Path $work '.setup-transaction.json'
 $calls=[Collections.Generic.List[object]]::new()
 $script:failRuntimeRun=$false
+$script:failOldRegistration=$false
 function Rollback-CodexCommand { return (Join-Path $work 'synthetic-cli.exe') }
 function Read-FallbackState { return $null }
 function Assert-OwnedRegistration { }
@@ -54,6 +55,11 @@ function Remove-Registration {
 }
 function Setup-Registration([string]$Root,$Settings,[bool]$EnableAutostart,[string]$TunnelClient,[string]$Command) {
   $calls.Add([pscustomobject]@{operation='registration';root=$Root})
+  if($script:failOldRegistration) {
+    if((Read-Json $transactionPath).current_registration_root -cne $Root) {throw 'old_owner_not_persisted_before_registration'}
+    Write-Json (Join-Path $data 'installation.json') ([pscustomobject]@{synthetic_partial_old_registration=$Root})
+    throw 'synthetic_old_registration_partial_failure'
+  }
   Write-Json $configPath ([pscustomobject]@{installation=@{root=$Root;node_path=(Runtime-Node $Root)}})
 }
 function Invoke-Bridge([string]$Root,[string[]]$BridgeArgs) {
@@ -63,12 +69,30 @@ function Invoke-Bridge([string]$Root,[string[]]$BridgeArgs) {
   if($BridgeArgs[0] -ceq 'run' -and $script:failRuntimeRun) { throw 'synthetic_resume_failed' }
   return [pscustomobject]@{supervisor='stopped';service='stopped'}
 }
+function Test-InstallerRuntimeReady([string]$Root,[string]$Directory) {Invoke-Bridge $Root @('status','--data-dir',$Directory)|Out-Null;return $false}
+function Assert-RuntimeLocksReleased([string]$Directory) {}
+function Stop-Tray([string]$Root,[string]$Directory) {}
+function Start-InstallerSupervisor([string]$Root,[string]$Directory) {Invoke-Bridge $Root @('run','--supervisor','--data-dir',$Directory)|Out-Null}
 $transaction=[pscustomobject]@{old_root=$callerRoot;old_runtime_root=$runtimeRoot;old_config=$binding;old_config_text=$originalConfig;data_dir=$data;app_data=(Join-Path $work 'AppData');was_running=$true;registration_changed=$true;old_autostart=$false;current_registration_root=(Join-Path $work 'new caller')}
 Write-Json $transactionPath $transaction
 Rollback-Transaction $transaction
-if($calls.Count -ne 3 -or $calls[0].root -cne $callerRoot -or $calls[1].root -cne $runtimeRoot -or $calls[2].root -cne $runtimeRoot -or $calls[2].version -cne '0.2.0-alpha.7' -or $calls[2].node -cne $node -or ($calls[2].arguments -join '|') -cne ('run|--data-dir|'+$data)) { throw 'Rollback dispatched wrong caller/runtime/version/arguments.' }
+if($calls.Count -ne 3 -or $calls[0].root -cne $callerRoot -or $calls[1].root -cne $runtimeRoot -or $calls[2].root -cne $runtimeRoot -or $calls[2].version -cne '0.2.0-alpha.7' -or $calls[2].node -cne $node -or ($calls[2].arguments -join '|') -cne ('run|--supervisor|--data-dir|'+$data)) { throw 'Rollback dispatched wrong caller/runtime/version/arguments.' }
 if([IO.File]::ReadAllText($configPath) -cne $originalConfig -or (Test-Path -LiteralPath $transactionPath)) { throw 'Rollback did not preserve config and finish transaction.' }
 $checks.Add('restores_caller_registration_then_exact_config_then_original_runtime_dispatch')
+$materials=@{'caller.key'='synthetic caller unchanged';'worker.key'='synthetic worker unchanged';'tasks.sqlite'='synthetic task data unchanged'}
+foreach($name in $materials.Keys){[IO.File]::WriteAllText((Join-Path $data $name),$materials[$name])}
+$transaction.current_registration_root=Join-Path $work 'new caller'
+Write-Json (Join-Path $data 'installation.json') ([pscustomobject]@{synthetic_new_registration='owned fixture'})
+Write-Json $transactionPath $transaction;$calls.Clear();$script:failOldRegistration=$true
+try {Rollback-Transaction $transaction;throw 'Partial old registration failure was accepted.'}catch{if($_.Exception.Message -cne 'synthetic_old_registration_partial_failure'){throw}}
+$partial=Read-Json $transactionPath
+if($partial.current_registration_root -cne $callerRoot -or $partial.registration_changed -ne $true -or (Read-Json (Join-Path $data 'installation.json')).synthetic_partial_old_registration -cne $callerRoot) {throw 'Partial old registration lost its persisted owner or pending transaction.'}
+if(@($calls|Where-Object{$_.operation -ceq 'registration'}).Count -ne 1 -or @($calls|Where-Object{$_.operation -cin @('run','status')}).Count -ne 0) {throw 'Unknown old registration result retried setup or started background work.'}
+if([IO.File]::ReadAllText($configPath) -cne $originalConfig){throw 'Partial old registration changed original config.'}
+foreach($name in $materials.Keys){if([IO.File]::ReadAllText((Join-Path $data $name)) -cne $materials[$name]){throw 'Partial old registration changed protected fixture data.'}}
+$checks.Add('partial_old_registration_failure_persists_old_owner_before_write_and_keeps_transaction')
+$checks.Add('partial_old_registration_failure_preserves_config_tasks_keys_without_retry_or_start')
+$script:failOldRegistration=$false
 $calls.Clear();$transaction.registration_changed=$false
 Write-Json $transactionPath $transaction
 Rollback-Transaction $transaction

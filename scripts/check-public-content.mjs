@@ -184,7 +184,11 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
         for (const rule of verifyReleaseEvidence(evidence, expected, dirname(resolve(evidenceFile)))) report.findings.push({ path: 'release-evidence', rule });
         // This is a reviewer attestation tied to the exact binaries, not automatic image/installer inspection.
         for (const item of report.warnings) if (evidence.contentReview?.[item.path] !== item.sha256) report.findings.push({ path: item.path, rule: 'binary-review-not-bound-to-candidate' });
-        if (evidence.privacyReview?.status !== 'passed' || evidence.privacyReview?.mode !== 'human') report.findings.push({ path: 'release-evidence', rule: 'missing-private-context-review' });
+        const privacy = evidence.privacyReview;
+        const independentAgent = privacy?.mode === 'independent_agent' && privacy.independent === true
+          && typeof privacy.reviewer?.model === 'string' && privacy.reviewer.model.trim().length > 0
+          && typeof privacy.reviewer?.reasoning === 'string' && privacy.reviewer.reasoning.trim().length > 0;
+        if (privacy?.status !== 'passed' || !(privacy.mode === 'human' || independentAgent)) report.findings.push({ path: 'release-evidence', rule: 'missing-private-context-review' });
         proofPrivacy(evidence, dirname(resolve(evidenceFile)), report);
       }
     }

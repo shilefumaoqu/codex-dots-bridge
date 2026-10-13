@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="320" viewBox="0 0 960 320" role="img" aria-labelledby="title desc">
+  <title id="title">Codex Dots Bridge — two ways to collaborate</title>
+  <desc id="desc">Delegate work from Codex to your Dot and retrieve its result. Your Dot can also read saved Codex history or request a reply through optional local conversation access.</desc>
+  <defs>
+    <marker id="teal" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0L7 4L0 8" fill="none" stroke="#9cd5d4" stroke-width="1.5"/></marker>
+    <marker id="gold" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0 0L7 4L0 8" fill="none" stroke="#e6c783" stroke-width="1.5"/></marker>
+  </defs>
+  <rect width="960" height="320" rx="18" fill="#1b2d38"/>
+  <g font-family="Segoe UI,Arial,sans-serif">
+    <text x="40" y="44" fill="#f6f3e9" font-size="22" font-weight="600">One bridge. Your Codex and your Dot.</text>
+    <text x="40" y="72" fill="#b4c5cd" font-size="15">Keep the work, its progress and its reply connected.</text>
+    <rect x="40" y="117" width="208" height="106" rx="14" fill="#243d49" stroke="#4b6571"/>
+    <text x="64" y="160" fill="#f6f3e9" font-size="28" font-weight="600">Codex</text>
+    <text x="64" y="189" fill="#b4c5cd" font-size="16">On your computer</text>
+    <rect x="346" y="104" width="268" height="132" rx="14" fill="#f6f3e9"/>
+    <circle cx="369" cy="126" r="4" fill="#4a7977"/><circle cx="383" cy="126" r="4" fill="#708a99"/><circle cx="397" cy="126" r="4" fill="#bd9b57"/>
+    <text x="369" y="161" fill="#1b2d38" font-size="24" font-weight="600">Codex Dots Bridge</text>
+    <text x="369" y="191" fill="#49616b" font-size="16">Tasks · History · Replies</text>
+    <rect x="712" y="117" width="208" height="106" rx="14" fill="#243d49" stroke="#4b6571"/>
+    <text x="736" y="160" fill="#f6f3e9" font-size="28" font-weight="600">Your Dot</text>
+    <text x="736" y="189" fill="#b4c5cd" font-size="16">In ChatGPT</text>
+    <g fill="none" stroke="#9cd5d4" stroke-width="2"><path d="M258 144H334" marker-end="url(#teal)"/><path d="M624 144H700" marker-end="url(#teal)"/></g>
+    <g fill="none" stroke="#e6c783" stroke-width="2"><path d="M700 194H626" marker-end="url(#gold)"/><path d="M334 194H260" marker-end="url(#gold)"/></g>
+    <path d="M40 260H920" stroke="#4b6571"/>
+    <text x="40" y="292" fill="#9cd5d4" font-size="16" font-weight="600">CODEX → DOT</text>
+    <text x="181" y="292" fill="#d7e4e8" font-size="16">Delegate work</text>
+    <text x="440" y="292" fill="#e6c783" font-size="16" font-weight="600">DOT → CODEX</text>
+    <text x="584" y="292" fill="#d7e4e8" font-size="16">Saved history &amp; reply requests</text>
+  </g>
+</svg>

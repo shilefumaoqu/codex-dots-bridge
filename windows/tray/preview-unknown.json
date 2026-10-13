@@ -1,0 +1,1 @@
+{"schema":1,"installed_version":"0.2.0-alpha.20","service_version":null,"state":"unknown","tone":"amber","title":"状态未知","reason":"检查超时，请刷新后重试。","service":"未检查","cloud":"未检查","dot":"未检查","control":"disabled","autostart":"unknown","checked_at":"2026-10-13T00:00:00Z","task_counts":{},"inflight_count":null,"error":"status_timeout"}

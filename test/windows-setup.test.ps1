@@ -2,7 +2,9 @@
 param(
   [Parameter(Mandatory=$true)][string]$SetupExecutable,
   [string]$UpgradeSetupExecutable,
+  [switch]$ExpectOfficialTunnelMigration,
   [string]$LegacyPackageRoot,
+  [switch]$ExpectDirectTrayShortcut,
   [Parameter(Mandatory=$true)][string]$InstallerAppId,
   [Parameter(Mandatory=$true)][string]$CodexCommand,
   [Parameter(Mandatory=$true)][string]$TestDirectory
@@ -106,6 +108,25 @@ function Bridge([string[]]$BridgeArguments) {
 function Installer-Arguments {
   @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/TASKS=autostart',('/TESTINSTANCE='+$testInstance),('/DIR='+$app),('/DATADIR='+$data),('/CODEXHOME='+$CodexDirectory),('/CODEXCOMMAND='+$CodexCommand),('/APPDATADIR='+$startup))
 }
+function Assert-TrayShortcut {
+  if(-not $ExpectDirectTrayShortcut) { return }
+  $current=Read-State
+  $path=Join-Path $startup 'Microsoft\Windows\Start Menu\Programs\Codex Dots Bridge\Codex Dots Bridge.lnk'
+  Assert-Condition (Test-Path -LiteralPath $path -PathType Leaf) 'Main tray shortcut is missing.'
+  $shell=New-Object -ComObject WScript.Shell
+  $shortcut=$null
+  try {
+    $shortcut=$shell.CreateShortcut($path)
+    Assert-Condition ($shortcut.TargetPath -ieq (Join-Path $current.payload_root 'CodexDotsBridge.Tray.exe')) 'Main shortcut does not directly target the selected tray EXE.'
+    $quotedData=$current.data_dir -replace '(\\+)$','$1$1'
+    Assert-Condition ($shortcut.Arguments -ceq ('--show --data-dir "'+$quotedData+'"')) 'Main shortcut lost the resolved Unicode/custom data directory.'
+    Assert-Condition ($shortcut.WorkingDirectory -ieq $current.payload_root) 'Main shortcut working directory is not the selected payload.'
+    Assert-Condition ($shortcut.Arguments -notmatch 'PowerShell|ExecutionPolicy|setup-lifecycle') 'Main shortcut retained a PowerShell intermediary.'
+  } finally {
+    if($shortcut) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) | Out-Null }
+    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
+  }
+}
 try {
   Assert-Condition (-not (Find-TestUninstallKey)) 'Test uninstall key already exists; refusing to replace it.'
   $validArguments=Installer-Arguments
@@ -157,6 +178,7 @@ try {
   Run-Executable $SetupExecutable (Installer-Arguments)
   $installed=$true
   $state=Read-State
+  Assert-TrayShortcut
   # Inno evaluates file Check callbacks repeatedly: copying the manifest must not skip later directories.
   & (Join-Path $state.payload_root 'scripts\check-package.ps1') -PackageRoot $state.payload_root | Out-Null
   $checks.Add('complete_installed_payload_after_manifest_copy')
@@ -212,6 +234,7 @@ import Database from 'better-sqlite3';const db=new Database(process.argv[1]);db.
   $configToml=Join-Path $CodexDirectory 'config.toml'
   Add-Content -LiteralPath $configToml -Encoding UTF8 -Value "`n[mcp_servers.synthetic_unrelated]`ncommand = 'preserve-command'`nargs = ['literal space']"
   Run-Executable $SetupExecutable (Installer-Arguments)
+  Assert-TrayShortcut
   $checks.Add('same_version_reinstall_and_owned_startup')
   # A native test-only CLI forwards exact argv to the real CLI, failing just the first add.
   # This reaches Commit after the old owned registration is removed; rollback's add succeeds.
@@ -350,9 +373,39 @@ public static class OneAddFailure {
   Assert-Condition ([IO.File]::ReadAllText($configToml) -ceq $beforeToml) 'Blocked uninstall removed owned MCP before checking changed Skill.'
   [IO.File]::WriteAllBytes($skillPath,$skill)
   $checks.Add('modified_skill_blocks_upgrade_and_uninstall_before_removal')
-  if($UpgradeSetupExecutable) { Run-Executable $UpgradeSetupExecutable (Installer-Arguments); $buildReceipt=$upgradeReceipt; $registryPath=Find-TestUninstallKey -RequireState; Assert-Condition ([bool]$registryPath) 'Upgraded Inno registration missing.'; $checks.Add('real_cross_version_upgrade') }
+  $legacyOfficialClient=$null;$legacyTunnelIdentity=$null
+  if($UpgradeSetupExecutable -and $ExpectOfficialTunnelMigration) {
+    $beforeUpgradeState=Read-State
+    $oldOfficial=Join-Path $beforeUpgradeState.payload_root 'vendor\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe'
+    $legacyOfficialClient=Join-Path $work 'legacy development client.exe'
+    Copy-Item -LiteralPath $oldOfficial -Destination $legacyOfficialClient
+    # A missing synthetic key keeps this real installation test offline; it
+    # verifies executable/configuration association without launching a Tunnel.
+    $legacyTunnelIdentity=[pscustomobject]@{tunnel_id='tunnel_synthetic_installation';organization_id='org_synthetic';client_path=$legacyOfficialClient;key_file=(Join-Path $work 'missing synthetic runtime key.env')}
+    $migrationConfig=Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $migrationConfig | Add-Member -Force -NotePropertyName tunnel -NotePropertyValue $legacyTunnelIdentity
+    [IO.File]::WriteAllText($configPath,($migrationConfig | ConvertTo-Json -Depth 15),[Text.UTF8Encoding]::new($false))
+  }
+  if($UpgradeSetupExecutable) {
+    # An unchecked upgrade must retain an existing login registration.
+    $upgradeArguments=@(Installer-Arguments | Where-Object { $_ -notlike '/TASKS=*' }) + @('/TASKS=')
+    Run-Executable $UpgradeSetupExecutable $upgradeArguments
+    $ExpectDirectTrayShortcut=$true
+    $buildReceipt=$upgradeReceipt; $registryPath=Find-TestUninstallKey -RequireState
+    Assert-Condition ([bool]$registryPath) 'Upgraded Inno registration missing.'
+    Assert-Condition ([bool](Read-State).autostart) 'Unchecked upgrade disabled existing autostart.'
+    $checks.Add('real_cross_version_upgrade'); $checks.Add('unchecked_upgrade_preserves_existing_autostart')
+  }
   $after=Read-State
+  Assert-TrayShortcut
   $config=Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  if($legacyOfficialClient) {
+    $newOfficial=Join-Path $after.payload_root 'vendor\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe'
+    Assert-Condition ($config.tunnel.client_path -ieq $newOfficial) 'Legacy official Tunnel executable binding was not migrated.'
+    Assert-Condition ((Get-FileHash -LiteralPath $legacyOfficialClient -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath $newOfficial -Algorithm SHA256).Hash) 'Legacy official executable was deleted or modified.'
+    foreach($field in @('tunnel_id','organization_id','key_file')) { Assert-Condition ($config.tunnel.$field -ceq $legacyTunnelIdentity.$field) 'Tunnel account or key reference changed.' }
+    $checks.Add('real_legacy_official_tunnel_binding_migrates_without_connection_or_identity_change')
+  }
   Assert-Condition ($config.instance_id -eq $instance) 'Instance identity changed.'
   Assert-Condition ([IO.File]::ReadAllText((Join-Path $data 'caller.key')) -ceq $caller) 'Caller key changed.'
   Assert-Condition ([IO.File]::ReadAllText((Join-Path $data 'worker.key')) -ceq $worker) 'Worker key changed.'

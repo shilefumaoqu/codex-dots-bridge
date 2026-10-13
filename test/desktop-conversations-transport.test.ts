@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -20,7 +20,7 @@ class Socket extends EventEmitter {
   receive(...frames: object[]) { this.emit('data', Buffer.concat(frames.map(encode))); }
   destroy() { if (!this.destroyed) { this.destroyed = true; queueMicrotask(() => { this.closed = true; this.emit('close'); }); } return this; }
 }
-type Mode = 'idle' | 'busy' | 'unknown' | 'changed' | 'wrong_owner' | 'offline' | 'ack_loss';
+type Mode = 'idle' | 'busy' | 'unknown' | 'changed' | 'wrong_owner' | 'offline' | 'ack_loss' | 'invalid_ack';
 async function fixture(action: (f: ReturnType<typeof setup>) => Promise<void>, mode: Mode = 'idle') {
   const f = setup(mode); try { await action(f); } finally { f.controller.abort(); rmSync(f.root, { recursive: true, force: true }); }
 }
@@ -58,7 +58,7 @@ function setup(mode: Mode) {
       s.receive(frame, ...(secondSnapshotPath !== undefined ? [{ ...frame, params: { ...frame.params, change: { type: 'snapshot', conversationState: { ...state, rolloutPath: secondSnapshotPath } } } }] : []), ...(mode === 'changed' ? [{ ...frame, params: { ...frame.params, change: { type: 'update' } } }] : []));
     } else if (message.method === 'thread-follower-start-turn') {
       assert.equal(before, 1); if (mode === 'ack_loss') { s.destroy(); return; }
-      onStart?.(); reply({ result: { turn: { id: turnId } } });
+      onStart?.(); reply({ result: { turn: { id: mode === 'invalid_ack' ? 'not-a-turn-id' : turnId } } });
     }
   });
   const input = () => ({ threadId, rolloutPath, signal: controller.signal, deadline: Date.now() + 150 });
@@ -135,6 +135,229 @@ test('custom message inherits settings, persists before write, binds ACK and acc
 test('ordinary sender never retries on busy or ACK loss', async () => {
   await fixture(async f => { assert.equal((await f.send()).status, 'skipped_busy'); assert.equal(f.before(), 0); }, 'busy');
   await fixture(async f => { assert.equal((await f.send()).status, 'uncertain'); assert.equal(f.before(), 1); assert.equal(f.accepted(), undefined); assert.equal(f.socket.frames.filter(frame => frame.method === 'thread-follower-start-turn').length, 1); }, 'ack_loss');
+});
+
+test('invalid native ACK and acceptance save failure never begin reply timing or a new budget', async () => {
+  for (const mode of ['invalid_ack', 'save_failure'] as const) await fixture(async f => {
+    let accepted = 0; const stages: string[] = [];
+    const result = await f.send({ onAccepted: () => { accepted++; throw new Error('private-save-error'); }, onStageTiming: (stage: string) => stages.push(stage) });
+    assert.equal(result.status, 'uncertain'); assert.equal(accepted, mode === 'invalid_ack' ? 0 : 1);
+    assert.deepEqual(stages, ['owner_lookup', 'send_ack']);
+    assert.equal(f.socket.frames.filter(frame => frame.method === 'thread-follower-start-turn').length, 1);
+    assert(!JSON.stringify(result).includes('private-save-error'));
+  }, mode === 'invalid_ack' ? 'invalid_ack' : 'idle');
+});
+
+function missingOwnerSocket() {
+  return new Socket((message, socket) => {
+    if (message.method === 'initialize') socket.receive({ type: 'response', requestId: message.requestId, method: message.method, resultType: 'success', result: { clientId: 'missing-follower' } });
+    if (message.method === 'thread-owner-discovery') socket.receive({ type: 'response', requestId: message.requestId, resultType: 'error', error: 'no-client-found' });
+  });
+}
+test('definitive missing owner warms once, reconnects and sends once using fresh identity', async () => fixture(async f => {
+  let connects = 0, navigations = 0, accepted: string | undefined;
+  const absent = missingOwnerSocket();
+  f.onStart(() => appendFileSync(f.nativePath, JSON.stringify(f.complete()) + '\n'));
+  const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'ordinary message', signal: f.controller.signal, deadline: Date.now() + 1000, beforeSend: f.persist, onAccepted: id => { accepted = id; } }, {
+    ...f.testing, connect: () => { if (++connects === 1) return absent as unknown as net.Socket; queueMicrotask(() => f.socket.emit('connect')); return f.socket as unknown as net.Socket; },
+    warmLoad: async input => { navigations++; assert.equal(input.threadId, f.threadId); assert.equal(f.before(), 0); assert.equal(absent.closed, true); return { status: 'accepted' }; },
+  });
+  assert.equal(result.status, 'completed'); assert.equal(accepted, f.turnId); assert.equal(navigations, 1); assert.equal(connects, 2); assert.equal(f.before(), 1);
+  assert.equal(f.socket.frames.filter(frame => frame.method === 'thread-follower-start-turn').length, 1);
+}));
+
+test('owner becoming ready during a one-shot discovery requires a new lookup, then one correlated send', async () => fixture(async f => {
+  let connects = 0, navigations = 0, ready = false, accepted: string | undefined;
+  const deadline = Date.now() + 1500, stages: Record<string, number[]> = {}, sockets: Socket[] = [];
+  const staleDiscovery = new Socket((message, socket) => {
+    if (message.method === 'initialize') socket.receive({ type: 'response', requestId: message.requestId, resultType: 'success', result: { clientId: 'stale-follower' } });
+    else if (message.method === 'thread-owner-discovery') {
+      // The router captured false canHandle before the thread acquired ownership.
+      ready = true;
+      setTimeout(() => socket.receive({ type: 'response', requestId: message.requestId, resultType: 'error', error: 'no-client-found' }), 25);
+    }
+  });
+  f.onStart(() => {
+    appendFileSync(f.nativePath, JSON.stringify(f.complete(randomUUID(), 'unrelated reply')) + '\n');
+    appendFileSync(f.nativePath, JSON.stringify(f.complete(f.turnId, 'fresh correlated reply')) + '\n');
+  });
+  const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'same request', signal: f.controller.signal, deadline, beforeSend: f.persist, onAccepted: id => { accepted = id; }, onStageTiming: (stage, ms) => { (stages[stage] ??= []).push(ms); } }, {
+    ...f.testing, connect: () => {
+      connects++;
+      const socket = connects === 1 ? missingOwnerSocket() : connects === 2 ? staleDiscovery : f.socket;
+      if (connects > 1) { if (connects === 3) assert(ready); queueMicrotask(() => socket.emit('connect')); }
+      sockets.push(socket); return socket as unknown as net.Socket;
+    },
+    warmLoad: async input => { navigations++; assert.equal(input.deadline, deadline); assert.equal(input.signal, f.controller.signal); assert.equal(input.threadId, f.threadId); return { status: 'accepted' }; },
+  });
+  assert.deepEqual(result, { status: 'completed', turn_id: f.turnId, reply: 'fresh correlated reply' });
+  assert.equal(accepted, f.turnId); assert.equal(navigations, 1); assert.equal(connects, 3); assert.equal(f.before(), 1);
+  assert.equal(sockets.flatMap(socket => socket.frames).filter(frame => frame.method === 'thread-follower-start-turn').length, 1);
+  assert.equal(stages.autoload?.length, 1); assert.equal(stages.send_ack?.length, 1); assert.equal(stages.reply_wait?.length, 1);
+  assert(stages.owner_lookup?.some(ms => ms >= 200));
+}));
+
+test('autoload readiness preserves the service request and persisted acceptance across repeated lookups', async () => fixture(async f => {
+  const db = new Database(':memory:'); let executions = 0, connects = 0, navigations = 0;
+  const service = new DesktopConversationsService(db, { enabled: true, mode: 'local', codex_home: f.root, read: false, send: true }, {
+    timeoutMs: 1000, transport: { runRead: async () => assert.fail('no read'), runSend: input => {
+      executions++; assert.equal(input.requestId, f.requestId);
+      return runSend({ ...input, beforeSend: () => { input.beforeSend(); f.persist(); } }, {
+        ...f.testing, connect: () => { if (++connects <= 2) return missingOwnerSocket() as unknown as net.Socket; queueMicrotask(() => f.socket.emit('connect')); return f.socket as unknown as net.Socket; },
+        warmLoad: async () => { navigations++; return { status: 'accepted' }; },
+      });
+    } },
+  });
+  f.onStart(() => appendFileSync(f.nativePath, JSON.stringify(f.complete()) + '\n'));
+  try {
+    const args = { request_id: f.requestId, thread_id: f.threadId, text: 'same persisted request' };
+    service.send(args); const result = await service.get({ request_id: f.requestId, wait_seconds: 2 });
+    assert.equal(result.status, 'completed'); assert.equal(result.request_id, f.requestId); assert.equal(result.reply, '普通回复🌟');
+    const stored = JSON.parse((db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id = ?').get(f.requestId) as { data: string }).data);
+    assert.equal(stored.accepted_turn_id, f.turnId); assert.equal(stored.sent, true);
+    assert.equal(service.send(args).status, 'completed'); assert.equal(executions, 1); assert.equal(connects, 3); assert.equal(navigations, 1); assert.equal(f.before(), 1);
+    assert.equal(f.socket.frames.filter(frame => frame.method === 'thread-follower-start-turn').length, 1);
+  } finally { await service.close(); db.close(); }
+}));
+
+test('warm loading consumes pre-send time but durable ACK opens a fresh real log reply wait', async () => fixture(async f => {
+  const db = new Database(':memory:'); let connects = 0, ackSaves = 0, completion: NodeJS.Timeout | undefined;
+  const service = new DesktopConversationsService(db, { enabled: true, mode: 'local', codex_home: f.root, read: false, send: true }, {
+    timeoutMs: 600, transport: { runRead: async () => assert.fail('no read'), runSend: input => runSend({ ...input, beforeSend: () => { input.beforeSend(); f.persist(); } }, {
+      ...f.testing,
+      connect: () => { if (++connects === 1) return missingOwnerSocket() as unknown as net.Socket; queueMicrotask(() => f.socket.emit('connect')); return f.socket as unknown as net.Socket; },
+      warmLoad: async () => { await new Promise(resolve => setTimeout(resolve, 550)); return { status: 'accepted' }; },
+    }) },
+  });
+  f.onStart(() => { completion = setTimeout(() => appendFileSync(f.nativePath, JSON.stringify(f.complete()) + '\n'), 100); });
+  db.function('ack_saved', () => { ackSaves++; return 1; });
+  db.exec("CREATE TRIGGER count_ack AFTER UPDATE ON desktop_conversation_requests WHEN json_extract(NEW.data, '$.accepted_turn_id') IS NOT NULL AND json_extract(OLD.data, '$.accepted_turn_id') IS NULL BEGIN SELECT ack_saved(); END");
+  try {
+    const args = { request_id: f.requestId, thread_id: f.threadId, text: 'slow warm, fresh reply' };
+    service.send(args); const result = await service.get({ request_id: f.requestId, wait_seconds: 2 });
+    assert.equal(result.status, 'completed'); assert.equal(result.reply, '普通回复🌟'); assert.equal(ackSaves, 1);
+    assert.equal(result.timing.stages_ms?.busy_wait, undefined);
+    for (const stage of ['owner_lookup', 'autoload', 'send_ack', 'reply_wait'] as const) assert(Number.isFinite(result.timing.stages_ms?.[stage]));
+    assert(result.timing.stages_ms!.autoload! >= 500); assert(result.timing.stages_ms!.reply_wait! >= 50);
+    assert(!JSON.stringify(result).includes('follower')); assert(!JSON.stringify(result).includes(f.root));
+    assert.equal(service.send(args).status, 'completed'); assert.equal(connects, 2);
+    assert.equal(f.socket.frames.filter(frame => frame.method === 'thread-follower-start-turn').length, 1);
+  } finally { clearTimeout(completion); await service.close(); db.close(); }
+}));
+test('warm ACK followed by busy returns selection evidence; persistent absence exhausts the original deadline', async () => {
+  await fixture(async f => {
+    let connects = 0, navigations = 0;
+    const active = randomUUID(), startedAtMs = Date.now() - 1000;
+    f.history.turnHistory.history.entitiesByKey.active = { turnId: active, turnStartedAtMs: startedAtMs, status: 'inProgress' };
+    const absent = missingOwnerSocket();
+    const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'message', signal: f.controller.signal, deadline: Date.now() + 1000, beforeSend: f.persist, onAccepted: () => assert.fail('busy must not accept') }, { ...f.testing, connect: () => { if (++connects === 1) return absent as unknown as net.Socket; queueMicrotask(() => f.socket.emit('connect')); return f.socket as unknown as net.Socket; }, warmLoad: async () => { navigations++; return { status: 'accepted' }; } });
+    assert.equal(result.status, 'skipped_busy'); assert.equal(f.before(), 0); assert.equal(navigations, 1); assert.equal(connects, 2);
+    if (result.status === 'skipped_busy') { assert.equal(result.busy_state?.active_turn_id, active); assert.equal(result.busy_state?.active_turn_started_at_ms, startedAtMs); assert.equal(result.busy_owner, createHash('sha256').update('owner').digest('hex')); }
+  }, 'busy');
+  await fixture(async f => {
+    let connects = 0, navigations = 0; const sockets: Socket[] = [], started = Date.now();
+    const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'message', signal: f.controller.signal, deadline: started + 600, beforeSend: () => assert.fail('missing owner must not persist'), onAccepted: () => assert.fail('missing owner must not accept') }, { ...f.testing, connect: () => { connects++; const socket = missingOwnerSocket(); sockets.push(socket); return socket as unknown as net.Socket; }, warmLoad: async () => { navigations++; return { status: 'accepted' }; } });
+    assert.deepEqual(result, { status: 'skipped_unknown', reason: 'native_owner_unavailable_after_load' }); assert.equal(navigations, 1);
+    assert(connects >= 3 && connects <= 4); assert(Date.now() - started >= 590 && Date.now() - started < 1500);
+    assert(sockets.every(socket => socket.closed && !socket.frames.some(frame => frame.method === 'thread-follower-start-turn')));
+  });
+});
+
+test('cancel during autoload readiness pause stops before another discovery or send', async () => fixture(async f => {
+  let connects = 0, navigations = 0; const sockets: Socket[] = []; let cancellation: NodeJS.Timeout | undefined, cancelledAt = 0;
+  try {
+    const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'cancelled', signal: f.controller.signal, deadline: Date.now() + 1500, beforeSend: () => assert.fail('cancelled request must not reserve'), onAccepted: () => assert.fail('must not accept') }, {
+      ...f.testing, connect: () => { connects++; const socket = missingOwnerSocket(); sockets.push(socket); return socket as unknown as net.Socket; },
+      warmLoad: async () => { navigations++; cancellation = setTimeout(() => { cancelledAt = Date.now(); f.controller.abort(); }, 50); return { status: 'accepted' }; },
+    });
+    assert.deepEqual(result, { status: 'skipped_unknown', reason: 'closed' }); assert.equal(connects, 2); assert.equal(navigations, 1);
+    assert(cancelledAt > 0 && Date.now() - cancelledAt < 200); assert(sockets.every(socket => socket.closed));
+  } finally { clearTimeout(cancellation); }
+}));
+
+test('guard invalidated during readiness waiting refuses the eventual idle send without retry', async () => fixture(async f => {
+  let connects = 0, navigations = 0, allowed = true, guardChecks = 0; let invalidation: NodeJS.Timeout | undefined;
+  try {
+    const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'guarded', signal: f.controller.signal, deadline: Date.now() + 1500, beforeSend: () => { guardChecks++; assert.equal(allowed, false); throw new Error('private guard refusal'); }, onAccepted: () => assert.fail('must not accept') }, {
+      ...f.testing, connect: () => { if (++connects <= 2) return missingOwnerSocket() as unknown as net.Socket; queueMicrotask(() => f.socket.emit('connect')); return f.socket as unknown as net.Socket; },
+      warmLoad: async () => { navigations++; invalidation = setTimeout(() => { allowed = false; }, 50); return { status: 'accepted' }; },
+    });
+    assert.deepEqual(result, { status: 'skipped_unknown', reason: 'log_unavailable' }); assert.equal(guardChecks, 1); assert.equal(connects, 3); assert.equal(navigations, 1);
+    assert(!f.socket.frames.some(frame => frame.method === 'thread-follower-start-turn'));
+  } finally { clearTimeout(invalidation); }
+}));
+
+test('autoload readiness terminates on connection, discovery, unknown state and uncertain ACK outcomes', async () => {
+  for (const mode of ['offline', 'discovery_error', 'unknown', 'ack_loss'] as const) await fixture(async f => {
+    let connects = 0, navigations = 0;
+    const errorSocket = new Socket((message, socket) => {
+      if (message.method === 'initialize') socket.receive({ type: 'response', requestId: message.requestId, resultType: 'success', result: { clientId: 'error-follower' } });
+      else if (message.method === 'thread-owner-discovery') socket.receive({ type: 'response', requestId: message.requestId, resultType: 'error', error: 'private remote failure' });
+    });
+    const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'message', signal: f.controller.signal, deadline: Date.now() + 1000, beforeSend: f.persist, onAccepted: () => assert.fail('must not accept') }, {
+      ...f.testing, connect: () => { if (++connects === 1) return missingOwnerSocket() as unknown as net.Socket; const socket = mode === 'discovery_error' ? errorSocket : f.socket; queueMicrotask(() => socket.emit('connect')); return socket as unknown as net.Socket; },
+      warmLoad: async () => { navigations++; return { status: 'accepted' }; },
+    });
+    assert.deepEqual(result, ({ offline: { status: 'skipped_unreachable', reason: 'ipc_initialize_failed' }, discovery_error: { status: 'skipped_unknown', reason: 'ipc_owner_discovery_failed' }, unknown: { status: 'skipped_unknown', reason: 'resume_state' }, ack_loss: { status: 'uncertain', reason: 'send_outcome_unknown' } })[mode]);
+    assert.equal(connects, 2); assert.equal(navigations, 1); assert.equal(f.before(), mode === 'ack_loss' ? 1 : 0);
+    assert.equal(f.socket.frames.filter(frame => frame.method === 'thread-follower-start-turn').length, mode === 'ack_loss' ? 1 : 0);
+  }, mode === 'discovery_error' ? 'idle' : mode);
+});
+
+test('unconfirmed navigation is never repeated or followed by another owner discovery', async () => fixture(async f => {
+  let connects = 0, navigations = 0;
+  const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'message', signal: f.controller.signal, deadline: Date.now() + 1000, beforeSend: () => assert.fail('must not reserve'), onAccepted: () => assert.fail('must not accept') }, {
+    ...f.testing, connect: () => { connects++; return missingOwnerSocket() as unknown as net.Socket; }, warmLoad: async () => { navigations++; return { status: 'skipped_unknown', reason: 'native_navigation_unconfirmed' }; },
+  });
+  assert.deepEqual(result, { status: 'skipped_unknown', reason: 'native_navigation_unconfirmed' }); assert.equal(connects, 1); assert.equal(navigations, 1);
+}));
+test('offline, discovery error, existing owner and uncertain send never navigate', async () => {
+  for (const mode of ['idle', 'busy', 'offline', 'ack_loss'] as const) await fixture(async f => {
+    let navigations = 0;
+    f.onStart(() => appendFileSync(f.nativePath, JSON.stringify(f.complete()) + '\n'));
+    await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'message', signal: f.controller.signal, deadline: Date.now() + 150, beforeSend: f.persist, onAccepted: () => {} }, { ...f.testing, warmLoad: async () => { navigations++; return { status: 'accepted' }; } });
+    assert.equal(navigations, 0);
+  }, mode);
+});
+
+test('chosen next turn waits only for the same native turn, sends once and returns the exact new reply', async () => fixture(async f => {
+  const active = randomUUID(), startedAtMs = Date.now() - 1000; let connects = 0, waiting = 0, writes = 0;
+  const stages: Record<string, number[]> = {};
+  const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'next text', signal: f.controller.signal, deadline: Date.now() + 1000, afterTurn: { id: active, startedAtMs, ownerHash: createHash('sha256').update('owner').digest('hex') }, onWaiting: () => { waiting++; }, beforeSend: f.persist, onAccepted: () => {}, onStageTiming: (stage, ms) => { (stages[stage] ??= []).push(ms); } }, {
+    pollMs: 2, warmLoad: async () => { assert.fail('waiting never navigates'); }, connect: () => {
+      const busy = ++connects < 3;
+      return new Socket((message, socket) => {
+        const reply = (result: object) => socket.receive({ type: 'response', requestId: message.requestId, method: message.method, handledByClientId: 'owner', resultType: 'success', result });
+        if (message.method === 'initialize') reply({ clientId: 'waiting-follower' });
+        else if (message.method === 'thread-owner-discovery') reply({});
+        else if (message.method === 'thread-stream-following-changed' && message.params.following) socket.receive({ type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner', targetClientIds: ['waiting-follower'], params: { conversationId: f.threadId, hostId: 'local', change: { type: 'snapshot', conversationState: { id: f.threadId, rolloutPath: f.nativePath, resumeState: 'resumed', threadRuntimeStatus: { type: busy ? 'active' : 'idle' }, turnHistory: { kind: 'canonical', history: { entitiesByKey: { active: { turnId: active, turnStartedAtMs: startedAtMs, status: busy ? 'inProgress' : 'completed' } } } } } } } });
+        else if (message.method === 'thread-follower-start-turn') { writes++; assert.equal(f.before(), 1); appendFileSync(f.nativePath, JSON.stringify(f.complete(f.turnId, 'new reply')) + '\n'); reply({ result: { turn: { id: f.turnId } } }); }
+      }) as unknown as net.Socket;
+    },
+  });
+  assert.deepEqual(result, { status: 'completed', turn_id: f.turnId, reply: 'new reply' }); assert.equal(waiting, 2); assert.equal(connects, 3); assert.equal(writes, 1);
+  assert.equal(stages.owner_lookup?.length, 3); assert.equal(stages.busy_wait?.length, 2);
+  assert.equal(stages.send_ack?.length, 1); assert.equal(stages.reply_wait?.length, 1); assert.equal(stages.autoload, undefined);
+  assert(Object.values(stages).flat().every(ms => Number.isFinite(ms) && ms >= 0));
+}));
+test('chosen next turn never passes an intervening different turn or waits for a lost owner', async () => {
+  for (const mode of ['different', 'missing', 'replaced'] as const) await fixture(async f => {
+    const active = randomUUID(), other = randomUUID(); let connects = 0;
+    const result = await runSend({ threadId: f.threadId, codexHome: f.root, requestId: f.requestId, text: 'not sent', signal: f.controller.signal, deadline: Date.now() + 1000, afterTurn: { id: active, startedAtMs: 1, ownerHash: createHash('sha256').update('owner').digest('hex') }, beforeSend: () => assert.fail('must not reserve'), onAccepted: () => assert.fail('must not accept') }, {
+      pollMs: 2, warmLoad: async () => { assert.fail('must not reload lost owner while waiting'); }, connect: () => {
+        connects++;
+        return new Socket((message, socket) => {
+          const owner = mode === 'replaced' && connects > 1 ? 'replacement-owner' : 'owner';
+          const reply = (result: object) => socket.receive({ type: 'response', requestId: message.requestId, method: message.method, handledByClientId: owner, resultType: 'success', result });
+          if (message.method === 'initialize') reply({ clientId: 'waiting-follower' });
+          else if (message.method === 'thread-owner-discovery') { if (mode === 'missing' && connects > 1) socket.receive({ type: 'response', requestId: message.requestId, resultType: 'error', error: 'no-client-found' }); else reply({}); }
+          else if (message.method === 'thread-stream-following-changed' && message.params.following) socket.receive({ type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner', targetClientIds: ['waiting-follower'], params: { conversationId: f.threadId, hostId: 'local', change: { type: 'snapshot', conversationState: { id: f.threadId, resumeState: 'resumed', threadRuntimeStatus: { type: 'active' }, turnHistory: { kind: 'canonical', history: { entitiesByKey: { active: { turnId: active, turnStartedAtMs: 1, status: 'inProgress' }, ...(mode === 'different' ? { other: { turnId: other, turnStartedAtMs: 2, status: 'inProgress' } } : {}) } } } } } } });
+        }) as unknown as net.Socket;
+      },
+    });
+    assert.equal(result.status, 'skipped_unknown'); if (result.status === 'skipped_unknown') assert.equal(result.reason, mode === 'different' ? 'next_turn_changed' : mode === 'replaced' ? 'next_turn_owner_changed' : 'native_owner_unavailable');
+    assert.equal(connects, mode === 'different' ? 1 : 2);
+  });
 });
 
 test('beforeSend persistence failure blocks the frame; acceptance failure is uncertain', async () => {

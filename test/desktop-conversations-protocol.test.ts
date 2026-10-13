@@ -81,7 +81,7 @@ test('enabled conversation tools have strict worker-only schemas and correct rea
     const tools = (await rpc('tools/list')).body.result.tools;
     for (const [name, properties, readOnly] of [
       ['codex_read_conversation', ['request_id', 'thread_id'], true],
-      ['codex_send_message', ['request_id', 'thread_id', 'text'], false],
+      ['codex_send_message', ['request_id', 'thread_id', 'text', 'delivery_mode'], false],
       ['codex_conversation_status', ['request_id', 'wait_seconds', 'offset'], true],
     ] as const) {
       const tool = tools.find((value: any) => value.name === name); assert.ok(tool);
@@ -91,6 +91,9 @@ test('enabled conversation tools have strict worker-only schemas and correct rea
       const caller = await control(name, { request_id: randomUUID() }); assert.notEqual(caller.status, 200);
     }
     const readDescription = tools.find((tool: any) => tool.name === 'codex_read_conversation').description;
+    const sendSchema = tools.find((tool: any) => tool.name === 'codex_send_message').inputSchema;
+    assert.deepEqual(sendSchema.properties.delivery_mode.enum, ['current_turn', 'next_turn']);
+    assert.equal(sendSchema.required.includes('delivery_mode'), false);
     assert.match(readDescription, /codex_conversation_status/); assert.match(readDescription, /(?:same|stable) request(?:_id)?/i);
     assert.match(readDescription, /offset/); assert.match(readDescription, /next_offset(?:\s*(?:=|:)\s*null|\s+until\s+null)/);
     assert.match(readDescription, /source_complete\s*(?:=|:)\s*false/);
@@ -108,6 +111,8 @@ test('enabled conversation tools have strict worker-only schemas and correct rea
         { request_id, thread_id: 'invalid', text: 'synthetic' }, { request_id, thread_id, text: '' },
         { request_id, thread_id, text: 'x'.repeat(8001) }, { request_id, thread_id, text: 5 }, { request_id, thread_id },
         { request_id, thread_id, text: 'synthetic', offset: 0 }, { request_id, thread_id, text: 'synthetic', offset: 32000 },
+        { request_id, thread_id, text: 'synthetic', delivery_mode: 'immediate' },
+        { request_id, thread_id, text: 'synthetic', delivery_mode: null },
       ]],
       ['codex_conversation_status', [
         { request_id, extra: true }, { request_id: 'invalid' }, { request_id, wait_seconds: -1 },
@@ -126,6 +131,11 @@ test('enabled conversation tools have strict worker-only schemas and correct rea
     for (const text of ['x', 'x'.repeat(8000)]) {
       const args = { request_id, thread_id, text };
       parsed((await rpc('tools/call', { name: 'codex_send_message', arguments: args })).body); assert.deepEqual(seen.at(-1), { method: 'send', args });
+    }
+    for (const delivery_mode of ['current_turn', 'next_turn']) {
+      const args = { request_id, thread_id, text: 'synthetic', delivery_mode };
+      parsed((await rpc('tools/call', { name: 'codex_send_message', arguments: args })).body);
+      assert.deepEqual(seen.at(-1), { method: 'send', args });
     }
     for (const wait_seconds of [undefined, 0, 0.25, 20]) {
       const args = { request_id, ...(wait_seconds === undefined ? {} : { wait_seconds }) };

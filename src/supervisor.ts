@@ -7,9 +7,12 @@ import { isolatedEnvironment, launchWindowsTunnel } from './tunnel-runner.js';
 export { isolatedEnvironment } from './tunnel-runner.js';
 import { processIsAlive } from './maintenance.js';
 import { ProbeError } from './store.js';
+import { recoverRebootLocks } from './reboot-recovery.js';
+import { launchWindowsSupervisor } from './windows-background.js';
 
 export interface SupervisorOptions {nodePath:string;entryPath:string}
-interface SupervisorState {owner:string;pid:number;bridge_pid?:number;tunnel_pid?:number;guardian_pid?:number;phase:'starting'|'running'|'stopping'|'failed';error?:string;cleanup_complete?:boolean}
+interface LifecycleEvent {at:string;event:'child_exit'|'child_error'|'uncaught_exception';child?:'bridge'|'guardian';pid?:number;exit_code?:number|null;signal?:string|null}
+interface SupervisorState {owner:string;pid:number;bridge_pid?:number;tunnel_pid?:number;guardian_pid?:number;phase:'starting'|'running'|'stopping'|'failed';error?:string;cleanup_complete?:boolean;lifecycle?:LifecycleEvent[]}
 const delay=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
 export function parseTunnelEnvironment(contents:string) {
   if(contents.length>16384)throw new ProbeError('invalid_tunnel_key_file');
@@ -39,14 +42,36 @@ export function supervisorStatus(dir:string) {
 }
 export async function startSupervisor(dir:string,options:SupervisorOptions) {
   protectProductionDirectory(dir);
-  const previous=readState(dir);if(previous&&!previous.cleanup_complete&&processIsAlive(previous.pid))throw new ProbeError('supervisor_already_running');
+  const recovery=await recoverRebootLocks(dir);
+  const previous=readState(dir);
+  if(!recovery.clearPreviousState&&previous&&!previous.cleanup_complete) {
+    // Windows recovery proves ownership/liveness using CIM, endpoint and exact
+    // metadata. A live numeric PID alone may belong to a later stdio caller.
+    if(process.platform==='win32')throw new ProbeError('supervisor_already_running_or_recovery_required');
+    if(processIsAlive(previous.pid))throw new ProbeError('supervisor_already_running');
+  }
   if(existsSync(join(dir,'supervisor.lock')))throw new ProbeError('stale_supervisor_lock');
-  const child=spawn(resolve(options.nodePath),[resolve(options.entryPath),'run','--supervisor','--data-dir',resolve(dir)],{detached:true,stdio:'ignore',windowsHide:true,env:isolatedEnvironment()});
-  let failed=false;child.once('error',()=>{failed=true;});child.unref();
+  let launchedPid:number|undefined,failed=false;
+  if(process.platform==='win32') {
+    // detached Node processes still inherit a caller's kill-on-close Job. The
+    // Windows broker creates the supervisor independently in the same session.
+    launchedPid=(await launchWindowsSupervisor({nodePath:options.nodePath,entryPath:options.entryPath,dataDir:dir})).pid;
+  } else {
+    const child=spawn(resolve(options.nodePath),[resolve(options.entryPath),'run','--supervisor','--data-dir',resolve(dir)],{detached:true,stdio:'ignore',windowsHide:true,env:isolatedEnvironment()});
+    launchedPid=child.pid;child.once('error',()=>{failed=true;});child.unref();
+  }
   for(let i=0;i<100;i++) {
     await delay(100);if(failed)throw new ProbeError('supervisor_spawn_failed');const current=readState(dir);
-    if(current&&current.pid===child.pid&&current.phase==='running')return supervisorStatus(dir);
-    if(current&&current.pid===child.pid&&current.phase==='failed')throw new ProbeError(current.error??'supervisor_start_failed');
+    if(current&&current.pid===launchedPid&&current.owner!==previous?.owner&&current.phase==='running') {
+      // Readiness belongs to the newly launched owner and both of its locks.
+      // A leftover running-state PID, later reused, is not a startup receipt.
+      try {
+        const lock=JSON.parse(readFileSync(join(dir,'supervisor.lock'),'utf8')) as {owner:string;pid:number};
+        const service=JSON.parse(readFileSync(join(dir,'service.lock'),'utf8')) as {owner:string;pid:number};
+        if(lock.owner===current.owner&&lock.pid===current.pid&&service.owner!==current.owner&&service.pid===current.bridge_pid&&current.bridge_pid&&processIsAlive(current.bridge_pid))return supervisorStatus(dir);
+      }catch(error){if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error;}
+    }
+    if(current&&current.pid===launchedPid&&current.owner!==previous?.owner&&current.phase==='failed')throw new ProbeError(current.error??'supervisor_start_failed');
   }
   return {supervisor:'starting',tools:'not_yet_verified'};
 }
@@ -91,6 +116,12 @@ export async function runSupervisor(dir:string,options:SupervisorOptions) {
   protectProductionDirectory(dir);const config=readProductionConfig(dir),owner=randomUUID(),lockPath=join(dir,'supervisor.lock');
   try{writeFileSync(lockPath,JSON.stringify({owner,pid:process.pid}),{flag:'wx',mode:0o600});}catch{throw new ProbeError('supervisor_already_running_or_stale');}
   let bridge:ChildProcess|undefined,guardian:ChildProcess|undefined,tunnelPid:number|undefined,stopping=false;let lastError:string|undefined;
+  const lifecycle:LifecycleEvent[]=[];
+  const observeChild=(child:ChildProcess,name:'bridge'|'guardian')=>{
+    const record=(event:LifecycleEvent)=>{lifecycle.push(event);if(lifecycle.length>16)lifecycle.shift();};
+    child.once('exit',(code,signal)=>record({at:new Date().toISOString(),event:'child_exit',child:name,pid:child.pid,exit_code:code,signal}));
+    child.once('error',()=>record({at:new Date().toISOString(),event:'child_error',child:name,pid:child.pid}));
+  };
   const recordError=(error:unknown)=>{
     if(lastError)return;
     const code=(error as NodeJS.ErrnoException).code;
@@ -100,14 +131,26 @@ export async function runSupervisor(dir:string,options:SupervisorOptions) {
   const cleanupStep=async(action:()=>void|Promise<void>,resource=true)=>{try{await action();}catch(error){if(resource)resourceCleanupFailed=true;recordError(error);}};
   const state=(phase:SupervisorState['phase'],error?:string,cleanupComplete=false)=>{
     const path=join(dir,`supervisor-state.${randomUUID()}.tmp`);
-    writeFileSync(path,JSON.stringify({owner,pid:process.pid,...(!cleanupComplete?{bridge_pid:bridge?.pid,tunnel_pid:tunnelPid,guardian_pid:guardian?.pid}:{cleanup_complete:true}),phase,...(error?{error}:{})}),{mode:0o600,flag:'wx'});
+    writeFileSync(path,JSON.stringify({owner,pid:process.pid,...(!cleanupComplete?{bridge_pid:bridge?.pid,tunnel_pid:tunnelPid,guardian_pid:guardian?.pid}:{cleanup_complete:true}),phase,...(error?{error}:{}),...(lifecycle.length?{lifecycle}:{})}),{mode:0o600,flag:'wx'});
     renameSync(path,join(dir,'supervisor-state.json'));
   };
   const stop=()=>{stopping=true;};process.once('SIGINT',stop);process.once('SIGTERM',stop);
+  const uncaught=()=>{
+    // Best effort only: no exception text, command lines or credentials are
+    // persisted, and diagnostic I/O never throws or terminates children.
+    try {
+      const lock=JSON.parse(readFileSync(lockPath,'utf8')) as {owner:string;pid:number};
+      if(lock.owner!==owner||lock.pid!==process.pid)return;
+      lifecycle.push({at:new Date().toISOString(),event:'uncaught_exception'});if(lifecycle.length>16)lifecycle.shift();
+      state('failed','supervisor_uncaught_exception');
+    }catch{/* retain the original fatal exception and runtime behavior */}
+  };
+  process.on('uncaughtExceptionMonitor',uncaught);
   try {
     state('starting');
     for(let attempt=0;!stopping;attempt++) {
       bridge=spawn(resolve(options.nodePath),[resolve(options.entryPath),'run','--foreground','--data-dir',resolve(dir)],{env:isolatedEnvironment(),windowsHide:true,stdio:['ignore','ignore','ignore','ipc']});
+      observeChild(bridge,'bridge');
       let childError=false;bridge.once('error',()=>{childError=true;});
       let endpoint:string|undefined;
       bridge.on('message',(message:unknown)=>{
@@ -123,7 +166,7 @@ export async function runSupervisor(dir:string,options:SupervisorOptions) {
         protectExternalKey(config.tunnel.key_file);
         if(existsSync(join(dir,'tunnel-health.url')))unlinkSync(join(dir,'tunnel-health.url'));
         const launched=launchWindowsTunnel(config.tunnel.client_path,['run','--control-plane.tunnel-id',config.tunnel.tunnel_id,'--control-plane.api-key','env:CONTROL_PLANE_API_KEY','--control-plane.organization-id',config.tunnel.organization_id,'--mcp.server-url',`url=${new URL('mcp/dot',endpoint).href},channel=main`,'--mcp.extra-headers',`X-Codex-Dots-Worker-Token: file:${join(resolve(dir),'worker.key')}`,'--health.listen-addr','127.0.0.1:0','--health.url-file',join(resolve(dir),'tunnel-health.url'),'--log.level','warn','--log.format','json'],config.tunnel.key_file);
-        guardian=launched.process;guardian.once('error',()=>{childError=true;});state('starting');tunnelPid=await launched.ready;
+        guardian=launched.process;observeChild(guardian,'guardian');guardian.once('error',()=>{childError=true;});state('starting');tunnelPid=await launched.ready;
       }
       state('running');
       while(!stopping&&!childError&&bridge.exitCode===null&&(!guardian||guardian.exitCode===null)) {
@@ -166,6 +209,7 @@ export async function runSupervisor(dir:string,options:SupervisorOptions) {
       if(existsSync(lockPath)){const lock=JSON.parse(readFileSync(lockPath,'utf8')) as {owner:string};if(lock.owner===owner)unlinkSync(lockPath);}
     });
     process.removeListener('SIGINT',stop);process.removeListener('SIGTERM',stop);
+    process.removeListener('uncaughtExceptionMonitor',uncaught);
   }
   if(lastError)throw new ProbeError(lastError);
 }

@@ -1,21 +1,22 @@
 import type net from 'node:net';
 import { closeSync, fstatSync, lstatSync, openSync, readSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { runDesktopMessageIpc, type DesktopIdleSnapshot } from './desktop-echo-ipc.js';
+import { runDesktopMessageIpc, type DesktopIpcDiagnostic, type DesktopTimingStage, type DesktopIdleSnapshot, type DesktopBusySnapshot } from './desktop-echo-ipc.js';
 import { resolveConversationPath } from './desktop-conversation-path.js';
 import { readNativeStoredHistory, type NativeReaderTesting, type NativeStoredHistory } from './desktop-conversation-reader.js';
+import { warmLoadDesktopThread, type DesktopWarmLoadInput, type DesktopWarmLoadResult } from './desktop-warm-load.js';
 
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const MAX_TEXT = 32000, MAX_LINE = 32 * 1024 * 1024;
 const utf8 = new TextDecoder('utf-8', { fatal: true });
-type Skip = { status: 'skipped_busy' | 'skipped_unknown' | 'skipped_unreachable'; reason: string };
+type Skip = { status: 'skipped_busy' | 'skipped_unknown' | 'skipped_unreachable'; reason: string; busy_state?: DesktopBusySnapshot; busy_owner?: string };
 export interface ConversationResolvedTarget { thread_id: string; rollout_path: string }
 export interface ConversationTransportInput { threadId: string; rolloutPath?: string; codexHome?: string; onResolvedTarget?: (target: ConversationResolvedTarget) => void; signal: AbortSignal; deadline: number }
 export interface ConversationReadInput extends ConversationTransportInput {}
-export interface ConversationSendInput extends ConversationTransportInput { requestId: string; text: string; beforeSend: () => void; onAccepted: (turnId: string) => void }
+export interface ConversationSendInput extends ConversationTransportInput { requestId: string; text: string; beforeSend: () => void; onAccepted: (turnId: string) => number | void; onStageTiming?: (stage: DesktopTimingStage, elapsedMs: number) => void; onDiagnostic?: (event: DesktopIpcDiagnostic) => void; afterTurn?: { id: string; startedAtMs: number; ownerHash: string }; onWaiting?: () => void }
 export type ConversationReadResult = { status: 'completed'; title?: string; context_json: string; source_complete: boolean; desktop_state: DesktopIdleSnapshot } | ({ status: 'completed' } & NativeStoredHistory) | Skip;
 export type ConversationSendResult = { status: 'completed'; turn_id: string; reply: string } | Skip | { status: 'uncertain'; reason: string };
-export interface ConversationTransportTesting { connect: () => net.Socket; pollMs?: number; nativeReader?: NativeReaderTesting }
+export interface ConversationTransportTesting { connect: () => net.Socket; pollMs?: number; nativeReader?: NativeReaderTesting; warmLoad?: (input: DesktopWarmLoadInput) => Promise<DesktopWarmLoadResult> }
 const failure = (code: string) => Object.assign(new Error(code), { code });
 const codes = new Set(['invalid_input', 'closed', 'timeout', 'log_unavailable', 'log_binding_invalid', 'log_eof_invalid', 'log_changed', 'log_invalid', 'reply_timeout', 'reply_failed', 'reply_invalid', 'reply_too_large', 'acceptance_not_persisted', 'context_too_large', 'native_path_missing', 'target_path_invalid', 'native_reader_unavailable', 'native_reader_closed', 'native_reader_protocol_invalid', 'native_reader_identity_invalid', 'native_reader_request_failed', 'native_reader_cleanup_failed']);
 const reason = (error: unknown) => codes.has((error as { code?: string })?.code ?? '') ? (error as { code: string }).code : 'log_unavailable';
@@ -100,18 +101,61 @@ export async function runRead(input: ConversationReadInput, testing?: Conversati
 }
 export async function runSend(input: ConversationSendInput, testing?: ConversationTransportTesting): Promise<ConversationSendResult> {
   let log: ConversationLog | undefined, sentAt: number | undefined, sent = false, preflightError: unknown;
+  const measure = async <T>(stage: DesktopTimingStage, action: () => Promise<T>): Promise<T> => {
+    const started = performance.now();
+    try { return await action(); } finally { input.onStageTiming?.(stage, Math.max(0, performance.now() - started)); }
+  };
   try {
     check(input); if (!UUID.test(input.requestId) || typeof input.text !== 'string' || !input.text.length || input.text.length > MAX_TEXT) throw failure('invalid_input');
-    const ipc = await runDesktopMessageIpc({ ...input, beforeSend: (meta?: { threadId: string; rolloutPath?: string }) => {
+    const sendOnce = () => runDesktopMessageIpc({ ...input, beforeSend: (meta?: { threadId: string; rolloutPath?: string }) => {
       try {
         check(input); const path = resolvedPath(input, meta); log = new ConversationLog(path, input.threadId); sentAt = log.captureEof();
         input.onResolvedTarget?.({ thread_id: input.threadId, rollout_path: path }); input.beforeSend(); check(input); log.validate(); sent = true;
       } catch (error) { preflightError = error; throw error; }
     } }, testing);
+    // Only definitive owner absence before any chat write enables one warm load.
+    // Never retry an uncertain message or replace the original desktop executor.
+    let ipc = await sendOnce();
+    if (ipc.status === 'skipped_unknown' && ipc.reason === 'native_owner_unavailable' && !input.afterTurn && !sent && !preflightError && input.codexHome !== undefined && (!testing || testing.warmLoad)) {
+      check(input);
+      const loaded = await measure('autoload', () => (testing?.warmLoad ?? warmLoadDesktopThread)(input));
+      if (loaded.status !== 'accepted') return loaded;
+      check(input); ipc = await sendOnce();
+      // Discovery snapshots its candidate clients once. A thread that becomes
+      // owned during that request needs a new discovery, not another navigation.
+      while (ipc.status === 'skipped_unknown' && ipc.reason === 'native_owner_unavailable' && !sent && !preflightError) {
+        await measure('owner_lookup', () => new Promise<void>(resolve => {
+          const done = () => { clearTimeout(timer); input.signal.removeEventListener('abort', done); resolve(); };
+          const timer = setTimeout(done, Math.max(1, Math.min(250, input.deadline - Date.now())));
+          input.signal.addEventListener('abort', done, { once: true });
+          if (input.signal.aborted) done();
+        }));
+        if (input.signal.aborted) throw failure('closed');
+        if (Date.now() >= input.deadline) return { status: 'skipped_unknown', reason: 'native_owner_unavailable_after_load' };
+        check(input); ipc = await sendOnce();
+      }
+    }
+    while (ipc.status === 'skipped_busy' && input.afterTurn && !sent && !preflightError) {
+      if (ipc.busy_state?.active_turn_id !== input.afterTurn.id || ipc.busy_state?.active_turn_started_at_ms !== input.afterTurn.startedAtMs) return { status: 'skipped_unknown', reason: 'next_turn_changed' };
+      input.onWaiting?.();
+      await measure('busy_wait', () => new Promise<void>(resolve => {
+        const done = () => { clearTimeout(timer); input.signal.removeEventListener('abort', done); resolve(); };
+        const timer = setTimeout(done, Math.max(1, Math.min(testing?.pollMs ?? 500, input.deadline - Date.now())));
+        input.signal.addEventListener('abort', done, { once: true });
+        if (input.signal.aborted) done();
+      }));
+      check(input); ipc = await sendOnce();
+      // A disconnected/lost owner terminates waiting; never navigate/replay it.
+    }
     if (ipc.status !== 'accepted') return preflightError ? { status: 'skipped_unknown', reason: reason(preflightError) } : ipc;
     if (!sent || sentAt === undefined) throw failure('reply_invalid');
-    try { input.onAccepted(ipc.turnId); } catch { throw failure('acceptance_not_persisted'); }
-    const reply = await log!.reply(ipc.turnId, sentAt, input, testing?.pollMs ?? 100);
+    let replyDeadline: number | void;
+    try { replyDeadline = input.onAccepted(ipc.turnId); } catch { throw failure('acceptance_not_persisted'); }
+    if (replyDeadline !== undefined && !Number.isFinite(replyDeadline)) throw failure('acceptance_not_persisted');
+    // Void callbacks retain the old transport contract. Service callbacks only
+    // return a fresh deadline after the validated ACK has been saved.
+    const replyInput = replyDeadline === undefined ? input : { ...input, deadline: replyDeadline };
+    const reply = await measure('reply_wait', () => log!.reply(ipc.turnId, sentAt!, replyInput, testing?.pollMs ?? 100));
     return { status: 'completed', turn_id: ipc.turnId, reply };
   } catch (error) { return { status: sent ? 'uncertain' : 'skipped_unknown', reason: reason(error) }; }
   finally { log?.close(); }

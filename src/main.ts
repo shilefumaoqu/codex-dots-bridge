@@ -14,6 +14,8 @@ import { acquireLock, defaultProductionDataDir, initProduction, protectProductio
 import { VERSION, callerSchemas, createProductionService, productionCall, resolveSchema, startProductionCaller, type CallerName } from './bridge.js';
 import { installCodex, uninstallCodex, backupData, restoreData, statusData, doctorData, connectionDiagnosticsData, assertStopped } from './maintenance.js';
 import { runSupervisor, startSupervisor, stopSupervisor, supervisorStatus } from './supervisor.js';
+import { getTrayStatus } from './tray-status.js';
+import { setTrayAutostart } from './tray-autostart.js';
 
 const {values,positionals}=parseArgs({allowPositionals:true,options:{
   'data-dir':{type:'string'},'request':{type:'string'},'task':{type:'string'},'title':{type:'string'},'text':{type:'string'},
@@ -24,6 +26,7 @@ const {values,positionals}=parseArgs({allowPositionals:true,options:{
   'tunnel-id':{type:'string'},'organization-id':{type:'string'},'tunnel-client':{type:'string'},'tunnel-env':{type:'string'},
   'codex-home':{type:'string'},'codex-command':{type:'string'},'desktop-access':{type:'string'},'autostart':{type:'boolean'},'no-register':{type:'boolean'},
   'foreground':{type:'boolean'},'supervisor':{type:'boolean'},'start':{type:'boolean'},'stop':{type:'boolean'},
+  'tray':{type:'boolean'},'autostart-state':{type:'string'},
   'to':{type:'string'},'from':{type:'string'},'help':{type:'boolean'},'version':{type:'boolean'},
 }});
 const dataDir=resolve(values['data-dir']??defaultProductionDataDir());
@@ -48,7 +51,10 @@ async function foreground() {
     } catch { process.stderr.write(JSON.stringify({service:'codex-dots-bridge',code:'desktop_echo_config_invalid'})+'\n'); }
     try {
       const conversationConfig=join(dataDir,'desktop-conversations.json');
-      if(existsSync(conversationConfig)) conversations=new DesktopConversationsService(store.db,JSON.parse(readFileSync(conversationConfig,'utf8')));
+      const conversationStore=store;
+      if(existsSync(conversationConfig)) conversations=new DesktopConversationsService(store.db,JSON.parse(readFileSync(conversationConfig,'utf8')),{
+        onIpcDiagnostic:(requestId,event)=>conversationStore.audit('desktop_ipc_failure',null,{request_id:requestId,...event}),
+      });
     } catch { process.stderr.write(JSON.stringify({service:'codex-dots-bridge',code:'desktop_conversations_config_invalid'})+'\n'); }
     const {loadOwnerNotifier,computeNotificationBindingKey}=await import('./owner-notification.js');
     let notificationConfig:ReturnType<typeof readOwnerNotificationConfig>;
@@ -92,6 +98,12 @@ async function foreground() {
   }
 }
 async function setup() {
+  if(values['autostart-state']!==undefined) {
+    const choice=values['autostart-state'];
+    if(choice!=='enabled'&&choice!=='disabled')throw new ProbeError('invalid_autostart_state');
+    if(Object.entries(values).some(([key,value])=>!['data-dir','autostart-state'].includes(key)&&value!==undefined))throw new ProbeError('conflicting_autostart_options');
+    output(setTrayAutostart(dataDir,choice==='enabled'));return;
+  }
   if(dataDir===root || dataDir.toLowerCase().startsWith(root.toLowerCase()+'\\') || dataDir.startsWith(root+'/'))throw new ProbeError('data_must_be_outside_source');
   const config=initProduction(dataDir);
   assertStopped(dataDir);
@@ -137,7 +149,7 @@ async function tasks() {
 }
 try {
   if(values.version)output({name:'codex-dots-bridge',version:VERSION});
-  else if(values.help||!positionals[0])process.stdout.write(`Codex Dots Bridge ${VERSION}\nWindows x64 prerelease; keep P0 evidence separate.\n\nsetup [--tunnel-id ID --organization-id ID --tunnel-client EXE --tunnel-env ENV_FILE] [--autostart]\nsetup --desktop-access off|read|read-send [--codex-home PATH] (service stopped)\nrun [--start | --stop | --foreground]\nstatus | doctor\ntasks list|get|submit|message|followup|cancel|ack|wait [--request JSON_FILE]\nresolve --request JSON_FILE\nbackup --to PROTECTED_DIRECTORY\nrestore --from BACKUP_DIRECTORY [--data-dir EMPTY_TARGET]\nuninstall [--codex-command NEW_NATIVE_EXE]\n\nAll commands accept --data-dir PATH. stdio and run --supervisor are managed entry points.\nNo command accepts a plaintext Tunnel key. Registration is not proof that Codex loaded the tools.\n`);
+  else if(values.help||!positionals[0])process.stdout.write(`Codex Dots Bridge ${VERSION}\nWindows x64 prerelease; keep P0 evidence separate.\n\nsetup [--tunnel-id ID --organization-id ID --tunnel-client EXE --tunnel-env ENV_FILE] [--autostart]\nsetup --desktop-access off|read|read-send [--codex-home PATH] (service stopped)\nrun [--start | --stop | --foreground]\nstatus [--tray] | doctor\nsetup --autostart-state enabled|disabled (no restart)\ntasks list|get|submit|message|followup|cancel|ack|wait [--request JSON_FILE]\nresolve --request JSON_FILE\nbackup --to PROTECTED_DIRECTORY\nrestore --from BACKUP_DIRECTORY [--data-dir EMPTY_TARGET]\nuninstall [--codex-command NEW_NATIVE_EXE]\n\nAll commands accept --data-dir PATH. stdio and run --supervisor are managed entry points.\nNo command accepts a plaintext Tunnel key. Registration is not proof that Codex loaded the tools.\n`);
   else switch(positionals[0]) {
     case 'setup':await setup();break;
     case 'run':
@@ -147,7 +159,7 @@ try {
       else if(values.supervisor)await runSupervisor(dataDir,runtime);
       else output(await startSupervisor(dataDir,runtime));break;
     case 'stdio':readProductionConfig(dataDir);startProductionCaller(dataDir);break;
-    case 'status':output({...statusData(dataDir),...supervisorStatus(dataDir)});break;
+    case 'status':output(values.tray?await getTrayStatus(dataDir,VERSION):{...statusData(dataDir),...supervisorStatus(dataDir)});break;
     case 'doctor':output({...await doctorData(dataDir),...supervisorStatus(dataDir)});break;
     case 'tasks':await tasks();break;
     case 'resolve':output(await productionCall(dataDir,'resolve',resolveSchema.parse(fromRequest())));break;

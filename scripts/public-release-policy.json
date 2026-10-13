@@ -9,9 +9,21 @@
     "docs/兼容性与已知限制.md",
     "docs/发布与升级.md",
     "docs/图标与品牌.md",
-    "docs/发布门禁.md"
+    "docs/发布门禁.md",
+    "docs/alpha12验收状态.md",
+    "docs/alpha13验收状态.md",
+    "docs/alpha14验收状态.md",
+    "docs/alpha15验收状态.md",
+    "docs/alpha16自动加载验收.md",
+    "docs/alpha17自动加载就绪验收.md",
+    "docs/alpha18诊断与验收.md",
+    "docs/alpha19启动恢复验收.md",
+    "docs/alpha20托盘验收.md",
+    "docs/alpha21启动恢复验收.md"
   ],
-  "assetPrefixes": ["docs/素材/星渡/"],
+  "assetPrefixes": [
+    "docs/素材/星渡/"
+  ],
   "reviewedHistoricalDocuments": {
     "docs/P0Dot执行说明.md": "1fb76e45fa1d2b7b05b6afecccd5643a5ee3b52b49a03e314cabe342c62d8d52",
     "docs/P0官方接入.md": "fe573ea5132e56065cc45a88c1a8cef6a725bf10854dd2cb3b569d0d8b0d9765",

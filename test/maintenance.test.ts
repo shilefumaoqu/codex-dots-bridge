@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import test from 'node:test';
+import test, { mock } from 'node:test';
+import fs from 'node:fs';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, unlinkSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -133,6 +136,64 @@ test('setup without autostart flag preserves a user-modified owned startup scrip
     assert.ok(uninstallCodex(dir).retained.includes('modified_or_foreign_autostart'));
     assert.equal(readFileSync(manifest.autostart.path,'utf8'),changed);
   }finally{if(priorAppData===undefined)delete process.env.APPDATA;else process.env.APPDATA=priorAppData;cleanup(root);}
+});
+
+test('setup upgrades an owned legacy startup after adding the tray and still preserves foreign edits',{skip:process.platform!=='win32'||!process.env.CODEX_DOTS_TEST_CODEX},()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots startup tray upgrade ')),priorAppData=process.env.APPDATA;
+  try {
+    process.env.APPDATA=join(root,'appdata');
+    const dir=join(root,'data'),home=join(root,'codex home'),source=join(root,'skill'),entry=join(root,'payload','dist','main.js');
+    initProduction(dir);mkdirSync(home);mkdirSync(source);mkdirSync(join(entry,'..'),{recursive:true});
+    writeFileSync(entry,'// synthetic entry');writeFileSync(join(source,'SKILL.md'),'owned synthetic skill');
+    const options={nodePath:process.execPath,entryPath:entry,skillSource:source,codexHome:home,codexCommand:process.env.CODEX_DOTS_TEST_CODEX!,autostart:true};
+    installCodex(dir,options);
+    const manifestPath=join(dir,'installation.json'),legacy=JSON.parse(readFileSync(manifestPath,'utf8'));
+    assert.ok(!legacy.autostart.content.includes('CodexDotsBridge.Tray.exe'));
+    writeFileSync(join(root,'payload','CodexDotsBridge.Tray.exe'),'synthetic tray file; never executed');
+    installCodex(dir,options);
+    const current=JSON.parse(readFileSync(manifestPath,'utf8'));
+    assert.ok(current.autostart.content.includes('CodexDotsBridge.Tray.exe'));
+    assert.equal(readFileSync(current.autostart.path,'utf8'),current.autostart.content);
+    installCodex(dir,options);
+    const changed='user-owned customization';writeFileSync(current.autostart.path,changed);
+    assert.throws(()=>installCodex(dir,options),/foreign_autostart_collision/);
+    assert.equal(readFileSync(current.autostart.path,'utf8'),changed);
+    assert.equal(readFileSync(manifestPath,'utf8'),JSON.stringify(current,null,2));
+  }finally{if(priorAppData===undefined)delete process.env.APPDATA;else process.env.APPDATA=priorAppData;cleanup(root);}
+});
+
+test('legacy Startup ownership survives failed MCP readback and failed replacement manifest write',{skip:process.platform!=='win32'||!process.env.CODEX_DOTS_TEST_CODEX},()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots startup migration failure ')),priorAppData=process.env.APPDATA;
+  try {
+    process.env.APPDATA=join(root,'appdata');
+    const dir=join(root,'data'),home=join(root,'codex home'),source=join(root,'skill'),entry=join(root,'payload','dist','main.js');
+    initProduction(dir);mkdirSync(home);mkdirSync(source);mkdirSync(join(entry,'..'),{recursive:true});
+    writeFileSync(entry,'// synthetic entry');writeFileSync(join(source,'SKILL.md'),'owned synthetic skill');
+    const command=process.env.CODEX_DOTS_TEST_CODEX!;
+    const options={nodePath:process.execPath,entryPath:entry,skillSource:source,codexHome:home,codexCommand:command,autostart:true};
+    installCodex(dir,options);
+    const manifestPath=join(dir,'installation.json'),original=readFileSync(manifestPath,'utf8'),legacy=JSON.parse(original);
+    writeFileSync(join(root,'payload','CodexDotsBridge.Tray.exe'),'synthetic tray file; never executed');
+    const actualExec=childProcess.execFileSync;let lists=0;
+    const readback=mock.method(childProcess,'execFileSync',((executable:unknown,args:unknown,...rest:unknown[])=>{
+      if(executable===command&&Array.isArray(args)&&args[0]==='mcp'&&args[1]==='list'&&++lists===2)throw new Error('synthetic MCP readback failure');
+      return (actualExec as Function)(executable,args,...rest);
+    }) as typeof actualExec);
+    syncBuiltinESMExports();
+    try{assert.throws(()=>installCodex(dir,options),/codex_cli_operation_failed/);}finally{readback.mock.restore();syncBuiltinESMExports();}
+    assert.equal(readFileSync(manifestPath,'utf8'),original);assert.equal(readFileSync(legacy.autostart.path,'utf8'),legacy.autostart.content);
+    const actualWrite=fs.writeFileSync;let injected=false;
+    const commit=mock.method(fs,'writeFileSync',((path:unknown,data:unknown,...rest:unknown[])=>{
+      if(path===manifestPath&&typeof data==='string'&&data.includes('CodexDotsBridge.Tray.exe')&&!injected){injected=true;throw new Error('synthetic manifest commit failure');}
+      return (actualWrite as Function)(path,data,...rest);
+    }) as typeof actualWrite);
+    syncBuiltinESMExports();
+    try{assert.throws(()=>installCodex(dir,options),/synthetic manifest commit failure/);}finally{commit.mock.restore();syncBuiltinESMExports();}
+    assert.equal(injected,true);assert.equal(readFileSync(manifestPath,'utf8'),original);assert.equal(readFileSync(legacy.autostart.path,'utf8'),legacy.autostart.content);
+    installCodex(dir,options);
+    const updated=JSON.parse(readFileSync(manifestPath,'utf8'));assert.equal(readFileSync(updated.autostart.path,'utf8'),updated.autostart.content);assert.ok(updated.autostart.content.includes('CodexDotsBridge.Tray.exe'));
+    assert.ok(uninstallCodex(dir).removed.includes('autostart'));
+  }finally{mock.restoreAll();syncBuiltinESMExports();if(priorAppData===undefined)delete process.env.APPDATA;else process.env.APPDATA=priorAppData;cleanup(root);}
 });
 
 test('hidden supervisor owns one bridge, rejects duplicate and stops without task cancellation',async()=>{

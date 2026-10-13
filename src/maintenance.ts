@@ -109,8 +109,8 @@ export function restoreData(backup:string,targetDir:string) {
   return {restored_directory:target,instance_id:config.instance_id,mcp_registration:'run_setup_again',dot_binding:'verify_subscription_after_start'};
 }
 export interface InstallOptions {nodePath:string;entryPath:string;skillSource:string;codexHome?:string;codexCommand?:string;autostart?:boolean}
-interface InstallManifest {owner:'codex-dots-bridge';instance_id:string;codex_home:string;codex_command:string;mcp:{name:string;command:string;args:string[]};mcp_registration?:unknown;skill:{path:string;files:Record<string,string>};autostart?:{path:string;content:string}}
-function safePath(path:string) {
+export interface InstallManifest {owner:'codex-dots-bridge';instance_id:string;codex_home:string;codex_command:string;mcp:{name:string;command:string;args:string[]};mcp_registration?:unknown;skill:{path:string;files:Record<string,string>};autostart?:{path:string;content:string}}
+export function safePath(path:string) {
   for(let cursor=resolve(path);;cursor=dirname(cursor)){if(existsSync(cursor)&&lstatSync(cursor).isSymbolicLink())throw new ProbeError('symlink_installation_path');if(cursor===dirname(cursor))break;}
 }
 function tree(root:string,prefix=''):Record<string,string> {
@@ -152,7 +152,7 @@ function mcpEntry(command:string,home:string,name:string) {
   return list.find(entry=>entry.name===name);
 }
 function entryMatches(entry:ReturnType<typeof mcpEntry>,expected:InstallManifest['mcp'],snapshot?:unknown) {return !!entry&&entry.transport.type==='stdio'&&entry.transport.command===expected.command&&JSON.stringify(entry.transport.args??[])===JSON.stringify(expected.args)&&(snapshot===undefined||JSON.stringify(entry)===JSON.stringify(snapshot));}
-function readInstall(dir:string):InstallManifest|undefined {
+export function readInstall(dir:string):InstallManifest|undefined {
   const path=join(dir,'installation.json');if(!existsSync(path))return;
   regular(path);const value=JSON.parse(readFileSync(path,'utf8')) as InstallManifest;
   if(value.owner!=='codex-dots-bridge'||value.instance_id!==readProductionConfig(dir).instance_id)throw new ProbeError('foreign_installation_manifest');
@@ -161,6 +161,20 @@ function readInstall(dir:string):InstallManifest|undefined {
   for(const name of Object.keys(value.skill.files)) {const path=resolve(value.skill.path,name);if(!path.startsWith(resolve(value.skill.path)+sep))throw new ProbeError('invalid_installation_manifest');}
   if(value.autostart&&value.autostart.path!==join(process.env.APPDATA??'','Microsoft','Windows','Start Menu','Programs','Startup','CodexDotsBridge.vbs'))throw new ProbeError('invalid_installation_manifest');
   return value;
+}
+export function createAutostartEntry(dir:string,mcp:InstallManifest['mcp'],requireTray=false) {
+  if(process.platform!=='win32'||!process.env.APPDATA)throw new ProbeError('autostart_windows_only');
+  const path=join(process.env.APPDATA,'Microsoft','Windows','Start Menu','Programs','Startup','CodexDotsBridge.vbs');
+  const tray=join(dirname(dirname(resolve(mcp.args[0]!))),'CodexDotsBridge.Tray.exe');
+  safePath(tray);
+  if(requireTray&&!existsSync(tray))throw new ProbeError('tray_executable_missing');
+  if(existsSync(tray))regular(tray);
+  const quote=(v:string)=>'"'+v.replaceAll('"','""')+'"';
+  const command=(args:string[])=>{if(args.some(arg=>/["%\r\n\0]/.test(arg)))throw new ProbeError('unsafe_autostart_argument');return args.map(v=>'"'+v+'"').join(' ');};
+  const launch=command([mcp.command,mcp.args[0]!,'run','--data-dir',resolve(dir)]);
+  const content='Set shell = CreateObject("WScript.Shell")\r\nshell.Run '+quote(launch)+', 0, False\r\n'+
+    (existsSync(tray)?'shell.Run '+quote(command([tray,'--data-dir',resolve(dir),'--background']))+', 0, False\r\n':'');
+  return {path,content};
 }
 export function installCodex(dir:string,options:InstallOptions) {
   protectProductionDirectory(dir);const config=readProductionConfig(dir),previous=readInstall(dir);
@@ -177,21 +191,20 @@ export function installCodex(dir:string,options:InstallOptions) {
   if(previous&&JSON.stringify(skillFiles)!==JSON.stringify(previous.skill.files))throw new ProbeError('skill_upgrade_requires_uninstall');
   const manifest:InstallManifest={owner:'codex-dots-bridge',instance_id:config.instance_id,codex_home:home,codex_command:command,mcp,mcp_registration:previous?.mcp_registration,skill:{path:skillPath,files:skillFiles}};
   if(options.autostart) {
-    if(process.platform!=='win32'||!process.env.APPDATA)throw new ProbeError('autostart_windows_only');
-    const path=join(process.env.APPDATA,'Microsoft','Windows','Start Menu','Programs','Startup','CodexDotsBridge.vbs');
-    const quote=(v:string)=>'"'+v.replaceAll('"','""')+'"';
-    const launch=[mcp.command,mcp.args[0]!,'run','--data-dir',resolve(dir)].map(v=>'"'+v+'"').join(' ');
-    const content='Set shell = CreateObject("WScript.Shell")\r\nshell.Run '+quote(launch)+', 0, False\r\n';
-    if(existsSync(path)&&(!previous?.autostart||previous.autostart.path!==path||readFileSync(path,'utf8')!==previous.autostart.content))throw new ProbeError('foreign_autostart_collision');
+    const {path,content}=createAutostartEntry(dir,mcp);
     manifest.autostart={path,content};
   }else if(previous?.autostart)manifest.autostart=previous.autostart;
   if(manifest.autostart) {
     safePath(manifest.autostart.path);
     if(existsSync(manifest.autostart.path)) {
       regular(manifest.autostart.path);
-      if(readFileSync(manifest.autostart.path,'utf8')!==manifest.autostart.content)throw new ProbeError('foreign_autostart_collision');
+      if(!previous?.autostart||previous.autostart.path!==manifest.autostart.path||readFileSync(manifest.autostart.path,'utf8')!==previous.autostart.content)throw new ProbeError('foreign_autostart_collision');
     }
   }
+  const desiredAutostart=manifest.autostart;
+  const changingAutostart=!!previous?.autostart&&!!desiredAutostart&&previous.autostart.content!==desiredAutostart.content;
+  // Keep the old Startup ownership recoverable until its replacement is written.
+  if(changingAutostart)manifest.autostart=previous!.autostart;
   // Record intent before registrations so a failed step remains recoverable and owns only exact matching content.
   writeFileSync(join(dir,'installation.json'),JSON.stringify(manifest,null,2),{mode:0o600});protectProductionDirectory(dir);
   if(!existing)runCodex(command,home,['mcp','add',mcp.name,'--',mcp.command,...mcp.args]);
@@ -200,7 +213,25 @@ export function installCodex(dir:string,options:InstallOptions) {
   manifest.mcp_registration=registered;writeFileSync(join(dir,'installation.json'),JSON.stringify(manifest,null,2),{mode:0o600});
   mkdirSync(skillPath,{recursive:true});
   for(const name of Object.keys(skillFiles)){const path=join(skillPath,name);mkdirSync(dirname(path),{recursive:true});copyFileSync(join(options.skillSource,name),path);}
-  if(manifest.autostart){mkdirSync(dirname(manifest.autostart.path),{recursive:true});writeFileSync(manifest.autostart.path,manifest.autostart.content);}
+  if(desiredAutostart) {
+    mkdirSync(dirname(desiredAutostart.path),{recursive:true});
+    if(changingAutostart) {
+      const manifestPath=join(dir,'installation.json'),oldManifest=readFileSync(manifestPath,'utf8');
+      const oldStartup=existsSync(desiredAutostart.path)?readFileSync(desiredAutostart.path,'utf8'):undefined;
+      try {
+        writeFileSync(desiredAutostart.path,desiredAutostart.content);
+        manifest.autostart=desiredAutostart;
+        writeFileSync(manifestPath,JSON.stringify(manifest,null,2),{mode:0o600});
+      } catch(error) {
+        try {
+          if(oldStartup===undefined){if(existsSync(desiredAutostart.path))unlinkSync(desiredAutostart.path);}
+          else writeFileSync(desiredAutostart.path,oldStartup);
+          writeFileSync(manifestPath,oldManifest,{mode:0o600});
+        }catch{throw new ProbeError('autostart_rollback_incomplete');}
+        throw error;
+      }
+    } else writeFileSync(desiredAutostart.path,desiredAutostart.content);
+  }
   return {mcp:'registered',skill:'installed',autostart:!!manifest.autostart,codex_tools:'pending_restart_or_new_chat_and_real_call'};
 }
 export function uninstallCodex(dir:string,codexCommand?:string) {

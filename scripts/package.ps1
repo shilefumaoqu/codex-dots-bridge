@@ -28,6 +28,7 @@ try {
   }
 } finally { Pop-Location }
 New-Item -ItemType Directory -Path $staging | Out-Null
+& (Join-Path $PSScriptRoot 'build-tray.ps1') -OutputDirectory $staging | Out-Null
 foreach ($name in @('dist','skills','licenses')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) -Recurse }
 $publicPolicy = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'public-release-policy.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 foreach ($relative in $publicPolicy.documents) {
@@ -44,6 +45,9 @@ foreach ($name in @('package.json','package-lock.json','LICENSE','THIRD_PARTY_NO
 New-Item -ItemType Directory -Path (Join-Path $staging 'scripts') | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install.ps1') -Destination (Join-Path $staging 'scripts\install.ps1')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'setup-lifecycle.ps1') -Destination (Join-Path $staging 'scripts\setup-lifecycle.ps1')
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'desktop-warm-load.ps1') -Destination (Join-Path $staging 'scripts\desktop-warm-load.ps1')
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'recover-reboot-locks.ps1') -Destination (Join-Path $staging 'scripts\recover-reboot-locks.ps1')
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'launch-background.ps1') -Destination (Join-Path $staging 'scripts\launch-background.ps1')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'check-package.ps1') -Destination (Join-Path $staging 'scripts\check-package.ps1')
 foreach ($name in @('check-public-content.mjs','public-release-policy.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $staging ('scripts\'+$name)) }
 $packagedRuntime = Join-Path $staging 'runtime\node-v24.21.0-win-x64'

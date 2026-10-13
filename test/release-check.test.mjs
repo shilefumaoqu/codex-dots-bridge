@@ -215,3 +215,64 @@ test('CLI fails closed when final release evidence is absent', () => scratch(dir
   const result = spawnSync(process.execPath, ['scripts/check-public-content.mjs', '--root', dir, '--require-evidence'], { cwd: new URL('..', import.meta.url), encoding: 'utf8' });
   assert.equal(result.status, 1); assert.match(result.stdout, /missing-release-evidence/);
 }));
+
+function privacyCli(privacyReview, adjust = () => {}) {
+  return scratch(dir => {
+    const publicRoot = join(dir, 'public'); mkdirSync(publicRoot);
+    const source = join(dir, 'source.zip'), windows = join(dir, 'windows.zip'), notes = join(dir, 'notes.md'), evidencePath = join(dir, 'evidence.json');
+    for (const [path, body] of [[source, 'synthetic source'], [windows, 'synthetic windows'], [notes, 'synthetic release notes']]) writeFileSync(path, body);
+    const value = { ...evidence(), sourceZipSha256: sha('synthetic source'), windowsZipSha256: sha('synthetic windows'), releaseNotesSha256: sha('synthetic release notes'), privacyReview, contentReview: {} };
+    adjust(value, publicRoot);
+    writeFileSync(evidencePath, JSON.stringify(value));
+    return spawnSync(process.execPath, ['scripts/check-public-content.mjs', '--root', publicRoot, '--require-evidence', '--version', expected.version, '--commit', expected.sourceCommit, '--source-zip', source, '--windows-zip', windows, '--notes', notes, '--evidence', evidencePath], { cwd: new URL('..', import.meta.url), encoding: 'utf8' });
+  });
+}
+const independentPrivacy = () => ({ status: 'passed', mode: 'independent_agent', independent: true, reviewer: { model: 'gpt-6.1-sol', reasoning: 'high' }, evidence: structuredClone(check.evidence) });
+
+test('privacy gate preserves human review compatibility and accepts identified independent agents', () => {
+  for (const review of [{ status: 'passed', mode: 'human', evidence: structuredClone(check.evidence) }, independentPrivacy()]) {
+    const result = privacyCli(review);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  }
+});
+test('independent privacy review rejects missing metadata and self-review', () => {
+  const edits = [
+    review => { delete review.independent; },
+    review => { review.independent = false; },
+    review => { review.independent = 'true'; },
+    review => { delete review.reviewer; },
+    review => { delete review.reviewer.model; },
+    review => { review.reviewer.model = ' '; },
+    review => { review.reviewer.model = 1; },
+    review => { delete review.reviewer.reasoning; },
+    review => { review.reviewer.reasoning = ''; },
+    review => { review.reviewer.reasoning = true; },
+    review => { review.status = 'pending'; },
+    review => { review.mode = 'self_review'; },
+  ];
+  for (const edit of edits) {
+    const review = independentPrivacy(); edit(review);
+    const result = privacyCli(review);
+    assert.equal(result.status, 1); assert.match(result.stdout, /missing-private-context-review/);
+  }
+});
+test('independent privacy review still requires the exact proof path and digest', () => {
+  const edits = [
+    review => { delete review.evidence; },
+    review => { delete review.evidence.path; },
+    review => { review.evidence.path = 'missing.txt'; },
+    review => { delete review.evidence.sha256; },
+    review => { review.evidence.sha256 = 'f'.repeat(64); },
+  ];
+  for (const edit of edits) {
+    const review = independentPrivacy(); edit(review);
+    const result = privacyCli(review);
+    assert.equal(result.status, 1); assert.match(result.stdout, /missing-privacy-review-evidence/);
+  }
+});
+test('independent privacy review cannot waive candidate or binary binding gates', () => {
+  const candidate = privacyCli(independentPrivacy(), value => { value.sourceZipSha256 = 'f'.repeat(64); });
+  assert.equal(candidate.status, 1); assert.match(candidate.stdout, /candidate-mismatch:sourceZipSha256/);
+  const binary = privacyCli(independentPrivacy(), (_value, root) => { writeFileSync(join(root, 'synthetic-image.png'), Buffer.from([0, 1, 2, 3])); });
+  assert.equal(binary.status, 1); assert.match(binary.stdout, /binary-review-not-bound-to-candidate/);
+});

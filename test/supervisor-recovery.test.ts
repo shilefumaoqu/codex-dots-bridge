@@ -4,7 +4,8 @@ import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, exis
 import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
-import { spawn, type ChildProcess } from 'node:child_process';
+import childProcess, { spawn, type ChildProcess } from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { initProduction, readProductionConfig, writeProductionConfig, protectProductionDirectory } from '../src/runtime.js';
 import { launchWindowsTunnel } from '../src/tunnel-runner.js';
@@ -53,7 +54,12 @@ test('default run cannot disconnect an existing foreground service or overwrite 
   try{
     const f=fixture(root);const cfg=readProductionConfig(f.dir);delete cfg.tunnel;writeProductionConfig(f.dir,cfg);
     foreground=spawn(process.execPath,[f.entry,'run','--foreground','--data-dir',f.dir],{stdio:['ignore','ignore','ignore','ipc'],windowsHide:true});await new Promise<void>((resolve,reject)=>{foreground!.once('message',()=>resolve());foreground!.once('error',reject);});
-    const endpoint=readProductionConfig(f.dir).endpoint;await assert.rejects(()=>startSupervisor(f.dir,{nodePath:process.execPath,entryPath:f.entry}),/bridge_start_failed/);assert.equal(readProductionConfig(f.dir).endpoint,endpoint);assert.equal((await fetch(endpoint!)).status,200);
+    const endpoint=readProductionConfig(f.dir).endpoint;let brokerLaunches=0;const originalSpawn=childProcess.spawn;
+    childProcess.spawn=((...args:unknown[])=>{const argv=args[1];if(Array.isArray(argv)&&argv.some(value=>typeof value==='string'&&value.endsWith('launch-background.ps1')))brokerLaunches++;return (originalSpawn as (...args:unknown[])=>ChildProcess)(...args);}) as typeof spawn;syncBuiltinESMExports();
+    try {await assert.rejects(()=>startSupervisor(f.dir,{nodePath:process.execPath,entryPath:f.entry}),/bridge_start_failed|background_launch_unknown/);}
+    finally {childProcess.spawn=originalSpawn;syncBuiltinESMExports();}
+    if(process.platform==='win32')assert.equal(brokerLaunches,1,'an unknown receipt never starts a second supervisor');
+    assert.equal(readProductionConfig(f.dir).endpoint,endpoint);assert.equal((await fetch(endpoint!)).status,200);
     foreground.send({type:'shutdown'});await until(()=>foreground!.exitCode!==null);
   }finally{if(foreground?.exitCode===null)foreground.kill('SIGKILL');cleanup(root);}
 });

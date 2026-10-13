@@ -25,6 +25,8 @@ if(-not $PackageRoot) {
 $PackageRoot=[IO.Path]::GetFullPath($PackageRoot)
 & (Join-Path $PSScriptRoot 'check-package.ps1') -PackageRoot $PackageRoot
 $manifest=Get-Content -LiteralPath (Join-Path $PackageRoot 'release-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if(@($manifest.files | Where-Object {$_.path -ceq 'scripts/launch-background.ps1'}).Count -ne 1) { throw 'Setup requires its authenticated background-launch helper.' }
+if(@($manifest.files | Where-Object {$_.path -ceq 'scripts/recover-reboot-locks.ps1'}).Count -ne 1) { throw 'Setup requires its authenticated lock-recovery helper.' }
 if($manifest.node -ne '24.21.0' -or $manifest.tunnel -ne '0.0.16') { throw 'Setup requires the complete Node 24 and official Tunnel payload.' }
 $fingerprint=(Get-FileHash -LiteralPath (Join-Path $PackageRoot 'release-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
 $arguments=@(('/DPackageRoot='+$PackageRoot),('/DInstallerVersion='+$manifest.version),('/DInstallerAppId='+$InstallerAppId),('/DPackageFingerprint='+$fingerprint),('/DSetupOutput='+$OutputDirectory),(Join-Path $PSScriptRoot 'windows-setup.iss'))
