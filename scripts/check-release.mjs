@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync, existsSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync, realpathSync } from 'node:fs';
 import { resolve, dirname, join } from 'node:path';
 import { scanDirectory, scanBytes, isPublicDocument } from './check-public-content.mjs';
 
@@ -17,7 +17,7 @@ function sourceFiles(path='') {
   });
 }
 let hasGit=true,files;
-try {if(resolve(git('rev-parse','--show-toplevel').toString().trim())!==root)throw new Error('Not this source root');files=[...new Set(git('ls-files','-z','--cached','--others','--exclude-standard').toString().split('\0').filter(Boolean))];}
+try {if(realpathSync.native(resolve(git('rev-parse','--show-toplevel').toString().trim()))!==realpathSync.native(root))throw new Error('Not this source root');files=[...new Set(git('ls-files','-z','--cached','--others','--exclude-standard').toString().split('\0').filter(Boolean))];}
 catch {hasGit=false;files=sourceFiles();}
 if (process.argv.includes('--selected-public-documents')) {
   const selected = files.filter(file => !/^docs\//i.test(file) || isPublicDocument(file));
