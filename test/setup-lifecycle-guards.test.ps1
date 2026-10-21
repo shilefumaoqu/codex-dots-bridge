@@ -35,12 +35,13 @@ Rejected 'program_inside_data_directory' 'data_program_path_overlap' (Join-Path 
 # Exercise the exact lifecycle functions against locally compiled, synthetic native CLIs.
 $selectionErrors=$null;$selectionTokens=$null
 $selectionAst=[Management.Automation.Language.Parser]::ParseFile($script,[ref]$selectionTokens,[ref]$selectionErrors)
-foreach($name in @('Assert-SafePath','Select-TunnelClientForUpgrade','Assert-RuntimeLocksReleased','Runtime-Node','Write-Json','Read-Json','Tray-Path','Tray-Running','Stop-Tray','Invoke-TrayCommand','Start-Tray','Assert-NoInFlightTasks','Get-UpgradeRuntimeStatus','Prepare-UpgradeRuntime','Assert-State','Assert-OldCliIdentity','Test-CodexCommand','Rollback-CodexCommand','Read-FallbackState','Resolve-OldRuntimeRoot','Restore-TrayShortcut','Rollback-Transaction')) {
+foreach($name in @('Assert-SafePath','Select-TunnelClientForUpgrade','Assert-RuntimeLocksReleased','Runtime-Node','Write-Json','Read-Json','Tray-Path','Tray-Running','Stop-Tray','Invoke-TrayCommand','Start-Tray','Assert-NoInFlightTasks','Get-UpgradeRuntimeStatus','Prepare-UpgradeRuntime','Assert-State','Assert-OldCliIdentity','Test-CodexCommand','Rollback-CodexCommand','Read-FallbackState','Resolve-OldRuntimeRoot','Restore-TrayShortcut','Rollback-Transaction','Prepare-StableStartup','Invoke-StableLauncher','Complete-StableStartupMigration','Assert-Transaction','Test-JsonEquivalent','Read-OriginalRuntimeSnapshot','Test-OriginalEndpointAuthentication','Set-TransactionProperty','Assert-StableLauncherIdentity')) {
   $definition=$selectionAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
   if(-not $definition) { throw ('Lifecycle function missing: '+$name) }
   . ([ScriptBlock]::Create($definition.Extent.Text))
 }
 $compiler=Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+function Test-OriginalEndpointAuthentication {return $true} # Synthetic readiness adapters above do not bind HTTP ports.
 function Fixture([string]$Name,[string]$Body) {
   $source=Join-Path $work ($Name+'.cs');$exe=Join-Path $work ($Name+'.exe')
   [IO.File]::WriteAllText($source,('using System; public static class Fixture { public static int Main(string[] args) { if(args.Length!=3 || args[0]!="mcp" || args[1]!="list" || args[2]!="--json") return 19; '+$Body+' } }'),[Text.UTF8Encoding]::new($false))

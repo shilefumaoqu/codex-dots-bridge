@@ -29,7 +29,11 @@ if(@($manifest.files | Where-Object {$_.path -ceq 'scripts/launch-background.ps1
 if(@($manifest.files | Where-Object {$_.path -ceq 'scripts/recover-reboot-locks.ps1'}).Count -ne 1) { throw 'Setup requires its authenticated lock-recovery helper.' }
 if($manifest.node -ne '24.21.0' -or $manifest.tunnel -ne '0.0.16') { throw 'Setup requires the complete Node 24 and official Tunnel payload.' }
 $fingerprint=(Get-FileHash -LiteralPath (Join-Path $PackageRoot 'release-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
-$arguments=@(('/DPackageRoot='+$PackageRoot),('/DInstallerVersion='+$manifest.version),('/DInstallerAppId='+$InstallerAppId),('/DPackageFingerprint='+$fingerprint),('/DSetupOutput='+$OutputDirectory),(Join-Path $PSScriptRoot 'windows-setup.iss'))
+$launcher=Get-Content -LiteralPath (Join-Path $PackageRoot 'launcher-build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if($launcher.protocol -ne 1 -or $launcher.source_sha256 -notmatch '^[a-f0-9]{64}$'){throw 'Unsupported Launcher identity.'}
+$launcherFingerprint=(Get-FileHash -LiteralPath (Join-Path $PackageRoot 'CodexDotsBridge.Launcher.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+if($launcherFingerprint -cne $launcher.binary_sha256){throw 'Launcher binary differs from its build receipt.'}
+$arguments=@(('/DPackageRoot='+$PackageRoot),('/DInstallerVersion='+$manifest.version),('/DInstallerAppId='+$InstallerAppId),('/DPackageFingerprint='+$fingerprint),('/DLauncherFingerprint='+$launcherFingerprint),('/DLauncherSourceFingerprint='+$launcher.source_sha256),('/DSetupOutput='+$OutputDirectory),(Join-Path $PSScriptRoot 'windows-setup.iss'))
 & $Compiler /Q @arguments
 if($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath (Join-Path $OutputDirectory 'Setup.exe'))) { throw 'Inno Setup compilation failed.' }
 $exe=Join-Path $OutputDirectory 'Setup.exe'

@@ -141,13 +141,19 @@ try {
   Assert ($projection.installed_version -ceq $receipt.version -and $projection.service_version -ceq $receipt.version) 'Authenticated running version differs.'
   Assert ($projection.state -eq 'setup' -and $projection.tone -eq 'amber' -and $projection.cloud -eq '未配置' -and $projection.dot -eq '未连接' -and $projection.inflight_count -eq 1) 'Offline backend must report amber pending configuration and one in-flight task.'
   $checks.Add('authenticated_service_version_offline_amber_not_false_green')
-  $startup=Join-Path $appData 'Microsoft\Windows\Start Menu\Programs\Startup\CodexDotsBridge.vbs'
+  $startup=Join-Path $appData 'Microsoft\Windows\Start Menu\Programs\Startup\CodexDotsBridge.lnk'
   foreach($choice in @('disabled','enabled','disabled')){
     $setting=Bridge @('setup','--autostart-state',$choice)
     Assert ($setting.verified -eq $true -and $setting.autostart -eq $choice) 'Autostart update was not verified.'
     Assert ((Bridge @('status','--tray')).autostart -eq $choice) 'Projection lost autostart state.'
     Assert ((Test-Path -LiteralPath $startup) -eq ($choice -eq 'enabled')) 'Startup existence differs from choice.'
-    if($choice -eq 'enabled'){Assert ([IO.File]::ReadAllText($startup).Contains('CodexDotsBridge.Tray.exe')) 'Enabled entry does not launch bundled tray.'}
+    if($choice -eq 'enabled'){
+      $shell=New-Object -ComObject WScript.Shell;$link=$null
+      try{
+        $link=$shell.CreateShortcut($startup)
+        Assert ($link.TargetPath -ceq (Join-Path $app 'CodexDotsBridge.Launcher.exe') -and $link.Arguments -ceq '--autostart' -and $link.WorkingDirectory -ceq $app) 'Enabled entry does not point to the fixed Launcher with exact autostart arguments and working directory.'
+      }finally{if($link){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)};[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)}
+    }
     Assert-Stable $before
   }
   $checks.Add('live_autostart_disable_enable_disable_keeps_pids_locks_task_mcp_and_data')

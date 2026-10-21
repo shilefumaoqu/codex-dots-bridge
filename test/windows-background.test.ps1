@@ -1,5 +1,10 @@
 $ErrorActionPreference='Stop'
 . (Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\launch-background.ps1')
+$machineTemp=Join-Path $env:WINDIR 'Temp'
+$env:TEMP=$machineTemp;$env:TMP=$machineTemp
+$knownTemp=[IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData),'Temp')
+$normalized=Get-DotsBackgroundEnvironment ([pscustomobject]@{TEMP=$machineTemp;TMP=$machineTemp})
+if($PSVersionTable.PSVersion.Major -ne 5 -or $env:TEMP -cne $knownTemp -or $env:TMP -cne $knownTemp -or $normalized -cnotcontains ('TEMP='+$knownTemp) -or $normalized -cnotcontains ('TMP='+$knownTemp)){throw 'broker did not normalize inherited/request machine TEMP'}
 $work=Join-Path ([IO.Path]::GetTempPath()) ('dots-launch-unit-'+[Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $work -Force|Out-Null
 $checks=0
@@ -7,7 +12,7 @@ function Assert($Condition,[string]$Message){if(-not $Condition){throw $Message}
 try {
   $node=Join-Path $work 'node.exe';$entry=Join-Path $work 'main.js';$tray=Join-Path $work 'CodexDotsBridge.Tray.exe'
   foreach($path in @($node,$entry,$tray)){[IO.File]::WriteAllText($path,'not executable')}
-  $request=[pscustomobject]@{kind='supervisor';nodePath=$node;entryPath=$entry;dataDir=$work;environment=[pscustomobject]@{SystemRoot=$env:SystemRoot;PATH=$env:PATH}}
+  $request=[pscustomobject]@{kind='supervisor';nodePath=$node;entryPath=$entry;dataDir=$work;environment=[pscustomobject]@{SystemRoot=$env:SystemRoot;PATH=$env:PATH;TEMP=$machineTemp;TMP=$machineTemp}}
   $script:createCalls=0;$script:deny=$false;$script:unavailable=$false;$script:unknown=$false
   function New-CimInstance {param($ClassName,$Property,[switch]$ClientOnly,$ErrorAction)if($script:unavailable){throw 'probe unavailable'};$script:startup=$Property;return [pscustomobject]$Property}
   function Get-DotsCreatedProcess {param($ProcessNumber)return [pscustomobject]@{SessionId=[Diagnostics.Process]::GetCurrentProcess().SessionId}}
@@ -21,6 +26,7 @@ try {
   Assert ($r.pid -eq 123) 'Receipt did not report PID.'
   Assert ($script:startup.CreateFlags -eq 0x08000400 -and $script:startup.ShowWindow -eq 0) 'Incorrect Unicode/background flags.'
   Assert ($script:startup.EnvironmentVariables -cnotcontains 'CONTROL_PLANE_API_KEY=secret') 'Environment key leak.'
+  Assert ($script:startup.EnvironmentVariables -ccontains ('TEMP='+$knownTemp) -and $script:startup.EnvironmentVariables -ccontains ('TMP='+$knownTemp)) 'Broker propagated stale request TEMP to supervisor/guardian.'
   Assert ($script:createArguments.CommandLine -ceq ((@($node,$entry,'run','--supervisor','--data-dir',$work)|ForEach-Object{Quote-DotsWindowsArgument $_}) -join ' ')) 'Supervisor argv changed.'
   $trayRequest=[pscustomobject]@{kind='tray';executable=$tray;mode='--show';dataDir=$work;environment=$null}
   Start-DotsBackgroundProcess $trayRequest|Out-Null
@@ -35,6 +41,12 @@ try {
   try{Start-DotsBackgroundProcess $request|Out-Null;throw 'Accepted credential environment'}catch{Assert ($_.Exception.Message -ceq 'background_launch_invalid_request') 'Did not reject extra env variable.'}
   Assert ((Quote-DotsWindowsArgument 'x\') -ceq '"x\\"') 'Trailing slash quote broken.'
   Assert ((Quote-DotsWindowsArgument 'a"b') -ceq '"a\"b"') 'Embedded quote broken.'
+  foreach($record in @(@{name='supervisor-state.json';value=@{phase='running';owner='new-owner';pid=123;bridge_pid=124}},@{name='supervisor.lock';value=@{owner='new-owner';pid=123}},@{name='service.lock';value=@{owner='service-owner';pid=124}})){
+    [IO.File]::WriteAllText((Join-Path $work $record.name),($record.value|ConvertTo-Json -Compress))
+  }
+  $env:TEMP=$machineTemp;$env:TMP=$machineTemp
+  Assert (-not (Test-DotsBackgroundReady $node $entry $work 123 'old-owner')) 'Synthetic non-process became ready.'
+  Assert (($null -ne ('DotsBackgroundArguments' -as [type])) -and $env:TEMP -ceq $knownTemp -and $env:TMP -ceq $knownTemp) 'CheckReady CodeDom did not compile after normalizing machine TEMP.'
   # Extract the real lifecycle entry into an isolated runner; the old payload
   # deliberately lacks its own helper, as alpha.20 rollback does.
   $project=Split-Path -Parent $PSScriptRoot

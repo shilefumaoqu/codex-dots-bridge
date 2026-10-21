@@ -5,6 +5,7 @@ import { readProductionConfig } from './runtime.js';
 import { safePath } from './maintenance.js';
 import { ProbeError } from './store.js';
 import { readTrayAutostart, type AutostartState } from './tray-autostart.js';
+import { readRecentStartupFailure } from './startup-diagnostics.js';
 
 export type TrayState='ready'|'starting'|'stopping'|'stop_unconfirmed'|'stopped'|'setup'|'disconnected'|'unknown'|'failed'|'mismatch';
 export interface TrayStatus {
@@ -15,6 +16,7 @@ export interface TrayStatus {
 export interface TrayStatusOptions {
   call?:(dir:string,name:'dots_status',args:unknown,options:{timeoutMs:number})=>Promise<unknown>;
   now?:()=>number;
+  processPresence?:(pid:number)=>'gone'|'present'|'unknown';
 }
 const taskStates=['queued','running','waiting_input','cancel_requested','reconciliation_required','completed','failed','cancelled','expired'];
 const inflight=['queued','running','waiting_input','cancel_requested','reconciliation_required'];
@@ -36,11 +38,36 @@ function localJson(dir:string,name:string) {
 }
 function version(value:unknown):string|null {return typeof value==='string'&&/^\d+\.\d+\.\d+(?:-[a-zA-Z0-9.]+)?$/.test(value)&&value.length<80?value:null;}
 function safeError(error:unknown):string {return error instanceof ProbeError&&/^[a-z][a-z0-9_]{0,79}$/.test(error.code)?error.code:'tray_status_unavailable';}
+function processPresence(pid:number):'gone'|'present'|'unknown' {
+  try {process.kill(pid,0);return 'present';}
+  catch(error) {return (error as NodeJS.ErrnoException).code==='ESRCH'?'gone':'unknown';}
+}
+function recordedProcessesGone(hint:Record<string,unknown>,serviceLock:Record<string,unknown>|undefined,probe:NonNullable<TrayStatusOptions['processPresence']>) {
+  if(hint.phase!=='running'||hint.cleanup_complete===true||!Number.isSafeInteger(hint.bridge_pid)||Number(hint.bridge_pid)<1)return false;
+  if(serviceLock&&(serviceLock.pid!==hint.bridge_pid||typeof serviceLock.owner!=='string'||!serviceLock.owner||serviceLock.owner===hint.owner))return false;
+  try {
+    for(const field of ['pid','bridge_pid','guardian_pid','tunnel_pid']) {
+      const pid=hint[field];if(pid===undefined)continue;
+      if(!Number.isSafeInteger(pid)||Number(pid)<1||probe(Number(pid))!=='gone')return false;
+    }
+    return true;
+  }catch {return false;}
+}
 export async function getTrayStatus(dir:string,installedVersion:string,options:TrayStatusOptions={}):Promise<TrayStatus> {
   const now=options.now??Date.now;
   const result:TrayStatus={schema:1,installed_version:version(installedVersion)??'unknown',service_version:null,state:'unknown',tone:'amber',title:'状态未知',reason:'暂时无法核验当前服务状态',
     service:'待确认',cloud:'待确认',dot:'待确认',control:'disabled',autostart:readTrayAutostart(dir),checked_at:new Date(now()).toISOString(),task_counts:{},inflight_count:null,error:null};
   function state(next:TrayState,control:TrayStatus['control']='disabled') {result.state=next;[result.tone,result.title,result.reason]=labels[next];result.control=control;return result;}
+  function withStartupFailure() {
+    if(result.state==='failed'||result.state==='unknown') {
+      const recent=readRecentStartupFailure(dir,now());
+      if(recent) {
+        const reason=result.reason+'；最近启动记录：'+recent.at+' '+recent.code;
+        if(reason.length<=180)result.reason=reason;
+      }
+    }
+    return result;
+  }
   let config:ReturnType<typeof readProductionConfig>;
   let hint:Record<string,unknown>|undefined,lock:Record<string,unknown>|undefined,serviceLock:Record<string,unknown>|undefined,stop:Record<string,unknown>|undefined;
   let oldStop=false;
@@ -55,7 +82,7 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
       if(hint.error||hint.phase==='failed'){
         result.error='supervisor_failed';state('failed','start');
         if(hint.error==='bridge_start_failed'||hint.error==='supervisor_spawn_failed'){result.title='启动失败';result.reason='后台启动未成功，请检查连接设置';}
-        return result;
+        return withStartupFailure();
       }
       return state('stopped','start');
     }
@@ -63,13 +90,21 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
       result.service='已停止';result.cloud='未检查';result.dot='未检查';return state(config.tunnel?'stopped':'setup','start');
     }
   }catch(error) {
-    result.error=safeError(error);if(!existsSync(join(dir,'config.json')))return state('setup');return state('unknown');
+    result.error=safeError(error);if(!existsSync(join(dir,'config.json')))return state('setup');state('unknown');return withStartupFailure();
   }
   // Local PIDs are lifecycle hints only; readiness always requires the authenticated request.
   let observed:Record<string,unknown>;
   try {observed=object(await (options.call??productionCall)(dir,'dots_status',{}, {timeoutMs:2500}));}
   catch(error) {
     result.error=safeError(error);
+    // This enables an explicit recovery attempt, never an idle/ready claim.
+    // The actual start still performs strict Windows ownership/endpoint recovery.
+    // Numeric PID presence or any probe uncertainty must keep controls disabled.
+    if(result.error==='service_not_running'&&lock&&hint&&recordedProcessesGone(hint,serviceLock,options.processPresence??processPresence)) {
+      result.service='连接已中断';result.cloud='未检查';result.dot='未检查';
+      state('failed','start');result.title='后台连接中断';result.reason='记录的后台进程均已退出，可启动恢复；启动时会重新核验安全条件';result.error='background_connection_lost';
+      return withStartupFailure();
+    }
     if(lock&&hint?.phase==='starting'){result.service='正在启动';return state('starting');}
     if(lock&&hint?.phase==='stopping') {
       result.service='正在停止';return state(oldStop?'stop_unconfirmed':'stopping');
@@ -77,9 +112,9 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
     if(lock&&hint?.phase==='failed'){
       result.service='后台故障';state('failed');
       if(hint.error==='bridge_start_failed'||hint.error==='supervisor_spawn_failed'){result.title='启动失败';result.reason='后台启动未成功，请检查连接设置';}
-      return result;
+      return withStartupFailure();
     }
-    return state('unknown');
+    state('unknown');return withStartupFailure();
   }
   if(observed.service_reachable!==true){result.error='service_identity_unverified';return state('unknown');}
   result.service='响应正常';result.service_version=version(observed.version);

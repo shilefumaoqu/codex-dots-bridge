@@ -1,6 +1,6 @@
 {
   "name": "codex-dots-bridge",
-  "version": "0.2.0-alpha.21",
+  "version": "0.2.0-alpha.30",
   "private": true,
   "description": "A Windows local bridge from Codex to an existing Dot using official MCP, Tunnel and Events.",
   "license": "MIT",

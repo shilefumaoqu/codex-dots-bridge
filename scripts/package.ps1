@@ -29,6 +29,7 @@ try {
 } finally { Pop-Location }
 New-Item -ItemType Directory -Path $staging | Out-Null
 & (Join-Path $PSScriptRoot 'build-tray.ps1') -OutputDirectory $staging | Out-Null
+& (Join-Path $PSScriptRoot 'build-launcher.ps1') -OutputDirectory $staging | Out-Null
 foreach ($name in @('dist','skills','licenses')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) -Recurse }
 $publicPolicy = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'public-release-policy.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 foreach ($relative in $publicPolicy.documents) {

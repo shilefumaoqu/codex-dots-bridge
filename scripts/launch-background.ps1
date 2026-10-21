@@ -18,6 +18,23 @@ $ProgressPreference='SilentlyContinue'
 try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch { }
 try { [Console]::InputEncoding=[Text.UTF8Encoding]::new($false) } catch { }
 
+function Set-DotsUserCompilationTemp {
+  try {
+    $local=[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    if(-not $local -or -not [IO.Path]::IsPathRooted($local)){throw 'invalid_temp'}
+    $directory=[IO.Path]::GetFullPath([IO.Path]::Combine($local,'Temp'))
+    if(-not [IO.Directory]::Exists($directory)){throw 'invalid_temp'}
+    for($cursor=$directory;$cursor;$cursor=[IO.Path]::GetDirectoryName($cursor)) {
+      if(([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint) -ne 0){throw 'invalid_temp'}
+    }
+    $user=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $owner=[IO.Directory]::GetAccessControl($directory).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if($owner -notin @($user,'S-1-5-18')){throw 'invalid_temp'}
+    $env:TEMP=$directory;$env:TMP=$directory
+    return $directory
+  } catch {throw 'background_broker_unavailable'}
+}
+
 function Quote-DotsWindowsArgument([string]$Value) {
   # Windows argv escaping; the result is passed to Create directly, never a shell.
   $b=[Text.StringBuilder]::new('"');$slashes=0
@@ -29,6 +46,7 @@ function Quote-DotsWindowsArgument([string]$Value) {
   $null=$b.Append('\',$slashes*2);$null=$b.Append('"');$b.ToString()
 }
 function Get-DotsBackgroundEnvironment($Source) {
+  $compilationTemp=Set-DotsUserCompilationTemp
   $allowed=@('SystemRoot','WINDIR','ComSpec','PATH','Path','TEMP','TMP','LOCALAPPDATA','APPDATA','USERPROFILE','PROGRAMFILES','PROGRAMDATA','HOME')
   $values=[Collections.Generic.SortedDictionary[string,string]]::new([StringComparer]::OrdinalIgnoreCase)
   foreach($name in $allowed) {
@@ -40,6 +58,9 @@ function Get-DotsBackgroundEnvironment($Source) {
   }
   # Reject extra fields rather than copying any credential-bearing variables.
   if($null -ne $Source){foreach($property in $Source.PSObject.Properties){if($property.Name -cnotin $allowed){throw 'background_launch_invalid_request'}}}
+  # A request can carry the launcher's stale machine TEMP; do not propagate it
+  # back into the new supervisor, bridge, or CodeDom-based Tunnel guardian.
+  $values['TEMP']=$compilationTemp;$values['TMP']=$compilationTemp
   return [string[]]@($values.GetEnumerator()|ForEach-Object{$_.Key+'='+$_.Value})
 }
 function Assert-DotsLaunchPath([string]$Path,[string]$Leaf) {
@@ -67,6 +88,7 @@ function Read-DotsReadyJson([string]$Directory,[string]$Name) {
 }
 function Test-DotsBackgroundReady([string]$Node,[string]$Entry,[string]$Directory,[int]$ProcessNumber,[string]$OldOwner) {
   try {
+    $null=Set-DotsUserCompilationTemp
     $node=Assert-DotsLaunchPath $Node 'node.exe';$entry=Assert-DotsLaunchPath $Entry ''; $directory=Assert-DotsLaunchPath $Directory ''
     $state=Read-DotsReadyJson $directory 'supervisor-state.json';$supervisor=Read-DotsReadyJson $directory 'supervisor.lock';$service=Read-DotsReadyJson $directory 'service.lock'
     if($state.phase -cne 'running' -or $state.cleanup_complete -eq $true -or -not $state.owner -or $state.owner -ceq $OldOwner -or ($ProcessNumber -and $state.pid -ne $ProcessNumber)){return $false}

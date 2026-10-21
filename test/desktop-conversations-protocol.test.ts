@@ -97,6 +97,21 @@ test('enabled conversation tools have strict worker-only schemas and correct rea
     assert.match(readDescription, /codex_conversation_status/); assert.match(readDescription, /(?:same|stable) request(?:_id)?/i);
     assert.match(readDescription, /offset/); assert.match(readDescription, /next_offset(?:\s*(?:=|:)\s*null|\s+until\s+null)/);
     assert.match(readDescription, /source_complete\s*(?:=|:)\s*false/);
+    const statusDescription = tools.find((tool: any) => tool.name === 'codex_conversation_status').description;
+    for (const description of [readDescription, statusDescription]) {
+      assert.match(description, /defaults to the complete stored context: all stored turns and items/);
+      assert.match(description, /without a fixed recent-turn limit or stopping because recent context seems sufficient/);
+      assert.match(description, /Read each explicitly requested target separately; do not expand to other IDs mentioned in history/);
+      assert.match(description, /Only an explicit human request for recent context, a time range or a limited section permits partial analysis/);
+      assert.match(description, /start at offset=0/); assert.match(description, /verify contiguous context_offset values/);
+      assert.match(description, /assembled length equals total_chars, and parse the JSON/);
+      assert.match(description, /same request_id\/thread_id.*total_chars, context_sha256 and receipt_nonce remain fixed/);
+      assert.match(description, /verify the assembled SHA-256 when context_sha256 is available/);
+      assert.match(description, /actual stored turn count, retrieved chunk count, observed snapshot end and any coverage gaps/);
+      assert.match(description, /full_stored_history.*full_history_snapshot/);
+      assert.match(description, /false or a final chunk alone does not prove the caller retrieved all earlier chunks/);
+      assert.match(description, /report partial and the missing coverage rather than success/);
+    }
     assert.equal(seen.length, 0);
     const request_id = randomUUID(), thread_id = randomUUID();
     const cases: [string, Args[]][] = [
@@ -104,7 +119,7 @@ test('enabled conversation tools have strict worker-only schemas and correct rea
         { request_id, thread_id, extra: true }, { request_id: 'invalid', thread_id }, { request_id, thread_id: 'invalid' },
         { request_id, thread_id, limit: 0 }, { request_id, thread_id, limit: 1 }, { request_id, thread_id, limit: 5 },
         { request_id, thread_id, limit: 6 }, { request_id, thread_id, limit: 1.5 }, { request_id, thread_id, limit: '1' },
-        { request_id, thread_id, offset: 0 }, { request_id },
+        { request_id, thread_id, offset: 0 }, { request_id, thread_id, read_scope: 'full_stored_history' }, { request_id, thread_id, scope: 'recent' }, { request_id },
       ]],
       ['codex_send_message', [
         { request_id, thread_id, text: 'synthetic', extra: true }, { request_id: 'invalid', thread_id, text: 'synthetic' },

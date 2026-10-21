@@ -29,7 +29,7 @@ test('startSupervisor recovers synthetic prior-boot records and starts real dist
   const root=mkdtempSync(join(tmpdir(),'dots reboot supervisor integration ')),dir=join(root,'data');
   const oldOwner=randomUUID(),dataMarker=randomUUID();let started=false;
   // Observe the real helper's safe receipt without mocking its decision or outputs.
-  // startSupervisor preserves its existing public error shape on a refusal.
+  // startSupervisor retains the exact safe recovery refusal reason.
   const receipts:Array<{reason:string;recovered:boolean;elapsedMs:number}>=[];
   const originalExecFile=childProcess.execFile;
   childProcess.execFile=((...args:unknown[])=>{
@@ -101,7 +101,7 @@ test('startSupervisor recovers synthetic prior-boot records and starts real dist
         readCount++;await new Promise(done=>setTimeout(done,10));
       }
     })();
-    try {await assert.rejects(()=>startSupervisor(dir,{nodePath:process.execPath,entryPath:resolve('dist/main.js')}),/supervisor_already_running/);}
+    try {await assert.rejects(()=>startSupervisor(dir,{nodePath:process.execPath,entryPath:resolve('dist/main.js')}),/supervisor_recovery_endpoint_active_or_unknown/);}
     finally {probing=false;await reads;}
     assert.ok(readCount>5,'caller metadata/lock reads remain available during recovery probe');
     const unchanged=JSON.parse(readFileSync(join(dir,'supervisor-state.json'),'utf8')) as {owner:string;pid:number};
@@ -171,7 +171,7 @@ test('Windows API tolerates real stdio/start callers but preserves real foregrou
   }
 });
 
-test('same-boot stale locks ignore a proven later stdio PID and concurrent recoveries preserve task data',{skip:process.platform!=='win32',timeout:90_000},async()=>{
+test('same-boot stale locks ignore a proven later stdio PID and concurrent recoveries preserve task data',{skip:process.platform!=='win32',timeout:90_000},async t=>{
   const root=mkdtempSync(join(tmpdir(),'dots same boot reuse ')),dir=join(root,'data');let caller:ChildProcess|undefined;
   try {
     mkdirSync(dir);const owner=randomUUID(),server=createServer();
@@ -186,7 +186,9 @@ test('same-boot stale locks ignore a proven later stdio PID and concurrent recov
     const script=String.raw`$ErrorActionPreference='Stop';$old=[DateTime]::UtcNow.AddSeconds(-15);foreach($name in @('supervisor-state.json','supervisor.lock','service.lock')){$path=[IO.Path]::Combine($env:DOTS_TEST_DIR,$name);[IO.File]::SetCreationTimeUtc($path,$old);[IO.File]::SetLastWriteTimeUtc($path,$old)}`;
     execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{windowsHide:true,env:{...process.env,DOTS_TEST_DIR:dir}});
     const before=readFileSync(join(dir,'supervisor-state.json'),'utf8');
-    const results=await Promise.all([recoverRebootLocks(dir),recoverRebootLocks(dir)]);
+    const measured=await Promise.all([0,1].map(async()=>{const began=performance.now(),result=await recoverRebootLocks(dir);return {result,elapsedMs:Math.round(performance.now()-began)};}));
+    const results=measured.map(value=>value.result);
+    t.diagnostic('concurrent same-boot receipts: '+JSON.stringify(measured.map(value=>({reason:value.result.reason,recovered:value.result.recovered,elapsedMs:value.elapsedMs}))));
     assert.equal(results.filter(result=>result.recovered).length,1,JSON.stringify(results));
     assert.ok(results.some(result=>result.reason==='same_boot_locks_recovered'));
     assert.equal(existsSync(join(dir,'supervisor.lock')),false);assert.equal(existsSync(join(dir,'service.lock')),false);

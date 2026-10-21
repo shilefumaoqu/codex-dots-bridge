@@ -7,16 +7,18 @@
 <p align="center">把任务交给你的 Dot，在 Codex 中跟进过程并取回结果。</p>
 
 <p align="center">
-  <a href="README.en.md">English</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.21">v0.2.0-alpha.21</a> · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.en.md">English</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.30">v0.2.0-alpha.30</a> · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.21/Codex-Dots-Bridge-0.2.0-alpha.21-Setup.exe"><strong>下载 Windows 安装程序</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.30/Codex-Dots-Bridge-0.2.0-alpha.30-Setup.exe"><strong>下载 Windows 安装程序</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.21">Windows ZIP、SHA256 校验文件与完整发布说明</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.30">Windows ZIP、SHA256 校验文件与完整发布说明</a>
 </p>
+
+> **当前发布：0.2.0-alpha.30（实验性预发布）**。包含启动恢复、托盘重开、完整历史与增量接续、最小聊天入口和脱敏诊断。ChatGPT→Dot 连续聊天仍未通过，原自然 Events 后续也有零领取样本；请先阅读 [本版验收与限制](ACCEPTANCE.md)。程序就绪不等于消息往返成功。
 
 Codex Dots Bridge 是连接 Codex 与你已有 Dot 的协作插件。派出一项文本任务后，可以沿同一任务查看进度、回答澄清、补充要求并取回结果。
 
@@ -81,9 +83,9 @@ Codex Dots Bridge 是连接 Codex 与你已有 Dot 的协作插件。派出一�
 
 ## 当前状态与实验边界
 
-alpha.21 的 Windows 安装、升级与恢复检查已有验收；正向合成任务完成并取回，一条用户发起的本机对话发送往返也取得真实回复。自动 Events 及时领取、忙碌/离线等异常分支、真实重启恢复及长期运行仍未完整验收。曾出现的宿主工具目录拒绝尚无根因结论；后续成功样本不代表问题已解决。
+alpha.30 的启动辅助环境和回执修复已有定向测试、专门审查、成品及本机升级记录。alpha.21 的 Windows 安装、升级与恢复检查为历史验收；正向合成任务完成并取回，一条用户发起的本机对话发送往返也取得真实回复。自动 Events 及时领取、忙碌/离线等异常分支、真实重启恢复及长期运行仍未完整验收。曾出现的宿主工具目录拒绝尚无根因结论；后续成功样本不代表问题已解决。
 
-[Windows CI 本次结果](https://github.com/shilefumaoqu/codex-dots-bridge/actions/runs/38419703662)：38 项中 35 项通过，3 项历史 Git 测试失败；相同源码在本机 38/38 通过，环境差异原因未确认，后续 CI 构建步骤已跳过。另有 149 份源码与 286 个历史 Git blob 的公开内容隐私扫描未发现问题；该扫描结果不代表 CI 全部通过。
+[alpha.21 历史 Windows CI 结果](https://github.com/shilefumaoqu/codex-dots-bridge/actions/runs/38419703662)：38 项中 35 项通过，3 项历史 Git 测试失败；相同源码在本机 38/38 通过，环境差异原因未确认，后续 CI 构建步骤已跳过。另有 149 份源码与 286 个历史 Git blob 的公开内容隐私扫描未发现问题；该扫描结果不代表 CI 全部通过。
 
 当前按单用户、单台 Windows 电脑和一个现有 Dot 设计，并发默认 1。alpha 版本面向愿意按文档配置和反馈的试用者，不承诺适用于所有账号、设备策略或长时间无人值守场景。
 

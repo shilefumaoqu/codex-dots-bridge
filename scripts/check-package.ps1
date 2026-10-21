@@ -101,4 +101,10 @@ if ($seen.ContainsKey('CodexDotsBridge.Tray.exe')) {
   $trayVersion=[Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $PackageRoot 'CodexDotsBridge.Tray.exe')).ProductVersion
   if ($trayVersion -cne $package.version) { throw 'Compiled tray version mismatch.' }
 }
+if ($seen.ContainsKey('dist/startup-link.js')) {
+  if(-not $seen.ContainsKey('CodexDotsBridge.Launcher.exe') -or -not $seen.ContainsKey('launcher-build.json')){throw 'Stable startup requires its native Launcher and build identity.'}
+  $launcherBuild=Get-Content -LiteralPath (Join-Path $PackageRoot 'launcher-build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  if($launcherBuild.protocol -ne 1 -or $launcherBuild.source_sha256 -notmatch '^[a-f0-9]{64}$' -or $launcherBuild.binary_sha256 -cne (Get-FileHash -LiteralPath (Join-Path $PackageRoot 'CodexDotsBridge.Launcher.exe') -Algorithm SHA256).Hash.ToLowerInvariant()){throw 'Stable Launcher build identity mismatch.'}
+  if([Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $PackageRoot 'CodexDotsBridge.Launcher.exe')).ProductVersion -cne 'launcher-1'){throw 'Unsupported Launcher protocol.'}
+}
 Write-Output "Verified release $($package.version): $($seen.Count) files, $($inventory.packages.Count) npm licenses."

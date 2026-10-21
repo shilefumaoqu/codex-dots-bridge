@@ -52,7 +52,7 @@ test('advisory sink failure preserves the accepted exact reply and idempotent si
   }},{onIpcDiagnostic:()=>{throw new Error('PRIVATE_SINK_ERROR');}});
   try{
     const args={request_id:f.request,thread_id:f.thread,text:'synthetic'};f.service.send(args);const result=await finish(f);
-    assert.equal(result.status,'completed');assert.equal(result.verification,'exact_turn_reply');assert.equal(result.reply,'verified_reply');
+    assert.equal(result.status,'completed');assert.equal(result.verification,'exact_turn_reply');assert.equal(Object.hasOwn(result,'read_scope'),false);assert.equal(Object.hasOwn(result,'continuation_required'),false);assert.equal(result.reply,'verified_reply');
     assert.equal(f.service.send(args).turn_id,f.turn);assert.equal(sends,1);
   }finally{await f.cleanup();}
 });
@@ -202,15 +202,25 @@ test('local stored read binds home and exact ID without sender path, persists al
   try {
     f.service.read({ request_id: f.request, thread_id: f.thread }); const first = await f.service.get({ request_id: f.request, wait_seconds: 1 });
     assert.equal(first.verification, 'native_stored_history'); assert.equal(first.history_source, 'codex_app_server'); assert.equal(first.stored_history_complete, true); assert.equal(first.source_complete, false); assert.equal(Object.hasOwn(first, 'desktop_state'), false);
+    assert.equal(first.read_scope, 'full_stored_history'); assert.equal(first.continuation_required, true);
+    // Jumping directly to the last chunk must not claim the caller collected earlier chunks.
+    const lastOffset = Math.floor((context!.length - 1) / 32000) * 32000;
+    const jumped = await f.service.get({ request_id: f.request, offset: lastOffset });
+    assert.equal(jumped.read_scope, 'full_stored_history'); assert.equal(jumped.continuation_required, false); assert.equal(jumped.next_offset, null);
+    assert.equal(jumped.context_offset, lastOffset); assert(jumped.context_chunk!.length < jumped.total_chars!);
     const durable = JSON.parse((f.db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id=?').get(f.request) as { data: string }).data);
     assert.equal(Object.hasOwn(durable, 'resolved_target'), false); assert.equal(durable.sent, false);
     await f.service.close(); reopened = new DesktopConversationsService(f.db, f.config, { transport: { runRead: noRead, runSend: noSend } });
     let offset: number | null = 0, combined = '';
     while (offset !== null) {
-      const page = await reopened.get({ request_id: f.request, offset }); combined += page.context_chunk; offset = page.next_offset!;
+      const page = await reopened.get({ request_id: f.request, offset });
+      assert.equal(page.request_id, f.request); assert.equal(page.thread_id, f.thread); assert.equal(page.context_offset, offset); assert.equal(page.total_chars, context!.length);
+      assert.equal(page.read_scope, 'full_stored_history'); assert.equal(page.continuation_required, page.next_offset !== null);
+      combined += page.context_chunk; offset = page.next_offset!;
       assert.equal(page.verification, first.verification); assert.equal(page.history_source, 'codex_app_server'); assert.equal(page.stored_history_complete, true); assert.equal(page.receipt_nonce, first.receipt_nonce); assert.equal(page.context_sha256, first.context_sha256); assert.equal(Object.hasOwn(page, 'desktop_state'), false);
     }
-    assert.equal(combined, context); assert.equal(reopened.read({ request_id: f.request, thread_id: f.thread }).context_chunk, first.context_chunk); assert.equal(calls, 1);
+    assert.equal(combined, context); assert.equal(combined.length, first.total_chars); assert.deepEqual(JSON.parse(combined), JSON.parse(context!)); assert.equal(createHash('sha256').update(combined).digest('hex'), first.context_sha256);
+    assert.equal(reopened.read({ request_id: f.request, thread_id: f.thread }).context_chunk, first.context_chunk); assert.equal(calls, 1);
   } finally { await reopened?.close(); await f.cleanup(); }
 });
 test('local stored read stays independent while sends retain per-thread busy reservations', async () => {
@@ -393,28 +403,53 @@ test('all native snapshot pages concatenate losslessly, preserve surrogate pairs
   let calls = 0; const f = fixture({ runSend: noSend, runRead: async () => { calls++; return { status: 'completed', context_json: context, source_complete: true }; } }, { timeoutMs: 1000 });
   let recovered: DesktopConversationsService | undefined;
   try {
-    f.service.read({ request_id: f.request, thread_id: f.thread }); const first = await finish(f); assert.equal(first.context_chunk!.length, 31999); assert.equal(first.next_offset, 31999); assert.equal(first.source_complete, true);
+    f.service.read({ request_id: f.request, thread_id: f.thread }); const first = await finish(f); assert.equal(first.context_chunk!.length, 31999); assert.equal(first.next_offset, 31999); assert.equal(first.source_complete, true); assert.equal(first.read_scope, 'full_history_snapshot'); assert.equal(first.continuation_required, true);
     await assert.rejects(f.service.get({ request_id: f.request, offset: 32000 }), /invalid_offset/);
     await f.service.close(); recovered = new DesktopConversationsService(f.db, f.config, { transport: { runRead: noRead, runSend: noSend } });
     let offset = first.next_offset!, assembled = first.context_chunk!;
     while (offset !== null) {
       const page = await recovered.get({ request_id: f.request, offset }); assert.equal(page.context_offset, offset); assert(page.context_chunk!.length <= 32000); assert.equal(page.context_chunk!.isWellFormed(), true); assert.equal(page.receipt_nonce, first.receipt_nonce); assert.equal(page.context_sha256, first.context_sha256); assert.equal(page.total_chars, context.length);
+      assert.equal(page.read_scope, 'full_history_snapshot'); assert.equal(page.continuation_required, page.next_offset !== null);
       assert.equal(Object.hasOwn(page, 'desktop_state'), false); // Older durable reads stay compatible after restart.
       assembled += page.context_chunk; offset = page.next_offset!;
     }
     assert.equal(assembled, context); assert.deepEqual(JSON.parse(assembled), JSON.parse(context)); assert.equal(calls, 1);
     assert.equal(recovered.read({ request_id: f.request, thread_id: f.thread }).context_chunk, first.context_chunk);
-    const final = await recovered.get({ request_id: f.request, offset: context.length }); assert.equal(final.context_chunk, ''); assert.equal(final.next_offset, null);
+    const final = await recovered.get({ request_id: f.request, offset: context.length }); assert.equal(final.context_chunk, ''); assert.equal(final.next_offset, null); assert.equal(final.read_scope, 'full_history_snapshot'); assert.equal(final.continuation_required, false);
     await assert.rejects(recovered.get({ request_id: f.request, offset: context.length + 1 }), /invalid_offset/);
     await assert.rejects(recovered.get({ request_id: f.request, offset: -1 }), /invalid_request/);
     await assert.rejects(recovered.get({ request_id: f.request, offset: 1.5 }), /invalid_request/);
   } finally { await recovered?.close(); await f.cleanup(); }
 });
+test('single-page stored reads keep explicit targets isolated and never reread on replay', async () => {
+  const reads: string[] = []; const snapshots = new Map<string, string>();
+  const f = localFixture({ runSend: noSend, runRead: async input => {
+    reads.push(input.threadId);
+    const result = storedRead(input.threadId, input.threadId === f.thread ? '目标一最早原文🌟' : '目标二独立原文😀');
+    snapshots.set(input.threadId, result.context_json); return result;
+  } });
+  try {
+    const targets = [{ request_id: f.request, thread_id: f.thread }, { request_id: randomUUID(), thread_id: f.thread2 }];
+    for (const input of targets) {
+      const pending = f.service.read(input);
+      assert.equal(pending.status, 'pending'); assert.equal(Object.hasOwn(pending, 'read_scope'), false); assert.equal(Object.hasOwn(pending, 'continuation_required'), false);
+      const result = await f.service.get({ request_id: input.request_id, wait_seconds: 1 });
+      assert.equal(result.read_scope, 'full_stored_history'); assert.equal(result.continuation_required, false); assert.equal(result.next_offset, null);
+      assert.equal(result.context_offset, 0); assert.equal(result.context_chunk!.length, result.total_chars); assert.equal(result.context_chunk, snapshots.get(input.thread_id));
+      assert.equal(JSON.parse(result.context_chunk!).thread.id, input.thread_id);
+      assert.equal(result.source_complete, false); assert.equal(result.stored_history_complete, true);
+      assert.deepEqual(f.service.read(input), result);
+      assert.throws(() => f.service.read({ ...input, thread_id: input.thread_id === f.thread ? f.thread2 : f.thread }), /idempotency_conflict/);
+    }
+    assert.deepEqual(reads, [f.thread, f.thread2]);
+  } finally { await f.cleanup(); }
+});
+
 test('offset is only valid for completed reads and cannot change an existing request operation', async () => {
   let resolve!: () => void; const f = fixture({ runSend: async input => { input.beforeSend(); input.onAccepted(randomUUID()); return { status: 'uncertain', reason: 'send_outcome_unknown' }; }, runRead: async () => { await new Promise<void>(done => { resolve = done; }); return { status: 'completed', context_json: '{}', source_complete: false }; } }, { timeoutMs: 1000 });
   try {
-    f.service.read({ request_id: f.request, thread_id: f.thread }); await new Promise(done => setTimeout(done, 1)); await assert.rejects(f.service.get({ request_id: f.request, offset: 0 }), /offset_not_available/); resolve(); await finish(f);
-    const sendId = randomUUID(); f.service.send({ request_id: sendId, thread_id: f.thread, text: 'message' }); await finish(f, sendId); await assert.rejects(f.service.get({ request_id: sendId, offset: 0 }), /offset_not_available/);
+    const pending = f.service.read({ request_id: f.request, thread_id: f.thread }); assert.equal(Object.hasOwn(pending, 'read_scope'), false); assert.equal(Object.hasOwn(pending, 'continuation_required'), false); await new Promise(done => setTimeout(done, 1)); await assert.rejects(f.service.get({ request_id: f.request, offset: 0 }), /offset_not_available/); resolve(); await finish(f);
+    const sendId = randomUUID(); f.service.send({ request_id: sendId, thread_id: f.thread, text: 'message' }); const send = await finish(f, sendId); assert.equal(Object.hasOwn(send, 'read_scope'), false); assert.equal(Object.hasOwn(send, 'continuation_required'), false); await assert.rejects(f.service.get({ request_id: sendId, offset: 0 }), /offset_not_available/);
     assert.throws(() => f.service.send({ request_id: f.request, thread_id: f.thread, text: 'operation changed' }), /idempotency_conflict/);
   } finally { resolve?.(); await f.cleanup(); }
 });

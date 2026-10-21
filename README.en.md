@@ -7,16 +7,18 @@
 <p align="center">Hand work to your Dot, follow it in Codex, and retrieve the result.</p>
 
 <p align="center">
-  <a href="README.md">简体中文</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.21">v0.2.0-alpha.21</a> · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.md">简体中文</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.30">v0.2.0-alpha.30</a> · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.21/Codex-Dots-Bridge-0.2.0-alpha.21-Setup.exe"><strong>Download the Windows installer</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.30/Codex-Dots-Bridge-0.2.0-alpha.30-Setup.exe"><strong>Download the Windows installer</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.21">Windows ZIP, SHA256 files and full release notes</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.30">Windows ZIP, SHA256 files and full release notes</a>
 </p>
+
+> **Current release: 0.2.0-alpha.30 (experimental prerelease).** Includes startup recovery, tray reopening, stored-history and incremental handoff, a minimal chat entry and redacted diagnostics. ChatGPT-to-Dot continuous chat has not passed; later natural Events samples also expired without pickup. Read [acceptance and limits](ACCEPTANCE.md). A ready service does not prove a message round trip.
 
 Codex Dots Bridge connects Codex to your existing Dot. Delegate a text task, then use the same task ID to follow progress, answer questions, add requirements and retrieve the result.
 
@@ -81,9 +83,9 @@ Reading all stored history pages does not guarantee the original model context i
 
 ## Current status and experimental boundaries
 
-Alpha.21 has passed Windows installer, upgrade and recovery checks. A synthetic Codex-to-Dot task completed and was retrieved, and one user-initiated local-conversation send returned a real reply. Timely automatic Events pickup, busy/offline edge cases, recovery after a real reboot and long-term operation are not fully validated. A prior host tool-catalog rejection has no confirmed root cause; a later successful sample does not show that the issue is resolved.
+Alpha.30 has targeted startup checks, dedicated review, package and local-upgrade evidence; see ACCEPTANCE.md. Historical alpha.21 passed its Windows installer, upgrade and recovery checks. A synthetic Codex-to-Dot task completed and was retrieved, and one user-initiated local-conversation send returned a real reply. Timely automatic Events pickup, busy/offline edge cases, recovery after a real reboot and long-term operation are not fully validated. A prior host tool-catalog rejection has no confirmed root cause; a later successful sample does not show that the issue is resolved.
 
-[This Windows CI run](https://github.com/shilefumaoqu/codex-dots-bridge/actions/runs/38419703662) passed 35 of 38 checks; three legacy Git-history tests failed. The same source passed 38/38 locally, but the environment difference is unexplained and later CI build steps were skipped. A separate public-content privacy scan of 149 source files and 286 historical Git blobs found no issues; that does not mean the full CI passed.
+[Historical alpha.21 Windows CI run](https://github.com/shilefumaoqu/codex-dots-bridge/actions/runs/38419703662) passed 35 of 38 checks; three legacy Git-history tests failed. The same source passed 38/38 locally, but the environment difference is unexplained and later CI build steps were skipped. A separate public-content privacy scan of 149 source files and 286 historical Git blobs found no issues; that does not mean the full CI passed.
 
 The alpha is designed for one user, one Windows computer and one existing Dot, with default concurrency of 1. It is intended for testers willing to configure it and report issues; it is not a claim of compatibility with every account, device policy or unattended long-running setup.
 

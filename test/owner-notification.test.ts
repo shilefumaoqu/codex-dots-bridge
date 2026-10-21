@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { fork } from 'node:child_process';
 import { TaskStore } from '../src/task-store.js';
 import { ProbeEvents } from '../src/events.js';
-import { createProductionService, callerSchemas, workerSchemas } from '../src/bridge.js';
+import { createProductionService, callerSchemas, contextSchemas, workerSchemas } from '../src/bridge.js';
 import { loadOwnerNotifier, computeNotificationBindingKey, notificationConfigurationCurrent, notifyOwnerSchema, notificationReplySchema, submitNotificationReply, notifyOwner, type OwnerNotificationOptions } from '../src/owner-notification.js';
 import { initProduction, writeProductionConfig, readProductionConfig, readOwnerNotificationConfig, readToken } from '../src/runtime.js';
 import { backupData, restoreData } from '../src/maintenance.js';
@@ -175,8 +175,9 @@ test('same subscription refresh permits owned operations; replacement denies che
     assert.throws(()=>f.store.complete({...owned,input_revision:1,completion_key:'done',result:{text:'a'}}),code('reply_subscription_unavailable'));
     const plain=f.store.submit({idempotency_key:'plain',title:'plain',input:{text:'plain'}});assert.throws(()=>f.store.claim({task_id:plain.task_id,claim_key:'p'}),code('execution_slot_occupied'));
   }finally{f.close();}});
-test('original nine caller tools and eight worker tools remain; reply control is private',()=>{
-  assert.equal(Object.keys(callerSchemas).length,9);assert.equal(Object.keys(workerSchemas).length,9);
+test('original caller and worker tools remain alongside continuation; reply control stays private',()=>{
+  assert.deepEqual(Object.keys(callerSchemas).sort(),['dots_submit','dots_list','dots_get','dots_wait','dots_message','dots_followup','dots_cancel','dots_status','dots_ack_result',...Object.keys(contextSchemas)].sort());
+  assert.equal(Object.keys(workerSchemas).length,9);
   assert.ok(!Object.hasOwn(callerSchemas,'notification_reply'));assert.ok(Object.hasOwn(workerSchemas,'notify_owner'));
 });
 test('local config revocation or adapter rebinding stops sends and hides old pinned bodies immediately',async()=>{

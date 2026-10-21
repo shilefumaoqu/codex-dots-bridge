@@ -66,6 +66,16 @@ export const DESKTOP_IPC_FAILURE_REASONS = ['native_owner_unavailable', 'ipc_con
 export const DESKTOP_HISTORY_FIELDS = ['historyMode', 'turnHistory', 'turns', 'turnsPagination', 'paginatedHistory', 'boundedCloudHistory', 'canonicalVoiceHistory'] as const;
 export type DesktopHistory = Partial<Record<typeof DESKTOP_HISTORY_FIELDS[number], any>>;
 export type DesktopProbeResult = { status: 'ready'; title?: string; rolloutPath?: string; history: DesktopHistory; desktop_state: DesktopIdleSnapshot } | Exclude<DesktopIpcResult, { status: 'accepted' }>;
+export interface DesktopContextStateInput { threadId: string; signal: AbortSignal; deadline: number }
+/** Owner observation only. Neither the snapshot nor its timestamp grants an execution lock. */
+export interface DesktopContextStateSnapshot {
+  status: 'busy' | 'idle' | 'unknown'; observed_at: string;
+  checked_by: 'native_desktop_owner' | 'unavailable'; scope: 'observation_snapshot';
+  active_turn_id?: string; active_turn_started_at_ms?: number; reason?: string;
+}
+export async function observeDesktopContextState(input: DesktopContextStateInput, testing?: { connect: () => net.Socket }): Promise<DesktopContextStateSnapshot> {
+  return runDesktopIpc({ ...input, requestId: '', beforeSend: () => {} }, '', true, testing, false, true) as Promise<DesktopContextStateSnapshot>;
+}
 export async function runDesktopEchoIpc(input: DesktopIpcInput, testing?: { connect: () => net.Socket }): Promise<DesktopIpcResult> {
   return runDesktopIpc(input, fixedEchoPrompt(input.requestId), false, testing) as Promise<DesktopIpcResult>;
 }
@@ -75,7 +85,7 @@ export async function runDesktopMessageIpc(input: DesktopIpcInput & { text: stri
 export async function runDesktopReadIpc(input: Omit<DesktopIpcInput, 'requestId' | 'beforeSend'>, testing?: { connect: () => net.Socket }): Promise<DesktopProbeResult> {
   return runDesktopIpc({ ...input, requestId: '', beforeSend: () => {} }, '', true, testing) as Promise<DesktopProbeResult>;
 }
-async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boolean, testing?: { connect: () => net.Socket }, guideBusy = false): Promise<DesktopIpcResult | DesktopProbeResult> {
+async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boolean, testing?: { connect: () => net.Socket }, guideBusy = false, contextOnly = false): Promise<DesktopIpcResult | DesktopProbeResult | DesktopContextStateSnapshot> {
   let socket: net.Socket | undefined, clientId: string | undefined, owner: string | undefined;
   let buffer = Buffer.alloc(0), transportError: Error | undefined, followed = false, sent = false, aborted = false;
   let stageReason: string = 'ipc_connect_unavailable';
@@ -84,6 +94,7 @@ async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boo
   const finishStage = () => { if (timingStage) input.onStageTiming?.(timingStage, Math.max(0, performance.now() - stageStarted)); timingStage = undefined; };
   let observed: IdleDecision | undefined, observedAt: string | undefined, title: string | undefined, rolloutPath: string | undefined, history: DesktopHistory = {};
   let latestState: State | undefined;
+  let activeTurn: Pick<DesktopBusySnapshot, 'active_turn_id' | 'active_turn_started_at_ms'> = {};
   let snapshot: { resolve: () => void; reject: (error: Error) => void } | undefined;
   const pending = new Map<string, { method: IpcMethod; resolve: (frame: State) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   const rejectAll = (error: Error) => { transportError = error; for (const item of pending.values()) { clearTimeout(item.timer); item.reject(error); } pending.clear(); snapshot?.reject(error); };
@@ -129,7 +140,23 @@ async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boo
         if (item) { clearTimeout(item.timer); pending.delete(frame.requestId); if (frame.resultType === 'success') item.resolve(frame); else item.reject(failure(frame.resultType === 'error' && frame.error === 'no-client-found' ? 'no-client-found' : 'remote_error', item.method)); continue; }
         if (frame.type === 'broadcast' && frame.method === 'thread-stream-state-changed' && frame.version === 11 && frame.sourceClientId === owner && Array.isArray(frame.targetClientIds) && frame.targetClientIds.length === 1 && frame.targetClientIds[0] === clientId && frame.params?.conversationId === input.threadId && frame.params.hostId === 'local') {
           matchedStateFrames++;
-          if (frame.params.change?.type === 'snapshot') { const state = frame.params.change.conversationState; const decision = assessIdle(state, input.threadId); if (!observed || observed.status === 'idle') { observed = decision; observedAt = new Date().toISOString(); latestState = state; } if (typeof state?.title === 'string' && state.title.length <= 512) title = state.title; if (state?.id === input.threadId) { rolloutPath = typeof state.rolloutPath === 'string' && state.rolloutPath.length > 0 ? state.rolloutPath : undefined; if (readOnly) history = Object.fromEntries(DESKTOP_HISTORY_FIELDS.filter(key => Object.hasOwn(state, key)).map(key => [key, state[key]])); } snapshot?.resolve(); }
+          if (frame.params.change?.type === 'snapshot') {
+            const state = frame.params.change.conversationState, decision = assessIdle(state, input.threadId);
+            if (!observed || observed.status === 'idle') {
+              observed = decision; observedAt = new Date().toISOString();
+              if (contextOnly) {
+                const busy = decision.status === 'busy' ? busySnapshot(state, observedAt) : undefined;
+                activeTurn = busy?.active_turn_id ? { active_turn_id: busy.active_turn_id, active_turn_started_at_ms: busy.active_turn_started_at_ms } : {};
+              } else latestState = state;
+            }
+            // Context observation keeps only decisions and activity metadata;
+            // the existing full read retains its history and binding contract.
+            if (!contextOnly) {
+              if (typeof state?.title === 'string' && state.title.length <= 512) title = state.title;
+              if (state?.id === input.threadId) { rolloutPath = typeof state.rolloutPath === 'string' && state.rolloutPath.length > 0 ? state.rolloutPath : undefined; if (readOnly) history = Object.fromEntries(DESKTOP_HISTORY_FIELDS.filter(key => Object.hasOwn(state, key)).map(key => [key, state[key]])); }
+            }
+            snapshot?.resolve();
+          }
           else if (observed?.status === 'idle') observed = { status: 'unknown', reason: 'state_changed_after_snapshot' };
         }
       }
@@ -164,6 +191,10 @@ async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boo
       snapshot = { resolve: () => { clearTimeout(timer); snapshot = undefined; resolve(); }, reject: error => { clearTimeout(timer); snapshot = undefined; reject(error); } };
       try { followed = true; following(true); } catch (error) { snapshot.reject(error as Error); }
     });
+    if (contextOnly) {
+      if (input.signal.aborted || Date.now() >= input.deadline) throw failure('aborted');
+      return { status: observed?.status ?? 'unknown', observed_at: observedAt ?? new Date().toISOString(), checked_by: observed ? 'native_desktop_owner' : 'unavailable', scope: 'observation_snapshot', ...(observed?.status === 'busy' ? activeTurn : {}), reason: observed?.reason ?? 'unknown_state' };
+    }
     if (input.afterTurn) {
       const turns = visibleTurns(latestState), previous = turns.filter(turn => turn?.turnId === input.afterTurn!.id);
       // Do not silently move a chosen next-turn delivery past another turn.
@@ -189,6 +220,7 @@ async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boo
     // retry a message, or replace the existing public stage/status contract.
     try { input.onDiagnostic?.({ phase: sent ? 'send_ack' : stageReason, diagnostic_code: diagnosticCode, received_frames: receivedFrames, state_frames: stateFrames, matched_state_frames: matchedStateFrames, largest_frame_bytes: largestFrameBytes }); } catch {}
     const noOwner = stageReason === 'ipc_owner_discovery_failed' && code === 'no-client-found' && (error as { method?: string } | null)?.method === 'thread-owner-discovery';
+    if (contextOnly) return { status: 'unknown', observed_at: new Date().toISOString(), checked_by: 'unavailable', scope: 'observation_snapshot', reason: noOwner ? 'native_owner_unavailable' : code === 'aborted' ? 'ipc_aborted' : stageReason };
     return { status: sent ? 'uncertain' : code === 'unreachable' ? 'skipped_unreachable' : 'skipped_unknown', reason: sent ? 'send_outcome_unknown' : noOwner ? 'native_owner_unavailable' : code === 'aborted' ? 'ipc_aborted' : stageReason };
   } finally {
     finishStage();

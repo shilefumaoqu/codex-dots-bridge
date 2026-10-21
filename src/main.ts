@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 import { parseArgs } from 'node:util';
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { TaskStore } from './task-store.js';
 import { DesktopEchoService } from './desktop-echo.js';
 import { DesktopConversationsService } from './desktop-conversations.js';
+import { ContextService } from './context-service.js';
+import { observeDesktopContextState } from './desktop-echo-ipc.js';
 import { configureDesktopAccess, validateDesktopAccess } from './desktop-conversation-settings.js';
 import { ProbeError } from './store.js';
 import { ProbeEvents } from './events.js';
 import { acquireLock, defaultProductionDataDir, initProduction, protectProductionDirectory, readProductionConfig, readOwnerNotificationConfig, writeProductionConfig, readToken } from './runtime.js';
 import { VERSION, callerSchemas, createProductionService, productionCall, resolveSchema, startProductionCaller, type CallerName } from './bridge.js';
-import { installCodex, uninstallCodex, backupData, restoreData, statusData, doctorData, connectionDiagnosticsData, assertStopped } from './maintenance.js';
+import { installCodex, uninstallCodex, backupData, restoreData, statusData, doctorData, connectionDiagnosticsData, assertStopped, safePath } from './maintenance.js';
 import { runSupervisor, startSupervisor, stopSupervisor, supervisorStatus } from './supervisor.js';
 import { getTrayStatus } from './tray-status.js';
 import { setTrayAutostart } from './tray-autostart.js';
@@ -25,6 +27,7 @@ const {values,positionals}=parseArgs({allowPositionals:true,options:{
   'status':{type:'string'},'logical-session':{type:'string'},'limit':{type:'string'},
   'tunnel-id':{type:'string'},'organization-id':{type:'string'},'tunnel-client':{type:'string'},'tunnel-env':{type:'string'},
   'codex-home':{type:'string'},'codex-command':{type:'string'},'desktop-access':{type:'string'},'autostart':{type:'boolean'},'no-register':{type:'boolean'},
+  'upgrade-registration':{type:'boolean'},'startup-launcher':{type:'string'},'startup-link-content':{type:'string'},'preserve-autostart':{type:'boolean'},'registration-root':{type:'string'},
   'foreground':{type:'boolean'},'supervisor':{type:'boolean'},'start':{type:'boolean'},'stop':{type:'boolean'},
   'tray':{type:'boolean'},'autostart-state':{type:'string'},
   'to':{type:'string'},'from':{type:'string'},'help':{type:'boolean'},'version':{type:'boolean'},
@@ -43,6 +46,7 @@ async function foreground() {
   let service:ReturnType<typeof createProductionService>|undefined;
   let desktop:DesktopEchoService|undefined;
   let conversations:DesktopConversationsService|undefined;
+  let contexts:ContextService|undefined;
   try {
     store=new TaskStore(join(dataDir,'tasks.sqlite'));
     try {
@@ -56,6 +60,10 @@ async function foreground() {
         onIpcDiagnostic:(requestId,event)=>conversationStore.audit('desktop_ipc_failure',null,{request_id:requestId,...event}),
       });
     } catch { process.stderr.write(JSON.stringify({service:'codex-dots-bridge',code:'desktop_conversations_config_invalid'})+'\n'); }
+    try {
+      const contextConfig=join(dataDir,'desktop-conversations.json');
+      if(existsSync(contextConfig)) contexts=new ContextService(store.db,JSON.parse(readFileSync(contextConfig,'utf8')),{observeOwner:observeDesktopContextState});
+    } catch { process.stderr.write(JSON.stringify({service:'codex-dots-bridge',code:'context_config_invalid'})+'\n'); }
     const {loadOwnerNotifier,computeNotificationBindingKey}=await import('./owner-notification.js');
     let notificationConfig:ReturnType<typeof readOwnerNotificationConfig>;
     let bindingKey:string|undefined;
@@ -73,7 +81,7 @@ async function foreground() {
       },readCurrentBindingKey:()=>{
         const current=readProductionConfig(dataDir),binding=readOwnerNotificationConfig(dataDir);
         return binding?.enabled?computeNotificationBindingKey(current.instance_id,binding):undefined;
-      }},config.instance_id,desktop,conversations);
+      }},config.instance_id,desktop,conversations,contexts);
     const endpoint=await service.start();
     writeProductionConfig(dataDir,{...config,endpoint});
     process.stderr.write(JSON.stringify({service:'codex-dots-bridge',version:VERSION,endpoint})+'\n');
@@ -94,7 +102,7 @@ async function foreground() {
       }
     });
   } finally {
-    try {await service?.close();} finally {try {await Promise.all([desktop?.close(),conversations?.close()]);} finally {store?.close();release();if(process.connected)process.disconnect();}}
+    try {await service?.close();} finally {try {await Promise.all([desktop?.close(),conversations?.close(),contexts?.close()]);} finally {store?.close();release();if(process.connected)process.disconnect();}}
   }
 }
 async function setup() {
@@ -117,8 +125,16 @@ async function setup() {
     z.string().regex(/^tunnel_[A-Za-z0-9_-]+$/).parse(merged.tunnel_id);
     config.tunnel=merged as NonNullable<typeof config.tunnel>;
   }
-  const registration=values['no-register']?{mcp:'not_registered'}:installCodex(dataDir,{...runtime,skillSource:join(root,'skills','codex-dots-bridge'),
-    codexHome:values['codex-home'],codexCommand:values['codex-command'],autostart:values.autostart});
+  const registrationRoot=values['registration-root']?resolve(values['registration-root']):root;
+  if(registrationRoot!==root){
+    if(!values['upgrade-registration']||dirname(registrationRoot)!==dirname(root)||!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/.test(basename(registrationRoot)))throw new ProbeError('invalid_registration_target');
+    safePath(registrationRoot);
+    const target=JSON.parse(readFileSync(join(registrationRoot,'package.json'),'utf8'));
+    if(target.name!=='codex-dots-bridge'||target.version!==basename(registrationRoot))throw new ProbeError('invalid_registration_target');
+  }
+  const registrationRuntime=registrationRoot===root?runtime:{nodePath:join(registrationRoot,'runtime','node-v24.21.0-win-x64','node.exe'),entryPath:join(registrationRoot,'dist','main.js')};
+  const registration=values['no-register']?{mcp:'not_registered'}:installCodex(dataDir,{...registrationRuntime,skillSource:join(registrationRoot,'skills','codex-dots-bridge'),
+    codexHome:values['codex-home'],codexCommand:values['codex-command'],autostart:values.autostart,upgrade:values['upgrade-registration'],startupLauncher:values['startup-launcher'],preparedAutostart:values['startup-link-content'],preserveAutostart:values['preserve-autostart']});
   const desktopAccess=values['desktop-access']!==undefined?configureDesktopAccess(dataDir,values['desktop-access'],values['codex-home']):undefined;
   // Failed registration must not redirect the saved installation or alter its connection settings.
   config.installation={root,node_path:process.execPath};writeProductionConfig(dataDir,config);
@@ -153,11 +169,11 @@ try {
   else switch(positionals[0]) {
     case 'setup':await setup();break;
     case 'run':
-      if([values.stop,values.foreground,values.supervisor].filter(Boolean).length>1)throw new ProbeError('conflicting_run_modes');
+      if([values.start,values.stop,values.foreground,values.supervisor,values.autostart].filter(Boolean).length>1)throw new ProbeError('conflicting_run_modes');
       if(values.stop)output(await stopSupervisor(dataDir));
       else if(values.foreground)await foreground();
       else if(values.supervisor)await runSupervisor(dataDir,runtime);
-      else output(await startSupervisor(dataDir,runtime));break;
+      else output(await startSupervisor(dataDir,runtime,{autostart:values.autostart}));break;
     case 'stdio':readProductionConfig(dataDir);startProductionCaller(dataDir);break;
     case 'status':output(values.tray?await getTrayStatus(dataDir,VERSION):{...statusData(dataDir),...supervisorStatus(dataDir)});break;
     case 'doctor':output({...await doctorData(dataDir),...supervisorStatus(dataDir)});break;

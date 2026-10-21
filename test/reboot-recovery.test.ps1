@@ -1,14 +1,19 @@
 param([string]$NodePath=(Join-Path (Split-Path -Parent $PSScriptRoot) '.runtime/node-v24.21.0-win-x64/node.exe'))
 $ErrorActionPreference = 'Stop'
 if (-not [IO.File]::Exists($NodePath)) { throw 'Node24 test executable missing' }
+$machineTemp=Join-Path $env:WINDIR 'Temp'
+$env:TEMP=$machineTemp; $env:TMP=$machineTemp
 . (Join-Path $PSScriptRoot '../scripts/recover-reboot-locks.ps1')
+if ($PSVersionTable.PSVersion.Major -ne 5) { throw 'Windows PowerShell 5 required for CodeDom regression' }
+$knownTemp=[IO.Path]::Combine([Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData),'Temp')
+if ($env:TEMP -cne $knownTemp -or $env:TMP -cne $knownTemp -or -not ('DotsRebootFile' -as [type])) { throw 'recovery did not normalize inherited machine TEMP before CodeDom' }
 $script:checks = 0
 $script:fakeProcesses = @()
 $script:secondProcesses = $null
 function Get-DotsProcesses { return $script:fakeProcesses }
-function Get-DotsProcessInfo([int]$ProcessNumber) {
-    if ($null -ne $script:secondProcesses) { return @($script:secondProcesses | Where-Object { $_.ProcessId -eq $ProcessNumber }) }
-    return @($script:fakeProcesses | Where-Object { $_.ProcessId -eq $ProcessNumber })
+function Get-DotsProcessInfos([int[]]$ProcessNumbers) {
+    if ($null -ne $script:secondProcesses) { return @($script:secondProcesses | Where-Object { $ProcessNumbers -contains $_.ProcessId }) }
+    return @($script:fakeProcesses | Where-Object { $ProcessNumbers -contains $_.ProcessId })
 }
 function Assert($Value,[string]$Message) { if (-not $Value) { throw "assertion: $Message" }; $script:checks++ }
 $root = Join-Path ([IO.Path]::GetTempPath()) ('Dots reboot 中文 O''Brien '+[Guid]::NewGuid())

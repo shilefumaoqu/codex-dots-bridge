@@ -54,6 +54,7 @@ Source: "{#PackageRoot}\scripts\launch-background.ps1"; DestDir: "{app}"; Flags:
 Source: "{#PackageRoot}\scripts\launch-background.ps1"; Flags: dontcopy
 Source: "{#PackageRoot}\scripts\recover-reboot-locks.ps1"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PackageRoot}\scripts\recover-reboot-locks.ps1"; Flags: dontcopy
+Source: "{#PackageRoot}\CodexDotsBridge.Launcher.exe"; DestName: "CodexDotsBridge.Launcher.exe"; Flags: dontcopy
 
 [Icons]
 Name: "{code:GetShortcutsDirectory}\Codex Dots Bridge"; Filename: "{app}\payload\{#InstallerVersion}\CodexDotsBridge.Tray.exe"; Parameters: "{code:GetTrayParameters}"; WorkingDir: "{app}\payload\{#InstallerVersion}"; IconFilename: "{app}\payload\{#InstallerVersion}\CodexDotsBridge.ico"
@@ -63,6 +64,7 @@ Name: "{code:GetShortcutsDirectory}\卸载 Codex Dots Bridge"; Filename: "{unins
 [UninstallDelete]
 Type: files; Name: "{app}\installation-state.json"
 Type: files; Name: "{app}\.setup-result.txt"
+Type: files; Name: "{app}\.launcher-diagnostics.json"
 
 [Code]
 var
@@ -201,9 +203,13 @@ begin
   ExtractTemporaryFile('setup-lifecycle-runner.ps1');
   ExtractTemporaryFile('launch-background.ps1');
   ExtractTemporaryFile('recover-reboot-locks.ps1');
+  ExtractTemporaryFile('CodexDotsBridge.Launcher.exe');
   Params := RunnerParameters('Prepare') + ' -NewVersion ' + Quoted('{#InstallerVersion}') +
     ' -PackageFingerprint ' + Quoted('{#PackageFingerprint}') +
-    ' -InstallerIdentity ' + Quoted(GetInstallerAppId(''));
+    ' -InstallerIdentity ' + Quoted(GetInstallerAppId('')) +
+    ' -LauncherSource ' + Quoted(ExpandConstant('{tmp}\CodexDotsBridge.Launcher.exe')) +
+    ' -LauncherFingerprint ' + Quoted('{#LauncherFingerprint}') +
+    ' -LauncherSourceFingerprint ' + Quoted('{#LauncherSourceFingerprint}');
   Value := ExpandConstant('{param:DATADIR|}');
   if Value <> '' then Params := Params + ' -DataDir ' + Quoted(Value);
   Value := ExpandConstant('{param:CODEXHOME|}');

@@ -22,6 +22,7 @@ export interface DesktopConversationResult {
   title?: string; context_chunk?: string; context_offset?: number; next_offset?: number | null; total_chars?: number; source_complete?: boolean; context_sha256?: string;
   desktop_state?: DesktopIdleSnapshot;
   history_source?: 'codex_app_server'; stored_history_complete?: boolean;
+  read_scope?: 'full_stored_history' | 'full_history_snapshot'; continuation_required?: boolean;
   turn_id?: string; reply?: string; receipt_nonce?: string; reason?: string;
   busy_state?: DesktopBusySnapshot; delivery_mode?: 'current_turn' | 'next_turn';
   delivery_options?: { mode: 'current_turn' | 'next_turn'; supported: boolean }[];
@@ -181,7 +182,7 @@ export class DesktopConversationsService {
       const splitsPair = (at: number) => at > 0 && at < context.length && /[\uD800-\uDBFF]/.test(context[at - 1]!) && /[\uDC00-\uDFFF]/.test(context[at]!);
       if (splitsPair(start)) fail('invalid_offset');
       let end = Math.min(context.length, start + PAGE_CHARS); if (splitsPair(end)) end--;
-      page = { ...(value.title !== undefined ? { title: value.title } : {}), ...(value.desktop_state !== undefined ? { desktop_state: { ...value.desktop_state } } : {}), ...(value.history_source !== undefined ? { history_source: value.history_source, stored_history_complete: value.stored_history_complete } : {}), context_chunk: context.slice(start, end), context_offset: start, next_offset: end < context.length ? end : null, total_chars: context.length, source_complete: value.source_complete, context_sha256: value.context_sha256, receipt_nonce: value.receipt_nonce };
+      page = { ...(value.title !== undefined ? { title: value.title } : {}), ...(value.desktop_state !== undefined ? { desktop_state: { ...value.desktop_state } } : {}), ...(value.history_source !== undefined ? { history_source: value.history_source, stored_history_complete: value.stored_history_complete } : {}), context_chunk: context.slice(start, end), context_offset: start, next_offset: end < context.length ? end : null, read_scope: value.verification === 'native_stored_history' ? 'full_stored_history' : 'full_history_snapshot', continuation_required: end < context.length, total_chars: context.length, source_complete: value.source_complete, context_sha256: value.context_sha256, receipt_nonce: value.receipt_nonce };
     } else if (offset !== undefined) fail('offset_not_available');
     return { request_id: value.request_id, operation: value.operation, thread_id: value.thread_id, status: value.status, verification: value.verification,
       timing: { started_at: value.timing.started_at, ...(value.timing.finished_at ? { finished_at: value.timing.finished_at } : {}), ...(value.timing.elapsed_ms !== undefined ? { elapsed_ms: value.timing.elapsed_ms } : {}), ...(value.timing.stages_ms ? { stages_ms: Object.fromEntries(DESKTOP_TIMING_STAGES.filter(stage => Number.isFinite(value.timing.stages_ms?.[stage]) && value.timing.stages_ms![stage]! >= 0).map(stage => [stage, value.timing.stages_ms![stage]!])) } : {}) },

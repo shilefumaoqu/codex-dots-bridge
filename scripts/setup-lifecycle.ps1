@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-  [Parameter(Mandatory=$true)][ValidateSet('Prepare','Commit','Rollback','PreflightUninstall','Uninstall','Connect','Tray')][string]$Action,
+  [Parameter(Mandatory=$true)][ValidateSet('Prepare','Commit','Rollback','RecoverRollback','PreflightUninstall','Uninstall','Connect','Tray')][string]$Action,
   [Parameter(Mandatory=$true)][string]$InstallDirectory,
   [string]$NewVersion,
   [string]$PackageFingerprint,
@@ -10,7 +10,11 @@ param(
   [string]$CodexCommand,
   [string]$AppDataDirectory,
   [string]$ShortcutDirectory,
-  [switch]$Autostart
+  [switch]$Autostart,
+  [string]$LauncherSource,
+  [string]$LauncherFingerprint,
+  [string]$LauncherSourceFingerprint,
+  [switch]$DeferAutostart
 )
 $ErrorActionPreference='Stop'
 # Inno's PS5 process may inherit PS7 module paths. Load its own built-in hash commands.
@@ -360,8 +364,14 @@ try {
   const e=entries.find(e=>e.name===m.mcp.name);
   if(e&&(e.transport.type!=='stdio'||e.transport.command!==m.mcp.command||JSON.stringify(e.transport.args??[])!==JSON.stringify(m.mcp.args)||(m.mcp_registration!==undefined&&JSON.stringify(e)!==JSON.stringify(m.mcp_registration))))fail('modified_or_foreign_mcp');
   if(existsSync(m.skill.path))for(const [name,hash] of Object.entries(tree(m.skill.path)))if(m.skill.files[name]!==hash)fail('modified_or_foreign_skill');
-  if(m.autostart){const expected=join(process.env.APPDATA,'Microsoft/Windows/Start Menu/Programs/Startup/CodexDotsBridge.vbs');if(m.autostart.path!==expected)fail('invalid_autostart_path');safe(expected);if(existsSync(expected)&&readFileSync(expected,'utf8')!==m.autostart.content)fail('modified_or_foreign_autostart');}
-  console.log(JSON.stringify({owned:true,autostart:!!m.autostart}));
+  if(m.autostart){
+    const native=m.autostart.kind==='startup-link',expected=join(process.env.APPDATA,'Microsoft/Windows/Start Menu/Programs/Startup',native?'CodexDotsBridge.lnk':'CodexDotsBridge.vbs');
+    if(m.autostart.path!==expected)fail('invalid_autostart_path');safe(expected);
+    if(native){const launcher=join(dirname(dirname(r.root)),'CodexDotsBridge.Launcher.exe');if(m.autostart.launcher!==launcher||m.autostart_launcher!==launcher)fail('invalid_startup_launcher');safe(launcher);if(existsSync(expected)){const result=JSON.parse(execFileSync(launcher,['--startup','inspect'],{encoding:'utf8',windowsHide:true,stdio:'pipe',timeout:15000}));if(!result.owned||result.content!==m.autostart.content)fail('modified_or_foreign_autostart');}}
+    else if(existsSync(expected)&&readFileSync(expected,'utf8')!==m.autostart.content)fail('modified_or_foreign_autostart');
+  }
+  const actualSkill=existsSync(m.skill.path)?tree(m.skill.path):{};
+  console.log(JSON.stringify({owned:true,autostart:!!m.autostart,mcp_present:!!e,skill_complete:Object.keys(actualSkill).length===Object.keys(m.skill.files).length&&Object.entries(m.skill.files).every(([k,v])=>actualSkill[k]===v)}));
 }catch(e){console.log(JSON.stringify({error:/^[a-z][a-z0-9_]*$/.test(e.message)?e.message:'ownership_check_failed'}));process.exitCode=1;}
 '@
   try {
@@ -395,11 +405,165 @@ function Setup-Registration([string]$Root,$Settings,[bool]$EnableAutostart,[stri
   if(-not $Command) { $Command=$Settings.codex_command }
   $args=@('setup','--data-dir',$Settings.data_dir,'--codex-home',$Settings.codex_home,'--codex-command',$Command)
   if($EnableAutostart) { $args+='--autostart' }
+  $managementRoot=$Root
+  if($Settings.stable_startup) {
+    $managementRoot=$Settings.new_root
+    $args+=@('--upgrade-registration','--startup-launcher',(Join-Path $InstallDirectory 'CodexDotsBridge.Launcher.exe'),'--preserve-autostart')
+    if($Root -ine $managementRoot){$args+=@('--registration-root',$Root)}
+    if($Root -ieq $Settings.new_root -and $Settings.prepared_autostart){$args+=@('--startup-link-content',$Settings.prepared_autostart.content)}
+  }
   if($TunnelClient) {
     $config=Read-Json (Join-Path $Settings.data_dir 'config.json')
     $args+=@('--tunnel-id',$config.tunnel.tunnel_id,'--organization-id',$config.tunnel.organization_id,'--tunnel-env',$config.tunnel.key_file,'--tunnel-client',$TunnelClient)
   }
-  Invoke-Bridge $Root $args | Out-Null
+  Invoke-Bridge $managementRoot $args | Out-Null
+}
+
+function Invoke-StableLauncher([string]$Action,[string]$Expected='') {
+  $launcher=Join-Path $InstallDirectory 'CodexDotsBridge.Launcher.exe';Assert-SafePath $launcher
+  $arguments=@('--startup',$Action);if($Expected){$arguments+=@('--expected',$Expected)}
+  $start=[Diagnostics.ProcessStartInfo]::new($launcher)
+  $start.Arguments=($arguments | ForEach-Object {'"'+$_+'"'}) -join ' '
+  $start.UseShellExecute=$false;$start.CreateNoWindow=$true;$start.RedirectStandardOutput=$true;$start.RedirectStandardError=$true
+  $process=[Diagnostics.Process]::new();$process.StartInfo=$start
+  try{
+    if(-not $process.Start()){throw 'startup_launcher_unconfirmed'}
+    $output=$process.StandardOutput.ReadToEndAsync();$errorOutput=$process.StandardError.ReadToEndAsync()
+    if(-not $process.WaitForExit(15000)){throw 'startup_link_operation_unconfirmed'}
+    $value=$output.GetAwaiter().GetResult() | ConvertFrom-Json;$null=$errorOutput.GetAwaiter().GetResult()
+    if($process.ExitCode -ne 0){if($value.error -match '^[a-z][a-z0-9_]*$'){throw $value.error};throw 'startup_link_operation_failed'}
+    return $value
+  }finally{$process.Dispose()}
+}
+function Assert-Transaction($Transaction) {
+  if($Transaction.owner -cne 'codex-dots-bridge-setup' -or $Transaction.schema -ne 1 -or $Transaction.install_directory -ine $InstallDirectory){throw 'foreign_installation_transaction'}
+  if($Transaction.version -notmatch '^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$' -or $Transaction.new_root -ine (Join-Path $InstallDirectory ('payload\'+$Transaction.version))){throw 'invalid_transaction_payload'}
+  foreach($path in @($Transaction.data_dir,$Transaction.app_data,$Transaction.new_root)){Assert-SafePath $path}
+  if($Transaction.old_root){
+    $old=Read-Json $statePath;Assert-State $old
+    if($old.payload_root -ine $Transaction.old_root -or $old.data_dir -ine $Transaction.data_dir -or $old.codex_home -ine $Transaction.codex_home -or $old.installer_app_id -cne $Transaction.installer_app_id){throw 'transaction_prior_state_changed'}
+  }
+}
+function Prepare-StableStartup($Transaction,$Prior) {
+  if(-not $LauncherSource){return}
+  if($LauncherFingerprint -notmatch '^[a-f0-9]{64}$' -or $LauncherSourceFingerprint -notmatch '^[a-f0-9]{64}$'){throw 'invalid_launcher_identity'}
+  Assert-SafePath $LauncherSource
+  if((Get-FileHash -LiteralPath $LauncherSource -Algorithm SHA256).Hash.ToLowerInvariant() -cne $LauncherFingerprint){throw 'launcher_source_changed'}
+  $target=Join-Path $InstallDirectory 'CodexDotsBridge.Launcher.exe';Assert-SafePath $target
+  $actual=if(Test-Path -LiteralPath $target){(Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()}else{''}
+  $recoveryOwner=$null
+  if($Transaction.previous_recovery){
+    # The committed state, not a caller-supplied path or a similarly named file,
+    # must bind the exact earlier transaction before any resource is inherited.
+    $ownerState=Read-Json $statePath;Assert-State $ownerState
+    if($ownerState.recovery_record -cne $Transaction.previous_recovery -or $ownerState.recovery_sha256 -cne $Transaction.previous_recovery_sha256){throw 'recovery_record_binding_mismatch'}
+    Assert-SafePath $ownerState.recovery_record
+    if((Get-FileHash -LiteralPath $ownerState.recovery_record -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ownerState.recovery_sha256){throw 'recovery_record_changed'}
+    $record=Read-Json $ownerState.recovery_record
+    if($record.owner -cne 'codex-dots-bridge-setup' -or $record.schema -ne 1 -or $record.installer_app_id -cne $ownerState.installer_app_id -or $record.install_directory -ine $InstallDirectory -or $record.data_dir -ine $Transaction.data_dir -or -not $record.recovery.core_restored){throw 'recovery_record_binding_mismatch'}
+    # Historical, already-resolved records remain evidence but cannot confer ownership.
+    if($record.old_root -ieq $Transaction.old_root -and -not $ownerState.recovery_resolved_by){$recoveryOwner=$record}
+  }
+  $recoveredLauncher=$recoveryOwner -and (($recoveryOwner.launcher_sha256 -ceq $actual) -or ($recoveryOwner.launcher_candidate_sha256 -ceq $actual))
+  if($actual -and (-not $Prior -or -not $Prior.launcher_sha256 -or $Prior.launcher_sha256 -cne $actual) -and -not $recoveredLauncher){throw 'modified_or_foreign_launcher'}
+  $Transaction.stable_startup=$true;$Transaction.old_launcher_bytes=if($actual){[Convert]::ToBase64String([IO.File]::ReadAllBytes($target))}else{''}
+  $Transaction.old_launcher_sha256=$actual
+  $Transaction.launcher_candidate_sha256=$LauncherFingerprint
+  $Transaction.launcher_source_sha256=$LauncherSourceFingerprint
+  Write-Json $transactionPath $Transaction
+  # Matching source keeps the previously authenticated binary despite compiler PE timestamps.
+  $retainedSource=if($Prior -and $Prior.launcher_sha256 -ceq $actual){$Prior.launcher_source_sha256}elseif($recoveredLauncher){$recoveryOwner.launcher_source_sha256}else{''}
+  if(-not $actual -or $retainedSource -cne $LauncherSourceFingerprint){[IO.File]::Copy($LauncherSource,$target,$true)}
+  $Transaction.launcher_sha256=(Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant()
+  Write-Json $transactionPath $Transaction
+  $probe=Invoke-StableLauncher 'inspect'
+  $manifest=if(Test-Path -LiteralPath (Join-Path $Transaction.data_dir 'installation.json')){Read-Json (Join-Path $Transaction.data_dir 'installation.json')}else{$null}
+  $manifestOwns=$manifest.autostart -and $manifest.autostart.kind -ceq 'startup-link' -and $manifest.autostart.path -ceq $probe.path -and $manifest.autostart.launcher -ieq $target -and $probe.content -ceq $manifest.autostart.content
+  $recoveryOwns=$recoveryOwner -and $recoveryOwner.prepared_autostart -and $recoveryOwner.prepared_autostart.kind -ceq 'startup-link' -and $recoveryOwner.prepared_autostart.path -ceq $probe.path -and $recoveryOwner.prepared_autostart.launcher -ieq $target -and $recoveryOwner.prepared_autostart.content -ceq $probe.content
+  if($probe.exists -and (-not $probe.owned -or (-not $manifestOwns -and -not $recoveryOwns))){throw 'foreign_autostart_collision'}
+  if($probe.exists -and $recoveryOwns -and -not $manifestOwns){
+    if(-not $Transaction.autostart){throw 'recovered_autostart_requires_explicit_choice'}
+    if($probe.legacy_windows -ne 'enabled'){throw 'legacy_autostart_disabled_requires_user_migration'}
+    $Transaction.startup_inherited_from_recovery=$Transaction.previous_recovery
+  }
+  if(-not $Transaction.autostart){return}
+  if($probe.exists){
+    if($probe.windows -eq 'unknown'){throw 'autostart_windows_state_unconfirmed'}
+    $Transaction.prepared_autostart=[pscustomobject]@{kind='startup-link';path=$probe.path;content=$probe.content;launcher=$target}
+  }elseif($probe.legacy_windows -eq 'disabled'){
+    # A disabled version-bound VBS cannot safely migrate under a different Startup identity.
+    # Leave it and its running instance untouched; require the user to resolve this choice.
+    throw 'legacy_autostart_disabled_requires_user_migration'
+  }else{
+    if($probe.windows -ne 'enabled' -or $probe.legacy_windows -ne 'enabled'){throw 'autostart_windows_state_unconfirmed'}
+    $Transaction.startup_creation_intent=$true;Write-Json $transactionPath $Transaction
+    $created=Invoke-StableLauncher 'enable'
+    if(-not $created.exists -or -not $created.owned -or -not $created.content){throw 'autostart_readback_failed'}
+    $Transaction.startup_created=$true
+    $Transaction.prepared_autostart=[pscustomobject]@{kind='startup-link';path=$created.path;content=$created.content;launcher=$target}
+  }
+  Write-Json $transactionPath $Transaction
+  if($Transaction.prepared_autostart){Invoke-StableLauncher 'acknowledge' $Transaction.prepared_autostart.content | Out-Null}
+}
+function Complete-StableStartupMigration($Transaction) {
+  if(-not $Transaction.prepared_autostart -or -not $Transaction.old_manifest_text){return}
+  $old=$Transaction.old_manifest_text | ConvertFrom-Json
+  if($old.autostart -and $old.autostart.kind -ne 'startup-link'){
+    $path=$old.autostart.path;Assert-SafePath $path
+    if(Test-Path -LiteralPath $path){
+      if([IO.File]::ReadAllText($path) -cne $old.autostart.content){throw 'modified_or_foreign_autostart'}
+      # The replacement already exists and its receipt was persisted before any old item removal.
+      $probe=Invoke-StableLauncher 'inspect'
+      if(-not $probe.exists -or -not $probe.owned -or $probe.content -cne $Transaction.prepared_autostart.content){throw 'autostart_preparation_changed'}
+      Set-TransactionProperty $Transaction 'legacy_removal_intent' ([pscustomobject]@{path=$path;content=$old.autostart.content})
+      Write-Json $transactionPath $Transaction
+      Remove-Item -LiteralPath $path
+      $Transaction.legacy_removed=$true;Write-Json $transactionPath $Transaction
+    }
+  }
+}
+function Test-JsonEquivalent($Left,$Right,[bool]$IgnoreEndpoint=$false) {
+  if($null -eq $Left -or $null -eq $Right){return $null -eq $Left -and $null -eq $Right}
+  if($Left -is [string] -or $Left -is [ValueType]){return ($Right -is [string] -or $Right -is [ValueType]) -and $Left -ceq $Right}
+  if($Left -is [Collections.IList]){
+    if($Right -isnot [Collections.IList] -or $Left.Count -ne $Right.Count){return $false}
+    for($i=0;$i -lt $Left.Count;$i++){if(-not (Test-JsonEquivalent $Left[$i] $Right[$i])){return $false}}
+    return $true
+  }
+  $leftNames=@($Left.PSObject.Properties.Name | Where-Object {-not $IgnoreEndpoint -or $_ -cne 'endpoint'} | Sort-Object)
+  $rightNames=@($Right.PSObject.Properties.Name | Where-Object {-not $IgnoreEndpoint -or $_ -cne 'endpoint'} | Sort-Object)
+  if(($leftNames -join "`0") -cne ($rightNames -join "`0")){return $false}
+  foreach($name in $leftNames){if(-not (Test-JsonEquivalent $Left.$name $Right.$name)){return $false}}
+  return $true
+}
+function Read-OriginalRuntimeSnapshot($Transaction,[string]$RuntimeRoot) {
+  $path=Join-Path $Transaction.data_dir 'config.json';Assert-SafePath $path
+  $text=[IO.File]::ReadAllText($path);$current=$text | ConvertFrom-Json
+  $original=$Transaction.old_config_text | ConvertFrom-Json
+  $matches=Test-JsonEquivalent $current $original $true
+  $locks=(Test-Path -LiteralPath (Join-Path $Transaction.data_dir 'service.lock')) -or (Test-Path -LiteralPath (Join-Path $Transaction.data_dir 'supervisor.lock'))
+  $ready=$matches -and $locks -and (Test-InstallerRuntimeReady $RuntimeRoot $Transaction.data_dir) -and (Test-OriginalEndpointAuthentication $Transaction.data_dir $current.endpoint)
+  if($ready -and [IO.File]::ReadAllText($path) -cne $text){$ready=$false}
+  return [pscustomobject]@{text=$text;persistent_match=$matches;ready=$ready;locks=$locks}
+}
+function Test-OriginalEndpointAuthentication([string]$Directory,[string]$Endpoint) {
+  try{
+    $uri=[Uri]$Endpoint
+    if($uri.Scheme -cne 'http' -or $uri.Host -cne '127.0.0.1' -or $uri.Port -le 0 -or $uri.AbsolutePath -cne '/' -or $uri.Query -or $uri.Fragment -or $uri.UserInfo){return $false}
+    $key=Join-Path $Directory 'caller.key';Assert-SafePath $key
+    $token=[IO.File]::ReadAllText($key).Trim();if($token -cnotmatch '^[0-9a-f]{64}$'){return $false}
+    $response=Invoke-WebRequest -Uri ([Uri]::new($uri,'control/dots_status')) -Method Post -Headers @{Authorization=('Bearer '+$token)} -Body '{}' -ContentType 'application/json' -UseBasicParsing -TimeoutSec 3 -MaximumRedirection 0 -ErrorAction Stop
+    return $response.StatusCode -eq 200 -and ($response.Content | ConvertFrom-Json).service_reachable -eq $true
+  }catch{return $false}
+}
+function Set-TransactionProperty($Transaction,[string]$Name,$Value) {
+  if($Transaction -is [Collections.IDictionary]){$Transaction[$Name]=$Value}else{$Transaction | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force}
+}
+function Assert-StableLauncherIdentity($State) {
+  $launcher=Join-Path $InstallDirectory 'CodexDotsBridge.Launcher.exe';Assert-SafePath $launcher
+  if(Test-Path -LiteralPath $launcher){
+    if(-not $State.launcher_sha256 -or (Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash.ToLowerInvariant() -cne $State.launcher_sha256){throw 'modified_or_foreign_launcher'}
+  }
 }
 function Assert-OldCliIdentity($Prior,$Manifest) {
   if(-not $Manifest.codex_command -or -not [IO.Path]::IsPathRooted($Manifest.codex_command) -or [IO.Path]::GetExtension($Manifest.codex_command) -ine '.exe') { throw 'invalid_old_codex_cli_identity' }
@@ -489,13 +653,68 @@ function Restore-TrayShortcut($Transaction) {
 }
 function Rollback-Transaction($Transaction) {
   $env:APPDATA=$Transaction.app_data
+  $errors=[Collections.Generic.List[string]]::new()
   $runtimeRoot=''
-  if($Transaction.was_running) {
+  try { if($Transaction.was_running) {
     $runtimeRoot=Resolve-OldRuntimeRoot $Transaction.old_config $Transaction.old_root
     if(-not $runtimeRoot) { throw 'invalid_old_runtime_metadata' }
     if($Transaction.old_runtime_root -and $Transaction.old_runtime_root -cne $runtimeRoot) { throw 'old_runtime_binding_changed' }
-  }
-  if($Transaction.registration_changed) {
+  } } catch { $errors.Add($_.Exception.Message) }
+  $preserveLiveOriginal=$false
+  try { if($runtimeRoot -and $Transaction.old_config_text){
+    $originalSnapshot=Read-OriginalRuntimeSnapshot $Transaction $runtimeRoot
+    if($originalSnapshot.persistent_match -and $originalSnapshot.locks){
+      $preserveLiveOriginal=$true
+      if(-not $originalSnapshot.ready){throw 'rollback_original_runtime_unconfirmed'}
+      if($Transaction.registration_changed -and -not $Transaction.core_restored){
+        $ownership=Assert-OwnedRegistration $Transaction.old_root $Transaction.data_dir $Transaction.codex_home (Rollback-CodexCommand $Transaction)
+        if(-not $ownership.mcp_present -or -not $ownership.skill_complete){throw 'rollback_registration_requires_stopped_runtime'}
+        Set-TransactionProperty $Transaction 'core_restored' $true
+        if(Test-Path -LiteralPath $transactionPath){Write-Json $transactionPath $Transaction}
+      }
+    }
+  } } catch { $errors.Add($_.Exception.Message) }
+  try { if($Transaction.registration_changed -and -not $Transaction.core_restored -and -not $preserveLiveOriginal) {
+    if($Transaction.stable_startup) {
+      Stop-Tray $Transaction.new_root $Transaction.data_dir
+      $currentConfig=Read-Json (Join-Path $Transaction.data_dir 'config.json')
+      if($currentConfig.installation.root -ieq $Transaction.new_root){
+        Invoke-Bridge $Transaction.new_root @('run','--stop','--data-dir',$Transaction.data_dir) | Out-Null
+        Assert-RuntimeLocksReleased $Transaction.data_dir
+      }
+      $rollbackCommand=Rollback-CodexCommand $Transaction
+      if($Transaction.old_state_text){
+        $currentStateText=[IO.File]::ReadAllText($statePath)
+        if($currentStateText -cne $Transaction.old_state_text){
+          $installed=Read-Json $statePath;Assert-State $installed
+          if($installed.payload_root -ine $Transaction.new_root -or $installed.data_dir -ine $Transaction.data_dir -or $installed.installer_app_id -cne $Transaction.installer_app_id){throw 'rollback_installer_state_changed'}
+          [IO.File]::WriteAllText($statePath,$Transaction.old_state_text,[Text.UTF8Encoding]::new($false))
+        }
+      }
+      $fallbackState=Read-FallbackState $Transaction $rollbackCommand
+      $fallbackStateText=if($fallbackState){[IO.File]::ReadAllText($statePath)}else{''}
+      if($Transaction.old_config_text){[IO.File]::WriteAllText((Join-Path $Transaction.data_dir 'config.json'),$Transaction.old_config_text,[Text.UTF8Encoding]::new($false))}
+      if($Transaction.old_root){
+        Setup-Registration $Transaction.old_root $Transaction $false '' $rollbackCommand
+        if($Transaction.old_manifest_text){
+          $snapshot=$Transaction.old_manifest_text | ConvertFrom-Json
+          $restored=Read-Json (Join-Path $Transaction.data_dir 'installation.json')
+          $snapshot.codex_command=$restored.codex_command;$snapshot.mcp_registration=$restored.mcp_registration
+          Write-Json (Join-Path $Transaction.data_dir 'installation.json') $snapshot
+        }
+      }else{
+        Remove-Registration $Transaction.new_root $Transaction
+      }
+      if($Transaction.old_config_text){[IO.File]::WriteAllText((Join-Path $Transaction.data_dir 'config.json'),$Transaction.old_config_text,[Text.UTF8Encoding]::new($false))}
+      if($fallbackState){
+        $currentState=Read-FallbackState $Transaction $rollbackCommand
+        if([IO.File]::ReadAllText($statePath) -cne $fallbackStateText){throw 'rollback_installer_state_changed'}
+        $currentState.codex_command=$rollbackCommand
+        Assert-OldCliIdentity $currentState (Read-Json (Join-Path $Transaction.data_dir 'installation.json'))
+        Write-Json $statePath $currentState
+      }
+      $Transaction.core_restored=$true;Write-Json $transactionPath $Transaction
+    } else {
     Stop-Tray $Transaction.new_root $Transaction.data_dir
     $rollbackCommand=Rollback-CodexCommand $Transaction
     $fallbackState=Read-FallbackState $Transaction $rollbackCommand
@@ -531,22 +750,91 @@ function Rollback-Transaction($Transaction) {
       Assert-OldCliIdentity $currentState (Read-Json (Join-Path $Transaction.data_dir 'installation.json'))
       Write-Json $statePath $currentState
     }
-  }
-  if($Transaction.was_running -and $runtimeRoot) {
-    if(-not (Test-InstallerRuntimeReady $runtimeRoot $Transaction.data_dir)) {
+    }
+  } } catch { $errors.Add($_.Exception.Message) }
+  try { if($Transaction.was_running -and $runtimeRoot) {
+    # Registration failure does not prevent an independently verified original runtime resuming.
+    $originalSnapshot=Read-OriginalRuntimeSnapshot $Transaction $runtimeRoot
+    if(-not $originalSnapshot.persistent_match){throw 'rollback_runtime_binding_unrestored'}
+    if($originalSnapshot.locks -and -not $originalSnapshot.ready){throw 'rollback_original_runtime_unconfirmed'}
+    if(-not $originalSnapshot.ready) {
       Assert-RuntimeLocksReleased $Transaction.data_dir
       Start-InstallerSupervisor $runtimeRoot $Transaction.data_dir
     }
+  } } catch { $errors.Add($_.Exception.Message) }
+  try { if($Transaction.was_tray_running -and $Transaction.old_root) { Start-Tray $Transaction.old_root $Transaction.data_dir } } catch { $errors.Add($_.Exception.Message) }
+  try { if($Transaction.shortcut_path) { Restore-TrayShortcut $Transaction } } catch { $errors.Add($_.Exception.Message) }
+  $legacyPreserved=$true
+  try { if($Transaction.stable_startup -and ($Transaction.legacy_removed -or $Transaction.legacy_removal_intent)){
+    $legacy=if($Transaction.legacy_removal_intent){$Transaction.legacy_removal_intent}else{($Transaction.old_manifest_text | ConvertFrom-Json).autostart}
+    Assert-SafePath $legacy.path
+    if(-not (Test-Path -LiteralPath $legacy.path)){$legacyPreserved=$false;throw 'rollback_legacy_autostart_requires_recovery'}
+    if([IO.File]::ReadAllText($legacy.path) -cne $legacy.content){$legacyPreserved=$false;throw 'modified_or_foreign_autostart'}
+  } } catch { $legacyPreserved=$false;$errors.Add($_.Exception.Message) }
+  try { if($Transaction.stable_startup -and $legacyPreserved -and $Transaction.startup_created -and $Transaction.prepared_autostart) {
+    $probe=Invoke-StableLauncher 'inspect'
+    if($probe.exists){Invoke-StableLauncher 'disable' $Transaction.prepared_autostart.content | Out-Null}
+    Invoke-StableLauncher 'acknowledge' $Transaction.prepared_autostart.content | Out-Null
+  } } catch { $errors.Add($_.Exception.Message) }
+  try { if($Transaction.stable_startup -and $Transaction.startup_creation_intent -and -not $Transaction.startup_created) {
+    $intentPath=Join-Path $InstallDirectory '.startup-intent.json'
+    if(Test-Path -LiteralPath $intentPath){
+      $intent=Read-Json $intentPath;$probe=Invoke-StableLauncher 'inspect'
+      if($intent.owner -cne 'codex-dots-bridge-startup-intent' -or $intent.path -cne $probe.path){throw 'startup_intent_changed'}
+      if($probe.exists){if(-not $probe.owned -or $probe.content -cne $intent.content){throw 'startup_intent_changed'};Invoke-StableLauncher 'disable' $intent.content | Out-Null}
+      Invoke-StableLauncher 'acknowledge' $intent.content | Out-Null
+    }
+  } } catch { $errors.Add($_.Exception.Message) }
+  try { if($Transaction.stable_startup -and -not $Transaction.legacy_removed -and $errors.Count -eq 0){
+    $launcher=Join-Path $InstallDirectory 'CodexDotsBridge.Launcher.exe'
+    if(Test-Path -LiteralPath $launcher){
+      if((Get-FileHash -LiteralPath $launcher -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Transaction.launcher_sha256){throw 'launcher_changed_during_rollback'}
+      if($Transaction.old_launcher_bytes){[IO.File]::WriteAllBytes($launcher,[Convert]::FromBase64String($Transaction.old_launcher_bytes))}else{Remove-Item -LiteralPath $launcher}
+    }
+  } } catch { $errors.Add($_.Exception.Message) }
+  if($errors.Count){
+    if($Transaction.stable_startup){Set-TransactionProperty $Transaction 'rollback_errors' @($errors);Write-Json $transactionPath $Transaction}
+    throw $errors[0]
   }
-  if($Transaction.was_tray_running -and $Transaction.old_root) { Start-Tray $Transaction.old_root $Transaction.data_dir }
-  if($Transaction.shortcut_path) { Restore-TrayShortcut $Transaction }
   Remove-Item -LiteralPath $transactionPath -ErrorAction SilentlyContinue
 }
 
 try {
   Assert-SafePath $InstallDirectory
   if($InstallDirectory -eq [IO.Path]::GetPathRoot($InstallDirectory).TrimEnd('\')) { throw 'unsafe_install_directory' }
-  if($Action -eq 'Prepare') {
+  if($Action -eq 'RecoverRollback') {
+    $transaction=Read-Json $transactionPath;Assert-Transaction $transaction
+    if($InstallerIdentity -and $InstallerIdentity -cne $transaction.installer_app_id){throw 'installer_identity_mismatch'}
+    if(-not $transaction.old_root -or -not $transaction.old_config_text){throw 'recovery_requires_owned_previous_installation'}
+    $state=Read-Json $statePath;Assert-State $state;$env:APPDATA=$state.app_data;$validatedDirectory=$true
+    $oldRuntime=Resolve-OldRuntimeRoot $transaction.old_config $transaction.old_root
+    $originalSnapshot=Read-OriginalRuntimeSnapshot $transaction $oldRuntime
+    if(-not $originalSnapshot.persistent_match){throw 'recovery_original_config_unrestored'}
+    if($originalSnapshot.locks -and -not $originalSnapshot.ready){throw 'recovery_original_runtime_unconfirmed'}
+    $ownership=Assert-OwnedRegistration $transaction.old_root $transaction.data_dir $transaction.codex_home $state.codex_command
+    if(-not $ownership.mcp_present -or -not $ownership.skill_complete){throw 'recovery_original_registration_unrestored'}
+    if($transaction.was_running -and -not $originalSnapshot.ready){
+      Assert-RuntimeLocksReleased $transaction.data_dir;Start-InstallerSupervisor $oldRuntime $transaction.data_dir
+    }
+    if($transaction.was_tray_running -and -not (Tray-Running $transaction.old_root $transaction.data_dir)){Start-Tray $transaction.old_root $transaction.data_dir}
+    if($transaction.shortcut_path){Restore-TrayShortcut $transaction}
+    $manifest=Read-Json (Join-Path $transaction.data_dir 'installation.json')
+    $startupMissing=[bool]$manifest.autostart -and -not (Test-Path -LiteralPath $manifest.autostart.path)
+    $recovery=[pscustomobject]@{core_restored=$true;autostart_missing=$startupMissing;checked_at=[DateTime]::UtcNow.ToString('o');deferred=[bool]$DeferAutostart}
+    $transaction | Add-Member -NotePropertyName recovery -NotePropertyValue $recovery -Force
+    Write-Json $transactionPath $transaction
+    if(-not $DeferAutostart){throw 'recovery_verified_requires_explicit_defer'}
+    # Explicit acknowledgement transfers, rather than discards, the incomplete transaction evidence.
+    $history=Join-Path $InstallDirectory 'recovery';Assert-SafePath $history;New-Item -ItemType Directory -Path $history -Force | Out-Null
+    $receipt=Join-Path $history ('rollback-'+[DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff')+'-'+[Guid]::NewGuid().ToString('N')+'.json')
+    [IO.File]::Copy($transactionPath,$receipt,$false)
+    $state | Add-Member -NotePropertyName recovery_record -NotePropertyValue $receipt -Force
+    $state | Add-Member -NotePropertyName recovery_sha256 -NotePropertyValue ((Get-FileHash -LiteralPath $receipt -Algorithm SHA256).Hash.ToLowerInvariant()) -Force
+    $state | Add-Member -NotePropertyName autostart_status -NotePropertyValue $(if($startupMissing){'missing_requires_repair'}else{'preserved_not_reenabled'}) -Force
+    Write-Json $statePath $state
+    Remove-Item -LiteralPath $transactionPath
+    [IO.File]::WriteAllText($resultPath,'core_restored_autostart_deferred_evidence_retained',[Text.UTF8Encoding]::new($false))
+  } elseif($Action -eq 'Prepare') {
     if(-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { throw 'windows_x64_required' }
     if($NewVersion -notmatch '^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$' -or $PackageFingerprint -notmatch '^[a-f0-9]{64}$') { throw 'invalid_release_identity' }
     if($InstallerIdentity -notmatch '^CodexDotsBridgeSetup(?:\.Test\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?$') { throw 'invalid_installer_identity' }
@@ -555,7 +843,7 @@ try {
     if(Test-Path -LiteralPath $transactionPath) { throw 'previous_installation_requires_recovery' }
     if(Test-Path -LiteralPath $InstallDirectory) {
       foreach($item in Get-ChildItem -LiteralPath $InstallDirectory -Force) {
-        if($item.Name -notmatch '^(payload|setup-lifecycle\.ps1|launch-background\.ps1|recover-reboot-locks\.ps1|installation-state\.json|\.setup-result\.txt|unins\d+\.(exe|dat|msg))$') { throw 'foreign_install_directory_entry' }
+        if($item.Name -notmatch '^(payload|recovery|CodexDotsBridge\.Launcher\.exe|setup-lifecycle\.ps1|launch-background\.ps1|recover-reboot-locks\.ps1|installation-state\.json|\.launcher-diagnostics\.json|\.setup-result\.txt|unins\d+\.(exe|dat|msg))$') { throw 'foreign_install_directory_entry' }
       }
       if(-not $prior -and @(Get-ChildItem -LiteralPath $InstallDirectory -Force).Count) { throw 'unowned_install_directory' }
     }
@@ -618,9 +906,22 @@ try {
       $oldShortcutExists=Test-Path -LiteralPath $shortcutPath
       if($oldShortcutExists) { $oldShortcutBytes=[Convert]::ToBase64String([IO.File]::ReadAllBytes($shortcutPath)) }
     }
-    $transaction=[ordered]@{schema=1;owner='codex-dots-bridge-setup';install_directory=$InstallDirectory;installer_app_id=$InstallerIdentity;version=$NewVersion;package_fingerprint=$PackageFingerprint;new_root=$newRoot;data_dir=$DataDir;codex_home=$CodexHome;codex_command=$CodexCommand;app_data=$AppDataDirectory;autostart=([bool]$Autostart -or $oldAutostart);old_root=$oldRoot;old_runtime_root=$oldRuntimeRoot;old_codex_command=$oldCodexCommand;old_installer_state=([bool]$prior);old_config=$oldConfig;old_config_text=$oldConfigText;old_autostart=$oldAutostart;was_running=$wasRunning;was_tray_running=$wasTrayRunning;registration_changed=$false;current_registration_root=$oldRoot;shortcut_path=$shortcutPath;old_shortcut_exists=$oldShortcutExists;old_shortcut_bytes=$oldShortcutBytes}
+    $oldManifestText=if(Test-Path -LiteralPath (Join-Path $DataDir 'installation.json')){[IO.File]::ReadAllText((Join-Path $DataDir 'installation.json'))}else{''}
+    $previousRecovery='';$previousRecoveryHash=''
+    if($prior -and $prior.recovery_record){
+      $previousRecovery=[IO.Path]::GetFullPath($prior.recovery_record)
+      if(-not $previousRecovery.StartsWith((Join-Path $InstallDirectory 'recovery')+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'invalid_recovery_record'}
+      Assert-SafePath $previousRecovery
+      $previousRecoveryHash=(Get-FileHash -LiteralPath $previousRecovery -Algorithm SHA256).Hash.ToLowerInvariant()
+      if($previousRecoveryHash -cne $prior.recovery_sha256){throw 'recovery_record_changed'}
+      $evidence=Read-Json $previousRecovery
+      if(((-not $prior.recovery_resolved_by) -and $evidence.old_root -ine $oldRoot) -or $evidence.data_dir -ine $DataDir -or -not $evidence.recovery.core_restored){throw 'recovery_record_binding_mismatch'}
+    }
+    $transaction=[ordered]@{schema=1;owner='codex-dots-bridge-setup';install_directory=$InstallDirectory;installer_app_id=$InstallerIdentity;version=$NewVersion;package_fingerprint=$PackageFingerprint;new_root=$newRoot;data_dir=$DataDir;codex_home=$CodexHome;codex_command=$CodexCommand;app_data=$AppDataDirectory;autostart=([bool]$Autostart -or $oldAutostart);old_root=$oldRoot;old_runtime_root=$oldRuntimeRoot;old_codex_command=$oldCodexCommand;old_installer_state=([bool]$prior);old_state_text=$(if($prior){[IO.File]::ReadAllText($statePath)}else{''});old_config=$oldConfig;old_config_text=$oldConfigText;old_manifest_text=$oldManifestText;old_autostart=$oldAutostart;was_running=$wasRunning;was_tray_running=$wasTrayRunning;registration_changed=$false;current_registration_root=$oldRoot;shortcut_path=$shortcutPath;old_shortcut_exists=$oldShortcutExists;old_shortcut_bytes=$oldShortcutBytes;stable_startup=$false;prepared_autostart=$null;startup_created=$false;startup_creation_intent=$false;legacy_removed=$false;preserve_legacy=$false;core_restored=$false;rollback_errors=@();previous_recovery=$previousRecovery;previous_recovery_sha256=$previousRecoveryHash}
     Write-Json $transactionPath $transaction
     $ownsTransaction=$true
+    # Register/verify the fixed entry while the original service and MCP are still intact.
+    Prepare-StableStartup $transaction $prior
     if($oldRoot) { Stop-Tray $oldRoot $DataDir }
     if($oldRuntimeRoot -and ((Test-Path -LiteralPath (Join-Path $DataDir 'supervisor.lock')) -or (Test-Path -LiteralPath (Join-Path $DataDir 'service.lock')))) { Invoke-Bridge $oldRuntimeRoot @('run','--stop','--data-dir',$DataDir) | Out-Null }
     Assert-RuntimeLocksReleased $DataDir
@@ -643,7 +944,7 @@ try {
     Assert-RuntimeLocksReleased $transaction.data_dir
     $client=Select-TunnelClientForUpgrade $transaction
     $transaction.registration_changed=$true; Write-Json $transactionPath $transaction
-    if($transaction.old_root) { Remove-Registration $transaction.old_root $transaction }
+    if($transaction.old_root -and -not $transaction.stable_startup) { Remove-Registration $transaction.old_root $transaction }
     $transaction.current_registration_root=$transaction.new_root; Write-Json $transactionPath $transaction
     Setup-Registration $transaction.new_root $transaction $transaction.autostart $client
     $config=Read-Json (Join-Path $transaction.data_dir 'config.json')
@@ -661,6 +962,15 @@ try {
     }
     $state=[ordered]@{owner='codex-dots-bridge-setup';schema=1;install_directory=$InstallDirectory;installer_app_id=$transaction.installer_app_id;version=$transaction.version;package_fingerprint=$transaction.package_fingerprint;payload_root=$transaction.new_root;data_dir=$transaction.data_dir;codex_home=$transaction.codex_home;codex_command=$transaction.codex_command;app_data=$transaction.app_data;autostart=$transaction.autostart;connection=$connection}
     Start-Tray $transaction.new_root $transaction.data_dir
+    if($transaction.stable_startup){
+      Complete-StableStartupMigration $transaction
+      $state.launcher_sha256=$transaction.launcher_sha256;$state.launcher_source_sha256=$transaction.launcher_source_sha256
+      $state.autostart_status=if($transaction.preserve_legacy){'disabled_by_windows_legacy_preserved'}elseif($transaction.prepared_autostart){'registered_windows_state_preserved'}else{'disabled'}
+    }
+    if($transaction.previous_recovery){
+      if((Get-FileHash -LiteralPath $transaction.previous_recovery -Algorithm SHA256).Hash.ToLowerInvariant() -cne $transaction.previous_recovery_sha256){throw 'recovery_record_changed'}
+      $state.recovery_record=$transaction.previous_recovery;$state.recovery_sha256=$transaction.previous_recovery_sha256;$state.recovery_resolved_by=$transaction.version
+    }
     Write-Json $statePath $state
     Remove-Item -LiteralPath $transactionPath
     [IO.File]::WriteAllText($resultPath,$connection,[Text.UTF8Encoding]::new($false))
@@ -674,11 +984,14 @@ try {
     $state.codex_command=$currentCommand
     if($Action -eq 'Uninstall' -or $Action -eq 'PreflightUninstall') {
       if(Test-Path -LiteralPath $transactionPath) { throw 'previous_installation_requires_recovery' }
+      Assert-StableLauncherIdentity $state
       Assert-OwnedRegistration $state.payload_root $state.data_dir $state.codex_home $currentCommand | Out-Null
       if($Action -eq 'Uninstall') {
         Stop-Tray $state.payload_root $state.data_dir
         Invoke-Bridge $state.payload_root @('run','--stop','--data-dir',$state.data_dir) | Out-Null
         Remove-Registration $state.payload_root $state
+        $launcher=Join-Path $InstallDirectory 'CodexDotsBridge.Launcher.exe'
+        if(Test-Path -LiteralPath $launcher){Assert-StableLauncherIdentity $state;Remove-Item -LiteralPath $launcher}
       }
     } elseif($Action -eq 'Tray') {
       Assert-OwnedRegistration $state.payload_root $state.data_dir $state.codex_home $currentCommand | Out-Null

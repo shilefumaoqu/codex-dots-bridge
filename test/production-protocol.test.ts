@@ -6,9 +6,10 @@ import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { request as httpRequest } from 'node:http';
 import test from 'node:test';
+import { createMcpHandler } from '@modelcontextprotocol/server';
 import { TaskStore } from '../src/task-store.js';
 import { ProbeEvents } from '../src/events.js';
-import { createProductionService, VERSION, type RuntimeStatusProvider } from '../src/bridge.js';
+import { callerSchemas, createProductionService, productionWorker, VERSION, type RuntimeStatusProvider } from '../src/bridge.js';
 import { DesktopConversationsError, type DesktopConversationsService } from '../src/desktop-conversations.js';
 import { writeProductionConfig, acquireLock } from '../src/runtime.js';
 
@@ -65,10 +66,10 @@ test('worker protocol audit correlates bounded received/responded metadata witho
     const sent=await f.rpc('tools/call',{name:'codex_send_message',arguments:{request_id,thread_id,text:'SECRET_BODY'}},rpcId);
     assert.equal(sent.status,200);assert.equal(unpack(sent.body).text,'SECRET_RESPONSE');assert.equal(sends,1);
     const raw=()=>f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind IN ('worker_protocol_request','worker_protocol_response') ORDER BY id").all() as {detail:string}[];
-    const expected={method:'tools/call',tool_name:'codex_send_message',request_id,bridge_version:VERSION};
-    assert.deepEqual(raw().map(row=>JSON.parse(row.detail)),[{...expected,phase:'received'},{...expected,phase:'responded',http_status:200}]);
+    const expected={method:'tools/call',tool_name:'codex_send_message',bridge_version:VERSION};
+    assert.deepEqual(raw().map(row=>JSON.parse(row.detail)),[{...expected,phase:'received'},{...expected,request_id,phase:'responded',http_status:200}]);
     assert.equal((f.store.db.prepare("SELECT COUNT(*) AS n FROM task_evidence WHERE kind='worker_protocol_request'").get() as {n:number}).n,1,'response metadata must not double-count original requests');
-    assert.deepEqual(f.store.evidence().map(row=>JSON.parse(row.detail)),raw().map(row=>JSON.parse(row.detail)));
+    assert.deepEqual(f.store.evidence().filter(row=>row.kind.startsWith('worker_protocol_')).map(row=>JSON.parse(row.detail)),raw().map(row=>JSON.parse(row.detail)));
     const malicious=await f.rpc('tools/call',{name:'SECRET_TOOL',arguments:{request_id:'SECRET_INVALID_ID',thread_id,text:'SECRET_BODY',token:'SECRET_TOKEN',keys:{SECRET_KEY:'SECRET_VALUE'}}},rpcId);
     assert.ok(malicious.body.error||malicious.body.result?.isError);
     const invalid=await f.rpc('tools/call',{name:'codex_send_message',arguments:{request_id:'SECRET_INVALID_ID',thread_id,text:'SECRET_BODY'}},rpcId);
@@ -107,6 +108,172 @@ test('worker protocol audit failures do not change a handled call or cause a rep
     assert.equal(sends,1);assert.equal(auditAttempts,2);
     await f.closeService();assert.equal(auditAttempts,2);
   } finally {await f.close();}
+});
+
+test('worker ingress observes auth and parsing boundaries with private correlation and fixed categories',async()=>{
+  const f=await fixture();
+  const rows=()=>f.store.evidence().filter(row=>row.kind==='worker_ingress').map(row=>JSON.parse(row.detail));
+  const raw=async(body:string,extra:Record<string,string>={},path='mcp/dot?SECRET_QUERY=SECRET_VALUE')=>{
+    const response=await fetch(new URL(path,f.endpoint),{method:'POST',headers:{'content-type':'application/json','X-Codex-Dots-Worker-Token':tokens.worker,...extra},body});
+    await response.arrayBuffer();return response.status;
+  };
+  try {
+    assert.deepEqual(rows().map(d=>d.stage),['coverage_started']);
+    const task=(await f.control('dots_submit',{idempotency_key:'ingress-only',title:'Synthetic',input:{text:'SECRET_BODY'}})).body;
+    const rpcId=randomUUID();
+    await f.rpc('tools/call',{name:'get_task',arguments:{task_id:task.task_id}},rpcId);
+    const valid=rows().slice(1);assert.deepEqual(valid.map(d=>d.stage),['arrived','auth_accepted','handler_entered','tool_invoked','http_finished']);
+    assert.equal(new Set(valid.map(d=>d.ingress_id)).size,1);assert.notEqual(valid[0].ingress_id,rpcId);
+    assert.ok(valid.slice(0,3).every(d=>d.task_id===undefined));assert.ok(valid.slice(3).every(d=>d.task_id===task.task_id));
+    assert.equal(valid.at(-1).http_status,200);
+    const deniedId=randomUUID();
+    const body=JSON.stringify({jsonrpc:'2.0',id:rpcId,method:'tools/call',params:{name:'get_task',arguments:{task_id:deniedId}}});
+    assert.equal(await raw(body,{'X-Codex-Dots-Worker-Token':'SECRET_TOKEN'}),401);
+    assert.equal(await raw(body,{origin:'https://SECRET_ORIGIN.example'}),403);
+    const hostStatus=await new Promise<number>((resolve,reject)=>{
+      const request=httpRequest(new URL('mcp/dot?SECRET_QUERY',f.endpoint),{method:'POST',headers:{host:'SECRET_HOST.example','content-type':'application/json','X-Codex-Dots-Worker-Token':tokens.worker}},response=>{response.resume();response.once('end',()=>resolve(response.statusCode!));});request.once('error',reject);request.end(body);
+    });assert.equal(hostStatus,403);
+    // Existing custom error handling intentionally returns 500 for parser failures.
+    assert.equal(await raw('{SECRET_BAD_JSON'),500);
+    assert.equal(await raw(JSON.stringify({text:'SECRET_BODY'.repeat(30_000)})),500);
+    assert.deepEqual(rows().filter(d=>d.stage==='body_rejected').map(d=>d.reason),['invalid_json','body_too_large']);
+    assert.deepEqual(rows().filter(d=>d.stage==='auth_rejected').map(d=>d.reason),['worker_token_rejected','origin_rejected','host_rejected']);
+    const before=rows().length;
+    await raw('{}',{},'unknown/SECRET_PATH');await fetch(new URL('health',f.endpoint));await f.control('dots_status',{});
+    assert.equal(rows().length,before,'caller, health and unknown routes are not an access log');
+    await f.rpc('SECRET_METHOD',{name:'SECRET_TOOL',arguments:{task_id:deniedId}});
+    await f.rpc('tools/call',{name:'get_task',arguments:{task_id:deniedId,text:'SECRET_EXTRA'}});
+    await raw(JSON.stringify({jsonrpc:'SECRET_BAD_RPC',method:'tools/call',params:{name:'get_task',arguments:{task_id:deniedId}}}));
+    const diagnosticRows=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
+    for(const observed of [JSON.stringify(diagnosticRows),JSON.stringify(f.store.evidence())]) {
+      for(const secret of [deniedId,rpcId,'SECRET_QUERY','SECRET_VALUE','SECRET_TOKEN','SECRET_ORIGIN','SECRET_HOST','SECRET_BAD_JSON','SECRET_BODY','SECRET_PATH','SECRET_METHOD','SECRET_TOOL','SECRET_EXTRA']) assert.ok(!observed.includes(secret),secret);
+    }
+    f.store.audit('worker_ingress','SECRET_ROW_TASK',{ingress_id:'SECRET_ID',endpoint:'SECRET_ENDPOINT',stage:'SECRET_STAGE',reason:'SECRET_REASON',method:'SECRET_METHOD',task_id:'SECRET_TASK',request_id:'SECRET_REQUEST',bridge_version:'SECRET_VERSION',http_status:999,text:'SECRET_TEXT'});
+    assert.deepEqual(JSON.parse(f.store.evidence().at(-1)!.detail),{});assert.equal(f.store.evidence().at(-1)!.task_id,null);
+    f.store.audit('worker_protocol_request',null,{method:'SECRET_METHOD'});assert.deepEqual(JSON.parse(f.store.evidence().at(-1)!.detail),{});
+    await f.closeService();assert.equal(rows().at(-1).stage,'coverage_stopped');
+  } finally {await f.close();}
+});
+
+test('worker ingress failure and disconnect observations never retry or conceal successful business execution',async()=>{
+  let entered!:()=>void,release!:()=>void,sends=0;
+  const enteredPromise=new Promise<void>(resolve=>entered=resolve),blocked=new Promise<void>(resolve=>release=resolve);
+  const conversations={enabled:true,send:async()=>{sends++;entered();await blocked;return {status:'synthetic_once'};},close:async()=>{}} as unknown as DesktopConversationsService;
+  const f=await fixture(undefined,conversations);
+  try {
+    const original=f.store.audit.bind(f.store);let fail=true;
+    f.store.audit=(kind,taskId,detail)=>{if(fail&&kind==='worker_ingress')throw Error('SECRET_STORAGE_ERROR');original(kind,taskId,detail);};
+    assert.equal((await f.rpc('tools/list')).status,200,'persistent ingress audit failure does not change the HTTP/MCP result');
+    const controller=new AbortController();
+    const pending=fetch(new URL('mcp/dot',f.endpoint),{method:'POST',headers:{'content-type':'application/json',accept:'application/json, text/event-stream','MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/call','Mcp-Name':'codex_send_message','X-Codex-Dots-Worker-Token':tokens.worker},body:JSON.stringify({jsonrpc:'2.0',id:'SECRET_RPC_ID',method:'tools/call',params:{_meta:meta,name:'codex_send_message',arguments:{request_id:randomUUID(),thread_id:randomUUID(),text:'SECRET_TEXT'}}}),signal:controller.signal}).then(()=>false,()=>true);
+    await enteredPromise;assert.equal(sends,1);fail=false;controller.abort();assert.equal(await pending,true);
+    await delay(50);release();await delay(50);
+    const details=f.store.evidence().filter(row=>row.kind==='worker_ingress').map(row=>JSON.parse(row.detail));
+    assert.ok(details.some(d=>d.stage==='audit_gap'&&d.reason==='audit_write_failed'));
+    assert.ok(details.some(d=>d.stage==='http_aborted'&&d.reason==='connection_closed'));
+    assert.equal(sends,1);assert.equal(f.deliveries.length,0);
+    assert.ok(!JSON.stringify(f.store.evidence()).includes('SECRET_'));
+    const response=await f.rpc('tools/list');assert.equal(response.status,200);
+  } finally {release();await f.close();}
+});
+
+test('worker ingress observes a Fastify handler pipeline failure without changing error behavior',async()=>{
+  const dir=mkdtempSync(join(tmpdir(),'codex dots production ')),store=new TaskStore(join(dir,'tasks.sqlite'));
+  const events=new ProbeEvents(store,async()=>{throw Error('unexpected delivery');},'tasks');
+  const service=createProductionService(store,events,tokens);
+  service.app.addHook('preHandler',async()=>{throw Error('SECRET_HANDLER_ERROR');});
+  try {
+    const endpoint=await service.start();const response=await fetch(new URL('mcp/dot',endpoint),{method:'POST',headers:{'content-type':'application/json','X-Codex-Dots-Worker-Token':tokens.worker},body:'{}'});
+    assert.equal(response.status,500);await response.arrayBuffer();
+    const details=store.evidence().filter(row=>row.kind==='worker_ingress').map(row=>JSON.parse(row.detail));
+    assert.deepEqual(details.map(d=>d.stage),['coverage_started','arrived','auth_accepted','handler_failed','http_finished']);
+    assert.equal(details[3].reason,'request_error');assert.ok(!JSON.stringify(details).includes('SECRET_'));
+  } finally {await service.close();store.close();removeOwnTemp(dir);}
+});
+
+test('worker diagnostic UUIDs are collected only inside SDK-accepted tool callbacks',async()=>{
+  let sends=0,workerReads=0;
+  const conversations={enabled:true,send:async()=>{sends++;return {status:'synthetic_once'};},close:async()=>{}} as unknown as DesktopConversationsService;
+  const f=await fixture(undefined,conversations);
+  const raw=()=>f.store.db.prepare("SELECT task_id,detail FROM task_evidence WHERE kind LIKE 'worker_%' ORDER BY id").all() as {task_id:string|null;detail:string}[];
+  try {
+    const task=(await f.control('dots_submit',{idempotency_key:'sdk-diagnostic-validation',title:'Synthetic',input:{text:'SECRET_BODY'}})).body;
+    const originalGet=f.store.get.bind(f.store);
+    f.store.get=(...args:Parameters<TaskStore['get']>)=>{if(args[1]?.worker)workerReads++;return originalGet(...args);};
+    const request_id=randomUUID(),thread_id=randomUUID();
+    const call=async(name:string,args:unknown,extra:Record<string,unknown>={},headers:Record<string,string>={})=>{
+      const response=await fetch(new URL('mcp/dot',f.endpoint),{method:'POST',headers:{'content-type':'application/json',accept:'application/json, text/event-stream','MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/call','Mcp-Name':name,'X-Codex-Dots-Worker-Token':tokens.worker,...headers},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{_meta:meta,name,arguments:args},...extra})});
+      return {status:response.status,body:await response.json() as any};
+    };
+    for(const [name,args] of [['get_task',{task_id:task.task_id}],['codex_send_message',{request_id,thread_id,text:'SECRET_SEND_TEXT'}]] as const) {
+      for(const specimen of [
+        {body:{id:1.5},code:-32600},
+        {body:{params:{_meta:123,name,arguments:args}},code:-32600},
+        {body:{params:{_meta:{...meta,'io.modelcontextprotocol/clientCapabilities':123},name,arguments:args}},code:-32602},
+        {headers:{'MCP-Protocol-Version':'2099-01-01'}},
+        {headers:{'Mcp-Method':'tools/list'}},
+      ]) {
+        const before=raw().length;
+        const rejected=await call(name,args,specimen.body,specimen.headers);
+        assert.equal(rejected.status,400);assert.ok(rejected.body.error);
+        if(specimen.code)assert.equal(rejected.body.error.code,specimen.code);
+        const observed=raw().slice(before);assert.ok(observed.length>0);
+        for(const row of observed) {
+          const detail=JSON.parse(row.detail);assert.equal(row.task_id,null);assert.equal(detail.task_id,undefined);assert.equal(detail.request_id,undefined);
+        }
+        const exported=f.store.evidence().filter(row=>row.kind.startsWith('worker_'));
+        for(const data of [JSON.stringify(observed),JSON.stringify(exported)]) for(const hidden of [task.task_id,request_id,thread_id,'SECRET_BODY','SECRET_SEND_TEXT']) assert.ok(!data.includes(hidden),hidden);
+      }
+    }
+    assert.equal(workerReads,0);assert.equal(sends,0,'the SDK must reject before executing either tool');
+    assert.equal((await call('get_task',{task_id:task.task_id})).status,200);
+    assert.equal((await call('codex_send_message',{request_id,thread_id,text:'SECRET_SEND_TEXT'})).status,200);
+    assert.equal(workerReads,1);assert.equal(sends,1);
+    assert.ok(raw().some(row=>row.task_id===task.task_id&&JSON.parse(row.detail).task_id===task.task_id));
+    assert.ok(raw().some(row=>JSON.parse(row.detail).request_id===request_id));
+    assert.ok(f.store.evidence().some(row=>row.kind==='worker_ingress'&&JSON.parse(row.detail).task_id===task.task_id));
+    assert.ok(f.store.evidence().some(row=>row.kind==='worker_ingress'&&JSON.parse(row.detail).request_id===request_id));
+    const invocations=f.store.evidence().filter(row=>row.kind==='worker_ingress'&&JSON.parse(row.detail).stage==='tool_invoked');
+    assert.equal(invocations.length,2,'each accepted callback is observed exactly once');
+    for(const data of [JSON.stringify(raw()),JSON.stringify(f.store.evidence())]) for(const hidden of [thread_id,'SECRET_BODY','SECRET_SEND_TEXT',tokens.worker,tokens.caller]) assert.ok(!data.includes(hidden),hidden);
+  } finally {await f.close();}
+});
+
+test('worker invocation correlation stays isolated across concurrent requests and observation failures',async()=>{
+  let sends=0,observerCalls=0;
+  const conversations={enabled:true,send:async()=>{sends++;await delay(20);return {status:'synthetic_once'};},close:async()=>{}} as unknown as DesktopConversationsService;
+  const f=await fixture(undefined,conversations);
+  const handler=createMcpHandler(()=>productionWorker(f.store,f.events,undefined,undefined,conversations,undefined,()=>{observerCalls++;throw Error('SECRET_OBSERVER_FAILURE');}),{legacy:'reject',responseMode:'json'});
+  try {
+    const tasks=[];
+    for(const key of ['parallel-a','parallel-b'])tasks.push((await f.control('dots_submit',{idempotency_key:key,title:'Synthetic',input:{text:'SECRET_BODY'}})).body);
+    const results=await Promise.all(tasks.map(task=>f.worker('get_task',{task_id:task.task_id})));
+    assert.deepEqual(results.map(task=>task.task_id),tasks.map(task=>task.task_id));
+    const requestIds=[randomUUID(),randomUUID()];
+    await Promise.all(requestIds.map(request_id=>f.worker('codex_send_message',{request_id,thread_id:randomUUID(),text:'SECRET_SEND_TEXT'})));
+    assert.equal(sends,2);
+    const details=f.store.evidence().filter(row=>row.kind==='worker_ingress').map(row=>JSON.parse(row.detail));
+    const invoked=details.filter(d=>d.stage==='tool_invoked');assert.equal(invoked.length,4);
+    assert.equal(new Set(invoked.map(d=>d.ingress_id)).size,4);
+    for(const observed of invoked) {
+      const group=details.filter(d=>d.ingress_id===observed.ingress_id);
+      assert.equal(group.filter(d=>d.stage==='tool_invoked').length,1);
+      assert.ok(group.slice(0,3).every(d=>d.task_id===undefined&&d.request_id===undefined));
+      for(const detail of group.slice(3)) {assert.equal(detail.task_id,observed.task_id);assert.equal(detail.request_id,observed.request_id);}
+    }
+    assert.deepEqual(invoked.filter(d=>d.task_id).map(d=>d.task_id).sort(),tasks.map(task=>task.task_id).sort());
+    assert.deepEqual(invoked.filter(d=>d.request_id).map(d=>d.request_id).sort(),requestIds.sort());
+    const originalAudit=f.store.audit.bind(f.store);
+    f.store.audit=(kind,taskId,detail)=>{if(kind==='worker_ingress'&&detail?.stage==='tool_invoked')throw Error('SECRET_WRITE_FAILURE');originalAudit(kind,taskId,detail);};
+    await f.worker('codex_send_message',{request_id:randomUUID(),thread_id:randomUUID(),text:'SECRET_SEND_TEXT'});
+    assert.equal(sends,3);assert.equal(f.deliveries.length,0);
+    assert.ok(f.store.evidence().some(row=>row.kind==='worker_ingress'&&JSON.parse(row.detail).stage==='audit_gap'));
+    const response=await handler.fetch(new Request('http://localhost/mcp/dot',{method:'POST',headers:{'content-type':'application/json',accept:'application/json, text/event-stream','MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/call','Mcp-Name':'codex_send_message'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{_meta:meta,name:'codex_send_message',arguments:{request_id:randomUUID(),thread_id:randomUUID(),text:'SECRET_SEND_TEXT'}}})}));
+    assert.equal(response.status,200);assert.deepEqual(unpack(await response.json()),{status:'synthetic_once'});
+    assert.equal(observerCalls,1);assert.equal(sends,4);
+    const raw=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
+    for(const observed of [JSON.stringify(raw),JSON.stringify(f.store.evidence())])for(const hidden of ['SECRET_BODY','SECRET_SEND_TEXT','SECRET_OBSERVER_FAILURE','SECRET_WRITE_FAILURE'])assert.ok(!observed.includes(hidden));
+  } finally {await handler.close();await f.close();}
 });
 
 test('worker tools/list definitions remain identical across task state changes and duplicate RPCs',async()=>{
@@ -192,6 +359,19 @@ test('worker discovery and get_task share rules for absent, disabled and enabled
         assert.match(rules.instructions,/Do not automatically forward results back/);
         assert.match(rules.instructions,/Preserve native approval requirements/);
         assert.match(rules.instructions,/official stored-history pagination/);
+        assert.match(rules.instructions,/defaults to the complete stored context: all stored turns and items/);
+        assert.match(rules.instructions,/without a fixed recent-turn limit or stopping because recent context seems sufficient/);
+        assert.match(rules.instructions,/Read each explicitly requested target separately; do not expand to other IDs mentioned in history/);
+        assert.match(rules.instructions,/Only an explicit human request for recent context, a time range or a limited section permits partial analysis/);
+        assert.match(rules.instructions,/start at offset=0/); assert.match(rules.instructions,/verify contiguous context_offset values/);
+        assert.match(rules.instructions,/assembled length equals total_chars, and parse the JSON/);
+        assert.match(rules.instructions,/same request_id\/thread_id.*total_chars, context_sha256 and receipt_nonce remain fixed/);
+        assert.match(rules.instructions,/verify the assembled SHA-256 when context_sha256 is available/);
+        assert.match(rules.instructions,/actual stored turn count, retrieved chunk count, observed snapshot end and any coverage gaps/);
+        assert.match(rules.instructions,/read_scope.*full_stored_history.*full_history_snapshot/);
+        assert.match(rules.instructions,/continuation_required only means this chunk has a next_offset/);
+        assert.match(rules.instructions,/false or a final chunk alone does not prove the caller retrieved all earlier chunks/);
+        assert.match(rules.instructions,/report partial and the missing coverage rather than success/);
         assert.match(rules.instructions,/does not prove live desktop idle state/);
         assert.match(rules.instructions,/Sending first uses the live original desktop owner/);
         assert.match(rules.instructions,/Busy returns awaiting_delivery_choice/);
@@ -364,11 +544,11 @@ function stdio(dir:string) {
     output:()=>stdout+stderr};
 }
 
-test('production modern worker advertises its nine tools/tasks Events and authenticates every route variant',async()=>{
+test('production modern worker advertises existing task tools plus narrow chat tools/tasks Events and authenticates every route variant',async()=>{
   const f=await fixture();try {
     const discovered=await f.rpc('server/discover');assert.equal(discovered.status,200);assert.equal(discovered.body.result.resultType,'complete');assert.deepEqual(discovered.body.result.capabilities.events,{});
     const tools=(await f.rpc('tools/list')).body.result.tools;
-    assert.deepEqual(tools.map((t:any)=>t.name).sort(),['list_tasks','get_task','claim_task','checkpoint_task','request_input','complete_task','fail_task','ack_cancel','notify_owner'].sort());
+    assert.deepEqual(tools.map((t:any)=>t.name).sort(),['list_tasks','get_task','claim_task','checkpoint_task','request_input','complete_task','fail_task','ack_cancel','notify_owner','dots_chat_send','dots_chat_status'].sort());
     assert.ok(tools.find((t:any)=>t.name==='fail_task').inputSchema.required.includes('input_revision'));
     const catalog=(await f.rpc('events/list')).body.result.events;assert.equal(catalog.length,1);assert.equal(catalog[0].inputSchema.properties.queue.const,'tasks');assert.equal(catalog[0].payloadSchema.properties.queue.const,'tasks');
     for(const route of ['mcp/dot','mcp/dot?bypass=1','mcp/dot?','control/dots_status','control/dots_status?bypass=1']) {
@@ -402,7 +582,10 @@ test('production modern worker advertises its nine tools/tasks Events and authen
 test('actual stdio caller submits text, binds a saved answer, resumes the same task and distinguishes retrieval/ACK/acceptance',async()=>{
   const f=await fixture(),caller=stdio(f.dir);try {
     await caller.initialize();const tools=(await caller.call('tools/list')).result.tools;
-    assert.deepEqual(tools.map((t:any)=>t.name).sort(),['dots_submit','dots_list','dots_get','dots_wait','dots_message','dots_followup','dots_cancel','dots_status','dots_ack_result'].sort());
+    assert.deepEqual(tools.map((t:any)=>t.name).sort(),Object.keys(callerSchemas).sort());
+    for(const name of ['dots_submit','dots_list','dots_get','dots_wait','dots_message','dots_followup','dots_cancel','dots_status','dots_ack_result']) assert.ok(tools.some((tool:any)=>tool.name===name));
+    assert.equal(tools.find((t:any)=>t.name==='codex_get_context').annotations.readOnlyHint,true);
+    assert.equal(tools.find((t:any)=>t.name==='codex_forget_context').annotations.destructiveHint,true);
     assert.equal(tools.find((t:any)=>t.name==='dots_wait').inputSchema.properties.timeout_seconds.maximum,20);
     const submission={idempotency_key:'actual-text',title:'Summarize supplied text',input:{text:'A blue box holds two synthetic items.',links:[{url:'https://example.com/reference',label:'reference only'}]},logical_session_id:'synthetic-session'};
     const task=await caller.tool('dots_submit',submission);assert.equal((await caller.tool('dots_submit',submission)).task_id,task.task_id);

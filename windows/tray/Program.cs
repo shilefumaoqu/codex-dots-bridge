@@ -136,6 +136,7 @@ namespace CodexDotsBridge.Tray
             b.AppendLine("状态: " + (effectiveTitle ?? Title)); b.AppendLine("本机服务: " + Service); b.AppendLine("云端连接: " + Cloud); b.AppendLine("Dot 订阅: " + Dot);
             b.AppendLine("登录自启: " + Autostart); b.AppendLine("检查时间: " + (CheckedAt.HasValue ? CheckedAt.Value.ToString("o") : "未取得"));
             b.AppendLine("错误码: " + (Error ?? "无")); b.AppendLine("在途任务数: " + (Inflight.HasValue ? Inflight.Value.ToString(CultureInfo.InvariantCulture) : "未取得"));
+            b.AppendLine("状态说明: " + Reason);
             foreach (string key in CountKeys) if (Counts.ContainsKey(key)) b.AppendLine("任务 " + key + ": " + Counts[key].ToString(CultureInfo.InvariantCulture));
             b.Append("连接状态不证明任务或消息已成功。" ); return b.ToString();
         }
@@ -259,7 +260,8 @@ namespace CodexDotsBridge.Tray
             try { Snapshot.Parse(injected); } catch (FormatException) { refused = true; } check(refused);
             string stale = Example("ready", "green", "stop", "enabled", "0.2.0-alpha.20", 0).Replace(DateTimeOffset.UtcNow.ToString("yyyy-MM-dd"), "2000-01-01"); refused = false;
             try { Snapshot.Parse(stale); } catch (FormatException) { refused = true; } check(refused);
-            string diagnostics = stopped.Diagnostics("0.2.0-alpha.20"); check(!diagnostics.Contains("C:\\")); check(!diagnostics.Contains("task_id"));
+            stopped.Reason = "最近启动记录：supervisor_recovery_recovery_probe_failed";
+            string diagnostics = stopped.Diagnostics("0.2.0-alpha.20"); check(!diagnostics.Contains("C:\\")); check(!diagnostics.Contains("task_id")); check(diagnostics.Contains(stopped.Reason));
             Console.WriteLine(new JavaScriptSerializer().Serialize(new { passed = n, backend_calls = 0 })); return 0;
         }
         static string Example(string state, string tone, string control, string autostart, string serviceVersion, int? inflight)
@@ -271,7 +273,7 @@ namespace CodexDotsBridge.Tray
     internal sealed class TrayContext : ApplicationContext
     {
         readonly BridgeForm form;
-        public TrayContext(BridgeForm f, bool show) { form = f; f.Exiting += delegate { ExitThread(); }; IntPtr unused = f.Handle; f.Initialize(); if (show) f.OpenWindow(); }
+        public TrayContext(BridgeForm f, bool show) { form = f; f.Disposed += delegate { ExitThread(); }; f.Exiting += delegate { ExitThread(); }; IntPtr unused = f.Handle; f.Initialize(); if (show) f.OpenWindow(); }
         protected override void ExitThreadCore() { form.Shutdown(); base.ExitThreadCore(); }
     }
 
@@ -288,10 +290,11 @@ namespace CodexDotsBridge.Tray
         readonly StatusBadge statusBadge = new StatusBadge(); readonly RoundedPanel components = new RoundedPanel(); readonly TableLayoutPanel header = new TableLayoutPanel();
         readonly ToolStripMenuItem controlItem = new ToolStripMenuItem(), autoItem = new ToolStripMenuItem();
         readonly TableLayoutPanel outer = new TableLayoutPanel(), footer = new TableLayoutPanel();
-        Snapshot state = new Snapshot(); Image brand; Icon currentIcon; bool checking, queuedRefresh, commandBusy, shuttingDown, initialized, dark;
+        Snapshot state = new Snapshot(); Image brand; Icon currentIcon; bool checking, queuedRefresh, refreshFollowup, commandBusy, shuttingDown, initialized, dark;
+        Task refreshTask;
         string pendingControl, pendingAutostart, actionNote, iconTone; DateTime lastCheck = DateTime.MinValue;
         float presentationScale = 1F;
-        bool presentationFontsInitialized;
+        bool presentationFontsInitialized, layoutDirty = true;
         readonly List<PresentationToken> presentationTokens = new List<PresentationToken>();
         readonly List<Font> originalPresentationFonts = new List<Font>();
         List<Font> currentPresentationFonts = new List<Font>();
@@ -317,11 +320,11 @@ namespace CodexDotsBridge.Tray
             menu.Items.Add(new ToolStripSeparator()); menu.Items.Add("退出托盘", null, delegate { ExitTray(); });
             menu.Font = new Font("Microsoft YaHei UI", 9.5F); menu.Padding = new Padding(6); foreach (ToolStripItem item in menu.Items) if (!(item is ToolStripSeparator)) item.Padding = new Padding(6, 5, 12, 5);
             tray.ContextMenuStrip = menu; tray.MouseClick += delegate(object sender, MouseEventArgs e) { if (e.Button == MouseButtons.Left) OpenWindow(); };
-            poll.Interval = 1000; poll.Tick += async delegate { if ((DateTime.UtcNow - lastCheck).TotalSeconds >= (Visible ? 5 : 15)) await RefreshState(); };
+            poll.Interval = 1000; poll.Tick += async delegate { if ((DateTime.UtcNow - lastCheck).TotalSeconds >= (Visible ? 5 : 15)) await RefreshState(false); };
             SystemEvents.PowerModeChanged += PowerChanged; SystemEvents.UserPreferenceChanged += PreferenceChanged;
             FormClosing += delegate(object sender, FormClosingEventArgs e)
             {
-                if (!shuttingDown && e.CloseReason == CloseReason.UserClosing) { e.Cancel = true; Hide(); }
+                if (!shuttingDown && (e.CloseReason == CloseReason.UserClosing || e.CloseReason == CloseReason.TaskManagerClosing)) { e.Cancel = true; Hide(); }
                 else if (!shuttingDown && e.CloseReason == CloseReason.WindowsShutDown) { Shutdown(); EventHandler handler = Exiting; if (handler != null) handler(this, EventArgs.Empty); }
             };
             Shown += delegate { if (options.Preview && options.Screenshot != null) SavePreview(); };
@@ -394,7 +397,7 @@ namespace CodexDotsBridge.Tray
             }
             showWait = ThreadPool.RegisterWaitForSingleObject(showEvent, delegate { Dispatch(OpenWindow); }, null, Timeout.Infinite, false);
             exitWait = ThreadPool.RegisterWaitForSingleObject(exitEvent, delegate { Dispatch(ExitTray); }, null, Timeout.Infinite, false);
-            tray.Visible = true; poll.Start(); BeginInvoke(new Action(async delegate { await RefreshState(); }));
+            tray.Visible = true; poll.Start(); BeginInvoke(new Action(async delegate { await RefreshState(false); }));
         }
         protected override void OnLoad(EventArgs e) { base.OnLoad(e); Initialize(); }
         protected override void OnHandleCreated(EventArgs e) { base.OnHandleCreated(e); if (options != null) ApplyTheme(); }
@@ -403,7 +406,7 @@ namespace CodexDotsBridge.Tray
         {
             if (shuttingDown) return;
             Show(); if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal; Activate(); BringToFront();
-            if (!options.Preview) { if ((DateTime.UtcNow - lastCheck).TotalSeconds > 45) { state = Snapshot.Unknown(state, "stale_status"); Render(); } BeginInvoke(new Action(async delegate { await RefreshState(); })); }
+            if (!options.Preview) { if ((DateTime.UtcNow - lastCheck).TotalSeconds > 45) { state = Snapshot.Unknown(state, "stale_status"); Render(); } BeginInvoke(new Action(async delegate { await RefreshState(false); })); }
         }
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData) { if (keyData == Keys.Escape) { Hide(); return true; } return base.ProcessCmdKey(ref msg, keyData); }
         protected override void WndProc(ref Message m)
@@ -415,6 +418,7 @@ namespace CodexDotsBridge.Tray
         void ScalePresentation(float next)
         {
             if (shuttingDown || next < 0.75F || next > 4F || (presentationFontsInitialized && Math.Abs(next - presentationScale) < 0.01F)) return;
+            layoutDirty = true;
             presentationScale = next; List<Font> fonts = new List<Font>(); SuspendLayout();
             try
             {
@@ -471,40 +475,67 @@ namespace CodexDotsBridge.Tray
             if (e.Mode == PowerModes.Resume) Dispatch(delegate { generation++; state = Snapshot.Unknown(state, "resume_recheck"); state.Title = "正在检查"; state.Reason = "系统已恢复，正在重新检查。"; lastCheck = DateTime.MinValue; Render(); BeginInvoke(new Action(async delegate { await RefreshState(); })); });
         }
         void PreferenceChanged(object sender, UserPreferenceChangedEventArgs e) { Dispatch(delegate { ApplyTheme(); Render(); }); }
-        async Task RefreshState()
+        Task RefreshState(bool queueIfChecking = true)
         {
-            if (shuttingDown) return;
-            if (options.Preview) { Render(); return; }
-            if (checking) { queuedRefresh = true; return; }
-            if (commandBusy) return;
-            checking = true; int checkGeneration = generation; lastCheck = DateTime.UtcNow;
-            refresh.Enabled = control.Enabled = controlItem.Enabled = autoItem.Enabled = false;
+            if (shuttingDown) return Task.FromResult(0);
+            if (options.Preview) { Render(); return Task.FromResult(0); }
+            if (checking)
+            {
+                // A manual burst adds at most one follow-up. Timer ticks add none.
+                if (queueIfChecking && !refreshFollowup && !commandBusy) queuedRefresh = true;
+                return refreshTask;
+            }
+            if (commandBusy) return Task.FromResult(0);
+            checking = true; refreshFollowup = queuedRefresh = false;
+            refreshTask = ReadState(); return refreshTask;
+        }
+        async Task ReadState()
+        {
             try
             {
-                CommandResult result = await cli.Run("status --tray", 5500, true);
-                if (shuttingDown) return;
-                if (generation != checkGeneration) { queuedRefresh = true; return; }
-                if (result.Error != null) state = Snapshot.Unknown(state, result.Error);
-                else
+                do
                 {
-                    try { state = Snapshot.Parse(result.Output); state.CheckVersions(Program.Version); }
-                    catch { state = Snapshot.Unknown(state, "invalid_projection"); }
-                }
-                if (pendingControl == "stop" && state.Control == "start" && (state.State == "stopped" || state.State == "failed")) { pendingControl = null; actionNote = null; }
-                if (pendingControl == "start" && (state.Control == "stop" || state.Tone == "red")) { pendingControl = null; actionNote = null; }
-                if (pendingAutostart != null && state.Autostart == pendingAutostart) { pendingAutostart = null; actionNote = null; }
-                Render();
+                    int checkGeneration = generation; lastCheck = DateTime.UtcNow;
+                    CommandResult result = await cli.Run("status --tray", 5500, true);
+                    if (shuttingDown) return;
+                    if (generation != checkGeneration) queuedRefresh = true;
+                    else
+                    {
+                        if (result.Error != null) state = Snapshot.Unknown(state, result.Error);
+                        else
+                        {
+                            try { state = Snapshot.Parse(result.Output); state.CheckVersions(Program.Version); }
+                            catch { state = Snapshot.Unknown(state, "invalid_projection"); }
+                        }
+                        if (pendingControl == "stop" && state.Control == "start" && (state.State == "stopped" || state.State == "failed")) { pendingControl = null; actionNote = null; }
+                        if (pendingControl == "start" && (state.Control == "stop" || state.Tone == "red")) { pendingControl = null; actionNote = null; }
+                        if (pendingAutostart != null && state.Autostart == pendingAutostart) { pendingAutostart = null; actionNote = null; }
+                    }
+                    lastCheck = DateTime.UtcNow; Render();
+                    if (!queuedRefresh || refreshFollowup) break;
+                    queuedRefresh = false; refreshFollowup = true;
+                } while (!shuttingDown);
             }
-            finally { checking = false; lastCheck = DateTime.UtcNow; if (!shuttingDown) { Render(); if (queuedRefresh) { queuedRefresh = false; BeginInvoke(new Action(async delegate { await RefreshState(); })); } } }
+            finally { checking = queuedRefresh = refreshFollowup = false; refreshTask = null; }
+        }
+        bool VersionsMatch
+        {
+            get { return Program.Version != null && state.InstalledVersion == Program.Version && (state.ServiceVersion == null || state.ServiceVersion == Program.Version); }
         }
         async Task ChangeService()
         {
-            if (options.Preview || commandBusy || checking || pendingControl != null || state.Control == "disabled") return;
+            if (options.Preview || shuttingDown || commandBusy || pendingControl != null || state.Control == "disabled" || !VersionsMatch) return;
             string action = state.Control;
+            // Reserve this intent before awaiting; never reverse a click after the state changes.
+            commandBusy = true; Render();
+            Task activeCheck = refreshTask; if (activeCheck != null) await activeCheck;
+            if (shuttingDown) return;
+            if (state.Control != action || !VersionsMatch || (DateTime.UtcNow - lastCheck).TotalSeconds > 45)
+            { commandBusy = false; actionNote = "状态已更新，请核对后重试。"; Render(); return; }
             if (action == "stop" && (!state.Inflight.HasValue || state.Inflight.Value > 0))
             {
                 string fact = state.Inflight.HasValue ? "当前有 " + state.Inflight.Value + " 项在途任务。" : "当前在途任务数量未能确认。";
-                if (MessageBox.Show(this, fact + "\r\n停止后台会中断本机连接，云端 Dot 执行可能继续。\r\n确认停止后台？", "Codex Dots Bridge", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK) return;
+                if (MessageBox.Show(this, fact + "\r\n停止后台会中断本机连接，云端 Dot 执行可能继续。\r\n确认停止后台？", "Codex Dots Bridge", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.OK) { commandBusy = false; Render(); return; }
             }
             commandBusy = true; pendingControl = action; actionNote = null; generation++; Render();
             CommandResult result = await cli.Run("run --" + action, 30000, false);
@@ -512,12 +543,17 @@ namespace CodexDotsBridge.Tray
             commandBusy = false;
             if (result.TimedOut) actionNote = action == "stop" ? "停止尚未确认；请刷新核对，不会强行结束后台。" : "启动尚未确认；请刷新核对。";
             else if (result.Error != null) { pendingControl = null; state = Snapshot.Unknown(state, result.Error); actionNote = action == "stop" ? "停止操作未完成，请刷新核对。" : "启动操作未完成，请刷新核对。"; }
-            Render(); await RefreshState();
+            await RefreshState();
         }
         async Task ChangeAutostart()
         {
-            if (options.Preview || commandBusy || checking || pendingAutostart != null || state.Autostart == "unknown") return;
-            string target = state.Autostart == "enabled" ? "disabled" : "enabled";
+            if (options.Preview || shuttingDown || commandBusy || pendingAutostart != null || state.Autostart == "unknown" || !VersionsMatch) return;
+            string previous = state.Autostart, target = previous == "enabled" ? "disabled" : "enabled";
+            commandBusy = true; Render();
+            Task activeCheck = refreshTask; if (activeCheck != null) await activeCheck;
+            if (shuttingDown) return;
+            if (state.Autostart != previous || !VersionsMatch || (DateTime.UtcNow - lastCheck).TotalSeconds > 45)
+            { commandBusy = false; actionNote = "状态已更新，请核对后重试。"; Render(); return; }
             commandBusy = true; pendingAutostart = target; generation++; actionNote = "正在保存登录自启设置；当前后台运行状态保持不变。"; Render();
             CommandResult result = await cli.Run("setup --autostart-state " + target, 30000, false);
             if (shuttingDown) return;
@@ -537,23 +573,30 @@ namespace CodexDotsBridge.Tray
         void Render()
         {
             string title = EffectiveTitle, tone = EffectiveTone;
-            heading.Text = title; heading.ForeColor = ForeColor; statusBadge.Tone = tone; statusBadge.StatusColor = ToneColor(tone); statusBadge.Invalidate();
+            bool layoutChanged = layoutDirty || heading.Text != title || reason.Text != (actionNote ?? state.Reason) || service.Text != state.Service || cloud.Text != state.Cloud || dot.Text != state.Dot;
+            heading.Text = title; heading.ForeColor = ForeColor;
+            Color statusColor = ToneColor(tone);
+            if (statusBadge.Tone != tone || statusBadge.StatusColor != statusColor) { statusBadge.Tone = tone; statusBadge.StatusColor = statusColor; statusBadge.Invalidate(); }
             reason.Text = actionNote ?? state.Reason; reason.Visible = reason.Text.Length > 0;
             service.Text = state.Service; cloud.Text = state.Cloud; dot.Text = state.Dot;
             string button = state.Control == "start" ? "启动后台" : "停止后台";
             if (pendingControl == "start") button = "正在启动"; else if (pendingControl == "stop") button = "正在停止";
-            control.Text = controlItem.Text = button; control.Enabled = controlItem.Enabled = !options.Preview && !commandBusy && !checking && pendingControl == null && state.Control != "disabled";
-            refresh.Enabled = !checking && !commandBusy; autoItem.Enabled = !options.Preview && !checking && !commandBusy && pendingAutostart == null && state.Autostart != "unknown";
+            control.Text = controlItem.Text = button; control.Enabled = controlItem.Enabled = !options.Preview && !commandBusy && pendingControl == null && state.Control != "disabled" && VersionsMatch;
+            refresh.Enabled = !commandBusy; autoItem.Enabled = !options.Preview && !commandBusy && pendingAutostart == null && state.Autostart != "unknown" && VersionsMatch;
             autoItem.Text = state.Autostart == "unknown" ? "登录 Windows 后自动启动（未确认）" : "登录 Windows 后自动启动";
             autoItem.CheckState = state.Autostart == "enabled" ? CheckState.Checked : state.Autostart == "unknown" ? CheckState.Indeterminate : CheckState.Unchecked;
+            string oldAutostart = autostart.Text, oldVersions = versions.Text;
             autostart.Text = "登录自启：" + (state.Autostart == "enabled" ? "已开启" : state.Autostart == "disabled" ? "未开启" : "未能确认");
             bool same = Program.Version != null && state.InstalledVersion == Program.Version && (state.ServiceVersion == null || state.ServiceVersion == Program.Version);
             versions.Text = same ? "版本 " + Program.Version + (state.ServiceVersion == null ? " · 后台未取得" : "") : "界面 " + (Program.Version ?? "未取得") + "\n安装 " + (state.InstalledVersion ?? "未取得") + " · 后台 " + (state.ServiceVersion ?? "未取得");
             checkedAt.Text = state.CheckedAt.HasValue ? (state.State == "unknown" ? "上次检查 " : "检查于 ") + state.CheckedAt.Value.ToLocalTime().ToString("HH:mm:ss") : "尚未取得检查时间";
             UpdateIcon(tone); string tip = "Codex Dots Bridge · " + title + " · " + (Program.Version ?? "版本未取得"); tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
+            layoutChanged |= oldAutostart != autostart.Text || oldVersions != versions.Text;
+            if (!layoutChanged) return;
             versions.MaximumSize = new Size(Math.Max(100, ClientSize.Width - outer.Padding.Horizontal - Padding.Horizontal), 0);
             footer.Height = footer.Padding.Vertical + versions.PreferredSize.Height + versions.Margin.Vertical + autostart.PreferredSize.Height + autostart.Margin.Vertical + Math.Max(checkedAt.PreferredSize.Height, copy.PreferredSize.Height);
-            outer.PerformLayout(); int height = outer.GetPreferredSize(new Size(ClientSize.Width - Padding.Horizontal, 0)).Height + Padding.Vertical; if (ClientSize.Height != height) ClientSize = new Size(ClientSize.Width, height); Invalidate();
+            outer.PerformLayout(); int height = outer.GetPreferredSize(new Size(ClientSize.Width - Padding.Horizontal, 0)).Height + Padding.Vertical; if (ClientSize.Height != height) ClientSize = new Size(ClientSize.Width, height);
+            layoutDirty = false;
         }
         Color ToneColor(string tone)
         {
@@ -582,6 +625,7 @@ namespace CodexDotsBridge.Tray
         }
         void ApplyTheme()
         {
+            layoutDirty = true;
             iconTone = null;
             dark = options.Theme == "dark";
             if (options.Theme == "auto" && !SystemInformation.HighContrast) try { using (RegistryKey k = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")) { object v = k == null ? null : k.GetValue("AppsUseLightTheme"); dark = v is int && (int)v == 0; } } catch { }

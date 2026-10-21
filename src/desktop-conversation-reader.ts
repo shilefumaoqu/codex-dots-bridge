@@ -12,7 +12,7 @@ const object = (value: unknown): value is Record<string, any> => !!value && type
 export interface NativeReadInput { threadId: string; codexHome: string; signal: AbortSignal; deadline: number }
 export interface NativeStoredHistory { title?: string; context_json: string; source_complete: false; verification: 'native_stored_history'; history_source: 'codex_app_server'; stored_history_complete: true }
 export type ReaderChild = Pick<ChildProcess, 'on' | 'once' | 'removeListener' | 'kill' | 'exitCode' | 'signalCode'> & { stdin: Writable; stdout: Readable };
-export interface NativeReaderTesting { command?: string; spawn?: (command: string, args: string[], options: { env: NodeJS.ProcessEnv; windowsHide: boolean; shell: false; stdio: ['pipe', 'pipe', 'ignore'] }) => ReaderChild }
+export interface NativeReaderTesting { command?: string; now?: () => number; spawn?: (command: string, args: string[], options: { env: NodeJS.ProcessEnv; windowsHide: boolean; shell: false; stdio: ['pipe', 'pipe', 'ignore'] }) => ReaderChild }
 
 function localPath(value: string): string {
   const path = normalizeConversationPath(value);
@@ -41,8 +41,14 @@ export function findConversationReaderCommand(): string {
   const path = localPath(command); if (!path.toLowerCase().endsWith('.exe') || !lstatSync(path).isFile()) fail('native_reader_unavailable'); return path;
 }
 
-/** Separate read-only app-server session. No owner discovery, resume, turn, or tool execution. */
-export async function readNativeStoredHistory(input: NativeReadInput, testing: NativeReaderTesting = {}): Promise<NativeStoredHistory> {
+export interface NativeReadSession {
+  home: string;
+  request(method: 'thread/read' | 'thread/turns/list' | 'thread/items/list', params: object): Promise<any>;
+  check(): void;
+  receivedBytes(): number;
+}
+/** Shared strictly read-only transport; it never loads or resumes an owner thread. */
+export async function withNativeReadSession<T>(input: NativeReadInput, action: (session: NativeReadSession) => Promise<T>, testing: NativeReaderTesting = {}): Promise<T> {
   let terminal: Error | undefined;
   const deadline = Math.min(input.deadline, Date.now() + 60000);
   const check = () => { if (input.signal.aborted) fail('closed'); if (Date.now() >= deadline) fail('timeout'); if (terminal) throw terminal; };
@@ -88,7 +94,8 @@ export async function readNativeStoredHistory(input: NativeReadInput, testing: N
   child.stdout.on('data', onData); child.stdout.on('error', onError); child.on('error', onError); child.on('close', onClose); child.stdin.on('error', onError);
   input.signal.addEventListener('abort', abort, { once: true });
   if (input.signal.aborted) abort();
-  const request = (method: 'initialize' | 'thread/read' | 'thread/turns/list', params: object) => {
+  const request = (method: 'initialize' | 'thread/read' | 'thread/turns/list' | 'thread/items/list', params: object) => {
+    if (!['initialize', 'thread/read', 'thread/turns/list', 'thread/items/list'].includes(method)) fail('native_reader_method_forbidden');
     check(); if (terminal) return Promise.reject(terminal); const id = ++nextId;
     return new Promise<any>((resolve, reject) => {
       pending.set(id, { resolve, reject });
@@ -99,6 +106,22 @@ export async function readNativeStoredHistory(input: NativeReadInput, testing: N
     const initialized = await request('initialize', { clientInfo: { name: 'codex-dots-bridge-readonly', version: '1' }, capabilities: { experimentalApi: true } });
     if (!object(initialized)) fail('native_reader_protocol_invalid'); check();
     child.stdin.write(JSON.stringify({ method: 'initialized' }) + '\n');
+    return await action({ home, request, check, receivedBytes: () => received });
+  } finally {
+    clearTimeout(timer); input.signal.removeEventListener('abort', abort); terminate('closed'); parts = []; partBytes = 0;
+    child.stdout.removeListener('data', onData);
+    const closed = new Promise<void>(resolve => { if (stopped) resolve(); else child.once('close', () => resolve()); });
+    child.stdin.destroy(); child.stdout.destroy(); if (!stopped) child.kill();
+    let cleanup: NodeJS.Timeout | undefined;
+    try { await Promise.race([closed, new Promise<void>(resolve => { cleanup = setTimeout(resolve, 500); })]); } finally { if (cleanup) clearTimeout(cleanup); }
+    child.removeListener('error', onError); child.removeListener('close', onClose); child.stdin.removeListener('error', onError); child.stdout.removeListener('error', onError);
+    if (!stopped) fail('native_reader_cleanup_failed');
+  }
+}
+
+/** Legacy full-history contract is unchanged; new context readers project separately. */
+export async function readNativeStoredHistory(input: NativeReadInput, testing: NativeReaderTesting = {}): Promise<NativeStoredHistory> {
+  return withNativeReadSession(input, async ({ request, check }) => {
     const metadata = await request('thread/read', { threadId: input.threadId, includeTurns: false }); check();
     if (!object(metadata) || !object(metadata.thread) || metadata.thread.id !== input.threadId || !Array.isArray(metadata.thread.turns) || metadata.thread.turns.length) fail('native_reader_identity_invalid');
     const thread = metadata.thread, turns: Record<string, any>[] = [], cursors = new Set<string>(), ids = new Set<string>();
@@ -119,14 +142,5 @@ export async function readNativeStoredHistory(input: NativeReadInput, testing: N
     if (Buffer.byteLength(context_json, 'utf8') > MAX_BYTES) fail('context_too_large'); check();
     return { verification: 'native_stored_history', history_source: 'codex_app_server', stored_history_complete: true, source_complete: false, context_json,
       ...(typeof thread.name === 'string' && thread.name.length > 0 && thread.name.length <= 512 ? { title: thread.name } : {}) };
-  } finally {
-    clearTimeout(timer); input.signal.removeEventListener('abort', abort); terminate('closed'); parts = []; partBytes = 0;
-    child.stdout.removeListener('data', onData);
-    const closed = new Promise<void>(resolve => { if (stopped) resolve(); else child.once('close', () => resolve()); });
-    child.stdin.destroy(); child.stdout.destroy(); if (!stopped) child.kill();
-    let cleanup: NodeJS.Timeout | undefined;
-    try { await Promise.race([closed, new Promise<void>(resolve => { cleanup = setTimeout(resolve, 500); })]); } finally { if (cleanup) clearTimeout(cleanup); }
-    child.removeListener('error', onError); child.removeListener('close', onClose); child.stdin.removeListener('error', onError); child.stdout.removeListener('error', onError);
-    if (!stopped) fail('native_reader_cleanup_failed');
-  }
+  }, testing);
 }

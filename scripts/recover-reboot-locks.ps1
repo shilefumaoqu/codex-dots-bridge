@@ -2,6 +2,26 @@ param([string]$DataDir)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# CodeDom must use the current user's known folder, even when the launcher
+# inherited the machine TEMP. Never change the user or machine environment.
+function Set-DotsUserCompilationTemp {
+    try {
+        $local = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+        if (-not $local -or -not [IO.Path]::IsPathRooted($local)) { throw 'invalid_temp' }
+        $directory = [IO.Path]::GetFullPath([IO.Path]::Combine($local,'Temp'))
+        if (-not [IO.Directory]::Exists($directory)) { throw 'invalid_temp' }
+        for ($cursor=$directory; $cursor; $cursor=[IO.Path]::GetDirectoryName($cursor)) {
+            if (([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'invalid_temp' }
+        }
+        $user = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $owner = [IO.Directory]::GetAccessControl($directory).GetOwner([Security.Principal.SecurityIdentifier]).Value
+        if ($owner -notin @($user,'S-1-5-18')) { throw 'invalid_temp' }
+        $env:TEMP=$directory; $env:TMP=$directory
+        return $directory
+    } catch { throw 'recovery_probe_failed' }
+}
+$null = Set-DotsUserCompilationTemp
+
 # Metadata is read as a short-lived snapshot; no metadata handle spans a CIM or
 # network probe. Lock handles permit readers but prevent writes/replacement.
 # Deletion targets the exact opened old lock.
@@ -93,16 +113,20 @@ function Get-DotsBootUtc {
 function Get-DotsProcesses {
     return @(Get-CimInstance -ClassName Win32_Process -Property ProcessId,Name,CommandLine,CreationDate -ErrorAction Stop)
 }
-function Get-DotsProcessInfo([int]$ProcessNumber) {
-    return @(Get-CimInstance -ClassName Win32_Process -Filter "ProcessId=$ProcessNumber" -Property ProcessId,Name,CommandLine,CreationDate -ErrorAction Stop)
+function Get-DotsProcessInfos([int[]]$ProcessNumbers) {
+    $numbers = @($ProcessNumbers | Sort-Object -Unique)
+    if ($numbers.Count -eq 0) { return @() }
+    foreach ($number in $numbers) { if ($number -le 0) { throw 'invalid_pid' } }
+    $filter = ($numbers | ForEach-Object { 'ProcessId='+$_ }) -join ' OR '
+    return @(Get-CimInstance -ClassName Win32_Process -Filter $filter -Property ProcessId,Name,CommandLine,CreationDate -ErrorAction Stop)
 }
-function Test-DotsSameDataProcess($Processes, [string]$Directory, $Config) {
+function Test-DotsSameDataProcess($Processes, [string]$Directory, $Config, $Refreshed) {
     foreach ($processInfo in $Processes) {
         if ($processInfo.ProcessId -eq $PID) { continue }
         if ([string]::IsNullOrWhiteSpace($processInfo.CommandLine) -and $processInfo.Name -match '^(node|codex-dots-bridge)(\.exe)?$') {
             # CIM can retain an already-exited process in its initial snapshot.
             # Refresh this PID once; a reused PID is assessed as its current entry.
-            $current = @(Get-DotsProcessInfo $processInfo.ProcessId)
+            $current = @($Refreshed | Where-Object { $_.ProcessId -eq $processInfo.ProcessId })
             if ($current.Count -eq 0) { continue }
             if ($current.Count -ne 1 -or $current[0].ProcessId -ne $processInfo.ProcessId) { throw 'unknown_process_command' }
             $processInfo = $current[0]
@@ -155,20 +179,51 @@ function Assert-DotsIdentity($Record) {
     if (-not [Guid]::TryParse([string]$Record.owner,[ref]$parsed) -or $parsed -eq [Guid]::Empty) { throw 'invalid_owner' }
     if ($Record.pid -isnot [ValueType] -or $Record.pid -le 0 -or $Record.pid -gt [int]::MaxValue -or [Math]::Truncate([double]$Record.pid) -ne $Record.pid) { throw 'invalid_pid' }
 }
-function Assert-DotsRecordedProcessesGone($State, [DateTime]$StateWriteUtc) {
-    # A numeric PID is not an identity. For same-boot recovery an extant PID is
-    # accepted only when CIM proves it was created after this exact old state.
+function Get-DotsRecordedPids($State) {
+    $numbers = [Collections.Generic.List[int]]::new()
     foreach ($field in @('pid','bridge_pid','guardian_pid','tunnel_pid')) {
         $number = $State.$field
         if ($null -eq $number) { continue }
         if ($number -isnot [ValueType] -or $number -le 0 -or $number -gt [int]::MaxValue -or [Math]::Truncate([double]$number) -ne $number) { throw 'invalid_pid' }
-        $current = @(Get-DotsProcessInfo $number)
+        $numbers.Add([int]$number)
+    }
+    return @($numbers | Sort-Object -Unique)
+}
+function Assert-DotsRecordedProcessesGone($State, [DateTime]$StateWriteUtc, $Refreshed) {
+    # A numeric PID is not an identity. For same-boot recovery an extant PID is
+    # accepted only when CIM proves it was created after this exact old state.
+    foreach ($number in @(Get-DotsRecordedPids $State)) {
+        $current = @($Refreshed | Where-Object { $_.ProcessId -eq $number })
         if ($current.Count -eq 0) { continue }
         if ($current.Count -ne 1 -or $current[0].ProcessId -ne $number -or $current[0].CreationDate -isnot [DateTime]) { throw 'recorded_process_unknown' }
         $created = $current[0].CreationDate.ToUniversalTime()
         if ($created -gt [DateTime]::UtcNow.AddSeconds(2)) { throw 'recorded_process_unknown' }
         if ($created -le $StateWriteUtc.AddSeconds(2)) { throw 'recorded_process_active' }
     }
+}
+function Assert-DotsProcessStage([string]$Directory, $Config, $State, [DateTime]$StateWriteUtc, [bool]$CheckRecorded) {
+    # Each stage independently samples all processes, then refreshes the relevant
+    # identities in one new CIM query. Never reuse this result across the lock gate.
+    $processes = @(Get-DotsProcesses)
+    $numbers = [Collections.Generic.List[int]]::new()
+    foreach ($processInfo in $processes) {
+        if ($processInfo.ProcessId -ne $PID -and [string]::IsNullOrWhiteSpace($processInfo.CommandLine) -and $processInfo.Name -match '^(node|codex-dots-bridge)(\.exe)?$') {
+            $number = $processInfo.ProcessId
+            if ($number -isnot [ValueType] -or $number -le 0 -or $number -gt [int]::MaxValue -or [Math]::Truncate([double]$number) -ne $number) { throw 'unknown_process_command' }
+            $numbers.Add([int]$number)
+        }
+    }
+    if ($CheckRecorded) { foreach ($number in @(Get-DotsRecordedPids $State)) { $numbers.Add($number) } }
+    $wanted = @($numbers | Sort-Object -Unique)
+    $refreshed = @(Get-DotsProcessInfos $wanted)
+    $seen = @{}
+    foreach ($processInfo in $refreshed) {
+        $number = $processInfo.ProcessId
+        if ($number -isnot [ValueType] -or $number -le 0 -or $number -gt [int]::MaxValue -or [Math]::Truncate([double]$number) -ne $number -or $wanted -notcontains $number -or $seen.ContainsKey([int]$number)) { throw 'recorded_process_unknown' }
+        $seen[[int]$number] = $true
+    }
+    if (Test-DotsSameDataProcess $processes $Directory $Config $refreshed) { throw 'same_data_process_active' }
+    if ($CheckRecorded) { Assert-DotsRecordedProcessesGone $State $StateWriteUtc $refreshed }
 }
 function Invoke-DotsRebootRecovery([string]$Directory) {
     $result = @{recovered=$false;clearPreviousState=$false;reason='preserved';removed=@()}
@@ -217,8 +272,7 @@ function Invoke-DotsRebootRecovery([string]$Directory) {
         # Live/current-boot instances must retain unrestricted stop/unlink behavior.
         # Do not acquire deletion-blocking lock handles until liveness is excluded.
         if (-not $config.endpoint -or -not (Test-DotsEndpointRefused $config.endpoint)) { throw 'endpoint_active_or_unknown' }
-        if (Test-DotsSameDataProcess (Get-DotsProcesses) $directory $config) { throw 'same_data_process_active' }
-        if (-not $priorBoot) { Assert-DotsRecordedProcessesGone $state $stateFile.WriteUtc }
+        Assert-DotsProcessStage $directory $config $state $stateFile.WriteUtc (-not $priorBoot)
         foreach ($name in @('service.lock','supervisor.lock')) {
             $path = [IO.Path]::Combine($directory,$name)
             if ([IO.File]::Exists($path)) {
@@ -247,8 +301,7 @@ function Invoke-DotsRebootRecovery([string]$Directory) {
             if ($serviceRecord.pid -ne $state.bridge_pid -or $serviceRecord.owner -ceq $state.owner) { throw 'ownership_mismatch' }
         }
         if (-not $config.endpoint -or -not (Test-DotsEndpointRefused $config.endpoint)) { throw 'endpoint_active_or_unknown' }
-        if (Test-DotsSameDataProcess (Get-DotsProcesses) $directory $config) { throw 'same_data_process_active' }
-        if (-not $priorBoot) { Assert-DotsRecordedProcessesGone $state $stateFile.WriteUtc }
+        Assert-DotsProcessStage $directory $config $state $stateFile.WriteUtc (-not $priorBoot)
         # Recheck after the process snapshot while both exact old locks remain held.
         if (-not (Test-DotsEndpointRefused $config.endpoint)) { throw 'endpoint_active_or_unknown' }
         foreach ($name in @('service.lock','supervisor.lock')) {

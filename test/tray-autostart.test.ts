@@ -22,7 +22,7 @@ test('owned autostart enables two hidden independent launches, toggles live with
     const config=readFileSync(join(f.dir,'config.json'),'utf8'),caller=readFileSync(join(f.dir,'caller.key'),'utf8');
     assert.equal(readTrayAutostart(f.dir),'disabled');
     assert.deepEqual(setTrayAutostart(f.dir,true),{schema:1,autostart:'enabled',verified:true});
-    const content=readFileSync(f.path,'utf8');assert.equal(content.match(/shell.Run /g)?.length,2);assert.equal(content.match(/, 0, False/g)?.length,2);assert.ok(content.includes(' run ')||content.includes('""run""'));assert.ok(content.includes('CodexDotsBridge.Tray.exe'));assert.ok(content.includes('--background'));
+    const content=readFileSync(f.path,'utf8');assert.equal(content.match(/shell.Run /g)?.length,2);assert.equal(content.match(/, 0, False/g)?.length,2);assert.ok(content.includes(' run ')||content.includes('""run""'));assert.ok(content.includes('--autostart'));assert.ok(content.includes('CodexDotsBridge.Tray.exe'));assert.ok(content.includes('--background'));
     assert.equal(readTrayAutostart(f.dir),'enabled');assert.deepEqual(setTrayAutostart(f.dir,false),{schema:1,autostart:'disabled',verified:true});
     assert.equal(existsSync(f.path),false);assert.equal(JSON.parse(readFileSync(f.manifestPath,'utf8')).autostart,undefined);
     assert.equal(readFileSync(join(f.dir,'config.json'),'utf8'),config);assert.equal(readFileSync(join(f.dir,'service.lock'),'utf8'),service);assert.equal(readFileSync(join(f.dir,'caller.key'),'utf8'),caller);

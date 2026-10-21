@@ -35,7 +35,7 @@ test('worker discovery and every enabled tool publish the finalized icon without
     const listed = await rpc('tools/list');
     assert.deepEqual(listed.tools.map((tool: any) => tool.name).sort(), [
       ...Object.keys(workerSchemas), 'codex_desktop_echo', 'codex_desktop_echo_status',
-      'codex_read_conversation', 'codex_send_message', 'codex_conversation_status',
+      'codex_read_conversation', 'codex_send_message', 'codex_conversation_status', 'dots_chat_send', 'dots_chat_status',
     ].sort());
     for (const tool of listed.tools) assert.deepEqual(tool.icons, xingduIcons(), tool.name);
     assert.equal(store.status().tasks.length, 0);

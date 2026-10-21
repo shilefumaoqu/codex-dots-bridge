@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, lstatS
 import { join, resolve, dirname, relative, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
+import { type AutostartEntry, type LinkAutostart, startupPath, validateLauncher, inspectStartupLink, prepareStartupLink, verifyAutostart } from './startup-link.js';
 import { execFileSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { initProduction, readProductionConfig, readOwnerNotificationConfig, writeProductionConfig, protectProductionDirectory } from './runtime.js';
@@ -108,8 +109,8 @@ export function restoreData(backup:string,targetDir:string) {
   writeProductionConfig(target,config);protectProductionDirectory(target);
   return {restored_directory:target,instance_id:config.instance_id,mcp_registration:'run_setup_again',dot_binding:'verify_subscription_after_start'};
 }
-export interface InstallOptions {nodePath:string;entryPath:string;skillSource:string;codexHome?:string;codexCommand?:string;autostart?:boolean}
-export interface InstallManifest {owner:'codex-dots-bridge';instance_id:string;codex_home:string;codex_command:string;mcp:{name:string;command:string;args:string[]};mcp_registration?:unknown;skill:{path:string;files:Record<string,string>};autostart?:{path:string;content:string}}
+export interface InstallOptions {nodePath:string;entryPath:string;skillSource:string;codexHome?:string;codexCommand?:string;autostart?:boolean;upgrade?:boolean;startupLauncher?:string;preparedAutostart?:string;preserveAutostart?:boolean}
+export interface InstallManifest {owner:'codex-dots-bridge';instance_id:string;codex_home:string;codex_command:string;mcp:{name:string;command:string;args:string[]};mcp_registration?:unknown;skill:{path:string;files:Record<string,string>};autostart?:AutostartEntry;autostart_launcher?:string}
 export function safePath(path:string) {
   for(let cursor=resolve(path);;cursor=dirname(cursor)){if(existsSync(cursor)&&lstatSync(cursor).isSymbolicLink())throw new ProbeError('symlink_installation_path');if(cursor===dirname(cursor))break;}
 }
@@ -159,7 +160,12 @@ export function readInstall(dir:string):InstallManifest|undefined {
   if(value.mcp.name!=='codex-dots-bridge'||value.skill.path!==join(value.codex_home,'skills','codex-dots-bridge')||value.mcp.args.length!==4||value.mcp.args[1]!=='stdio'||value.mcp.args[2]!=='--data-dir'||value.mcp.args[3]!==resolve(dir))throw new ProbeError('invalid_installation_manifest');
   safePath(value.skill.path);
   for(const name of Object.keys(value.skill.files)) {const path=resolve(value.skill.path,name);if(!path.startsWith(resolve(value.skill.path)+sep))throw new ProbeError('invalid_installation_manifest');}
-  if(value.autostart&&value.autostart.path!==join(process.env.APPDATA??'','Microsoft','Windows','Start Menu','Programs','Startup','CodexDotsBridge.vbs'))throw new ProbeError('invalid_installation_manifest');
+  if(value.autostart_launcher)validateLauncher(value.mcp.args[0]!,value.autostart_launcher);
+  if(value.autostart){
+    if(value.autostart.kind==='startup-link'){
+      if(value.autostart.path!==startupPath()||value.autostart.launcher!==value.autostart_launcher)throw new ProbeError('invalid_installation_manifest');
+    }else if(value.autostart.kind!==undefined&&value.autostart.kind!=='legacy-vbs'||value.autostart.path!==startupPath('legacy'))throw new ProbeError('invalid_installation_manifest');
+  }
   return value;
 }
 export function createAutostartEntry(dir:string,mcp:InstallManifest['mcp'],requireTray=false) {
@@ -171,7 +177,7 @@ export function createAutostartEntry(dir:string,mcp:InstallManifest['mcp'],requi
   if(existsSync(tray))regular(tray);
   const quote=(v:string)=>'"'+v.replaceAll('"','""')+'"';
   const command=(args:string[])=>{if(args.some(arg=>/["%\r\n\0]/.test(arg)))throw new ProbeError('unsafe_autostart_argument');return args.map(v=>'"'+v+'"').join(' ');};
-  const launch=command([mcp.command,mcp.args[0]!,'run','--data-dir',resolve(dir)]);
+  const launch=command([mcp.command,mcp.args[0]!,'run','--autostart','--data-dir',resolve(dir)]);
   const content='Set shell = CreateObject("WScript.Shell")\r\nshell.Run '+quote(launch)+', 0, False\r\n'+
     (existsSync(tray)?'shell.Run '+quote(command([tray,'--data-dir',resolve(dir),'--background']))+', 0, False\r\n':'');
   return {path,content};
@@ -183,18 +189,33 @@ export function installCodex(dir:string,options:InstallOptions) {
   const mcp={name:'codex-dots-bridge',command:resolve(options.nodePath),args:[resolve(options.entryPath),'stdio','--data-dir',resolve(dir)]};
   regular(mcp.command);regular(mcp.args[0]!);const skillFiles=tree(resolve(options.skillSource)),skillPath=join(home,'skills','codex-dots-bridge');
   if(!skillFiles['SKILL.md'])throw new ProbeError('skill_source_missing');
-  if(previous&&(previous.codex_home!==home||previous.codex_command!==command||JSON.stringify(previous.mcp)!==JSON.stringify(mcp)))throw new ProbeError('installation_change_requires_uninstall');
+  const changingRegistration=!!previous&&(previous.codex_command!==command||JSON.stringify(previous.mcp)!==JSON.stringify(mcp));
+  if(previous&&(previous.codex_home!==home||(!options.upgrade&&changingRegistration)))throw new ProbeError('installation_change_requires_uninstall');
   mkdirSync(home,{recursive:true}); // The official CLI requires CODEX_HOME to exist on first installation.
   const existing=mcpEntry(command,home,mcp.name);
   if(existing&&(!previous||!entryMatches(existing,previous.mcp,previous.mcp_registration)))throw new ProbeError('foreign_mcp_collision');
   if(existsSync(skillPath)&&(!previous||!ownedSkill(tree(skillPath),previous.skill.files)))throw new ProbeError('foreign_or_modified_skill_collision');
-  if(previous&&JSON.stringify(skillFiles)!==JSON.stringify(previous.skill.files))throw new ProbeError('skill_upgrade_requires_uninstall');
-  const manifest:InstallManifest={owner:'codex-dots-bridge',instance_id:config.instance_id,codex_home:home,codex_command:command,mcp,mcp_registration:previous?.mcp_registration,skill:{path:skillPath,files:skillFiles}};
-  if(options.autostart) {
+  if(previous&&!options.upgrade&&JSON.stringify(skillFiles)!==JSON.stringify(previous.skill.files))throw new ProbeError('skill_upgrade_requires_uninstall');
+  if(previous?.autostart)verifyAutostart(previous.autostart);
+  const launcher=options.startupLauncher?validateLauncher(mcp.args[0]!,options.startupLauncher):previous?.autostart_launcher;
+  const manifest:InstallManifest={owner:'codex-dots-bridge',instance_id:config.instance_id,codex_home:home,codex_command:command,mcp,mcp_registration:changingRegistration?undefined:previous?.mcp_registration,skill:{path:skillPath,files:skillFiles},...(launcher?{autostart_launcher:launcher}:{})};
+  if(options.preparedAutostart!==undefined) {
+    if(!launcher)throw new ProbeError('startup_launcher_missing');
+    const actual=inspectStartupLink(launcher);
+    if(!actual.exists||!actual.owned||actual.content!==options.preparedAutostart)throw new ProbeError('autostart_preparation_changed');
+    manifest.autostart={kind:'startup-link',path:actual.path,content:actual.content,launcher};
+  } else if(options.autostart&&launcher&&!options.preserveAutostart){
+    const current=inspectStartupLink(launcher);
+    // setup/Connect preserves an existing registration, including Windows disabling it.
+    // Explicit tray re-enabling still uses prepareStartupLink's approval checks.
+    if(previous?.autostart?.kind==='startup-link'&&current.exists&&current.owned&&current.content===previous.autostart.content&&previous.autostart.launcher===launcher)manifest.autostart=previous.autostart;
+    else manifest.autostart=prepareStartupLink(launcher,previous?.autostart);
+  }
+  else if(options.autostart&&!options.preserveAutostart) {
     const {path,content}=createAutostartEntry(dir,mcp);
     manifest.autostart={path,content};
   }else if(previous?.autostart)manifest.autostart=previous.autostart;
-  if(manifest.autostart) {
+  if(manifest.autostart&&manifest.autostart.kind!=='startup-link') {
     safePath(manifest.autostart.path);
     if(existsSync(manifest.autostart.path)) {
       regular(manifest.autostart.path);
@@ -202,18 +223,23 @@ export function installCodex(dir:string,options:InstallOptions) {
     }
   }
   const desiredAutostart=manifest.autostart;
-  const changingAutostart=!!previous?.autostart&&!!desiredAutostart&&previous.autostart.content!==desiredAutostart.content;
+  const changingAutostart=!!previous?.autostart&&!!desiredAutostart&&desiredAutostart.kind!=='startup-link'&&previous.autostart.content!==desiredAutostart.content;
   // Keep the old Startup ownership recoverable until its replacement is written.
   if(changingAutostart)manifest.autostart=previous!.autostart;
+  const previousManifest=previous?readFileSync(join(dir,'installation.json'),'utf8'):undefined;
+  const previousSkill=options.upgrade&&previous?Object.fromEntries(Object.keys(existsSync(skillPath)?tree(skillPath):{}).map(name=>[name,readFileSync(join(skillPath,name))])):undefined;
+  try{
   // Record intent before registrations so a failed step remains recoverable and owns only exact matching content.
   writeFileSync(join(dir,'installation.json'),JSON.stringify(manifest,null,2),{mode:0o600});protectProductionDirectory(dir);
-  if(!existing)runCodex(command,home,['mcp','add',mcp.name,'--',mcp.command,...mcp.args]);
+  if(changingRegistration&&existing)runCodex(command,home,['mcp','remove',mcp.name]);
+  if(!existing||changingRegistration)runCodex(command,home,['mcp','add',mcp.name,'--',mcp.command,...mcp.args]);
   const registered=mcpEntry(command,home,mcp.name);
   if(!entryMatches(registered,mcp))throw new ProbeError('mcp_registration_readback_failed');
   manifest.mcp_registration=registered;writeFileSync(join(dir,'installation.json'),JSON.stringify(manifest,null,2),{mode:0o600});
   mkdirSync(skillPath,{recursive:true});
+  for(const name of Object.keys(previous?.skill.files??{}))if(!(name in skillFiles)&&existsSync(join(skillPath,name)))unlinkSync(join(skillPath,name));
   for(const name of Object.keys(skillFiles)){const path=join(skillPath,name);mkdirSync(dirname(path),{recursive:true});copyFileSync(join(options.skillSource,name),path);}
-  if(desiredAutostart) {
+  if(desiredAutostart&&desiredAutostart.kind!=='startup-link'&&!options.preserveAutostart) {
     mkdirSync(dirname(desiredAutostart.path),{recursive:true});
     if(changingAutostart) {
       const manifestPath=join(dir,'installation.json'),oldManifest=readFileSync(manifestPath,'utf8');
@@ -230,9 +256,28 @@ export function installCodex(dir:string,options:InstallOptions) {
         }catch{throw new ProbeError('autostart_rollback_incomplete');}
         throw error;
       }
-    } else writeFileSync(desiredAutostart.path,desiredAutostart.content);
+    } else if(!existsSync(desiredAutostart.path)||readFileSync(desiredAutostart.path,'utf8')!==desiredAutostart.content)writeFileSync(desiredAutostart.path,desiredAutostart.content,{flag:existsSync(desiredAutostart.path)?'w':'wx'});
   }
   return {mcp:'registered',skill:'installed',autostart:!!manifest.autostart,codex_tools:'pending_restart_or_new_chat_and_real_call'};
+  }catch(error){
+    if(options.upgrade&&previous&&previousManifest!==undefined&&previousSkill){
+      try{
+        const actual=mcpEntry(command,home,mcp.name);
+        if(actual&&!entryMatches(actual,mcp)&&!entryMatches(actual,previous.mcp,previous.mcp_registration))throw new ProbeError('foreign_mcp_collision');
+        if(actual&&entryMatches(actual,mcp)&&!entryMatches(actual,previous.mcp,previous.mcp_registration))runCodex(command,home,['mcp','remove',mcp.name]);
+        const remaining=mcpEntry(command,home,mcp.name);
+        if(existing&&!remaining)runCodex(command,home,['mcp','add',previous.mcp.name,'--',previous.mcp.command,...previous.mcp.args]);
+        const now=existsSync(skillPath)?tree(skillPath):{};
+        for(const [name,hash] of Object.entries(now))if(previous.skill.files[name]!==hash&&skillFiles[name]!==hash)throw new ProbeError('foreign_or_modified_skill_collision');
+        for(const name of Object.keys(now))if(!(name in previousSkill))unlinkSync(join(skillPath,name));
+        for(const [name,bytes] of Object.entries(previousSkill)){mkdirSync(dirname(join(skillPath,name)),{recursive:true});writeFileSync(join(skillPath,name),bytes);}
+        const restored={...previous,mcp_registration:existing?mcpEntry(command,home,mcp.name):previous.mcp_registration};
+        // The CLI may normalize its registration snapshot; preserve that exact readback.
+        writeFileSync(join(dir,'installation.json'),JSON.stringify(restored,null,2),{mode:0o600});
+      }catch{throw new ProbeError('registration_rollback_incomplete');}
+    }
+    throw error;
+  }
 }
 export function uninstallCodex(dir:string,codexCommand?:string) {
   assertStopped(dir);const manifest=readInstall(dir);if(!manifest)return {removed:[],retained:['task_data','credentials'],installation:'not_owned'};
@@ -247,7 +292,11 @@ export function uninstallCodex(dir:string,codexCommand?:string) {
       const prune=(path:string)=>{for(const name of readdirSync(path)){const child=join(path,name);if(lstatSync(child).isDirectory())prune(child);}if(!readdirSync(path).length)rmdirSync(path);};prune(manifest.skill.path);removed.push('skill');
     }else retained.push('modified_or_foreign_skill');
   }
-  if(manifest.autostart&&existsSync(manifest.autostart.path)){if(readFileSync(manifest.autostart.path,'utf8')===manifest.autostart.content){unlinkSync(manifest.autostart.path);removed.push('autostart');}else retained.push('modified_or_foreign_autostart');}
+  if(manifest.autostart&&existsSync(manifest.autostart.path)){
+    if(manifest.autostart.kind==='startup-link'){
+      try{verifyAutostart(manifest.autostart);inspectStartupLink(manifest.autostart.launcher,'disable',manifest.autostart.content);removed.push('autostart');}catch{retained.push('modified_or_foreign_autostart');}
+    }else if(readFileSync(manifest.autostart.path,'utf8')===manifest.autostart.content){unlinkSync(manifest.autostart.path);removed.push('autostart');}else retained.push('modified_or_foreign_autostart');
+  }
   if(!retained.some(value=>value.startsWith('modified_')))unlinkSync(join(dir,'installation.json'));
   return {removed,retained};
 }
