@@ -7,18 +7,18 @@
 <p align="center">Hand work to your Dot, follow it in Codex, and retrieve the result.</p>
 
 <p align="center">
-  <a href="README.md">简体中文</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.31">v0.2.0-alpha.31</a> · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.md">简体中文</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">v0.2.0-alpha.32</a> · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.31/Codex-Dots-Bridge-0.2.0-alpha.31-Setup.exe"><strong>Download the Windows installer</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.32/Codex-Dots-Bridge-0.2.0-alpha.32-Setup.exe"><strong>Download the Windows installer</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.31">Windows ZIP, SHA256 files and full release notes</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">Windows ZIP, SHA256 files and full release notes</a>
 </p>
 
-> **Current release: 0.2.0-alpha.31 (experimental prerelease).** Adds Windows connection-refusal recovery, structured startup health and worker tool-result diagnostics. Includes a locally patched Tunnel build, not the unmodified official release; existing tray, history and handoff features are retained. ChatGPT-to-Dot continuous chat has not passed; later natural Events samples also expired without pickup. Read [acceptance and limits](ACCEPTANCE.md). A ready service does not prove a message round trip.
+> **Current release: 0.2.0-alpha.32 (experimental prerelease).** Builds on alpha.31 with deterministic Windows PowerShell built-in module loading, Unicode shortcuts, rollback identity protection and CI release/installer acceptance fixes. Includes a locally patched Tunnel build, not the unmodified official release; existing tray, history and handoff features are retained. ChatGPT-to-Dot continuous chat has not passed; later natural Events samples also expired without pickup. Read [acceptance and limits](ACCEPTANCE.md). A ready service does not prove a message round trip.
 
 Codex Dots Bridge connects Codex to your existing Dot. Delegate a text task, then use the same task ID to follow progress, answer questions, add requirements and retrieve the result.
 

@@ -7,18 +7,18 @@
 <p align="center">把任务交给你的 Dot，在 Codex 中跟进过程并取回结果。</p>
 
 <p align="center">
-  <a href="README.en.md">English</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.31">v0.2.0-alpha.31</a> · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.en.md">English</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">v0.2.0-alpha.32</a> · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.31/Codex-Dots-Bridge-0.2.0-alpha.31-Setup.exe"><strong>下载 Windows 安装程序</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.32/Codex-Dots-Bridge-0.2.0-alpha.32-Setup.exe"><strong>下载 Windows 安装程序</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.31">Windows ZIP、SHA256 校验文件与完整发布说明</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">Windows ZIP、SHA256 校验文件与完整发布说明</a>
 </p>
 
-> **当前发布：0.2.0-alpha.31（实验性预发布）**。新增 Windows 连接拒绝恢复、准确健康状态和接单工具结果诊断，保留已有托盘、完整历史与增量接续功能。配套 Tunnel 为本地修补版，并非官方原版。ChatGPT→Dot 连续聊天仍未通过，原自然 Events 后续也有零领取样本；请先阅读 [本版验收与限制](ACCEPTANCE.md)。程序就绪不等于消息往返成功。
+> **当前发布：0.2.0-alpha.32（实验性预发布）**。在 alpha.31 基线上修复 Windows PowerShell 内置模块加载、Unicode 快捷方式和安装回滚身份校验，并修复发布检查与安装验收的 CI 兼容问题；保留连接拒绝恢复、结果诊断、托盘、完整历史与增量接续功能。配套 Tunnel 为本地修补版，并非官方原版。ChatGPT→Dot 连续聊天仍未通过，原自然 Events 后续也有零领取样本；请先阅读 [本版验收与限制](ACCEPTANCE.md)。程序就绪不等于消息往返成功。
 
 Codex Dots Bridge 是连接 Codex 与你已有 Dot 的协作插件。派出一项文本任务后，可以沿同一任务查看进度、回答澄清、补充要求并取回结果。
 
