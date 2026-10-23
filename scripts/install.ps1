@@ -62,7 +62,8 @@ if (-not $OrganizationId -and $config.tunnel) { $OrganizationId = $config.tunnel
 if (-not $TunnelEnv -and $config.tunnel) { $TunnelEnv = $config.tunnel.key_file }
 if (-not $TunnelClient -and $config.tunnel) { $TunnelClient = $config.tunnel.client_path }
 if (-not $TunnelClient) {
-  foreach ($relative in @('vendor\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe', '.runtime\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe')) {
+  $tunnelPayload=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'tunnel-payload.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  foreach ($relative in @(('vendor/'+$tunnelPayload.directory+'/tunnel-client.exe'),('.runtime/'+$tunnelPayload.directory+'/tunnel-client.exe'))) {
     $candidate = Join-Path $projectRoot $relative
     if (Test-Path -LiteralPath $candidate -PathType Leaf) { $TunnelClient = $candidate; break }
   }

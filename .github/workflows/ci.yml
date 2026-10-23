@@ -48,9 +48,16 @@ jobs:
         run: |
           ./scripts/dev.ps1 build
           ./scripts/test-ci.ps1
-      - name: Package Windows artifact
+      - name: Prepare Go for the patched Tunnel
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache: false
+      - name: Build patched Tunnel and package Windows artifact
         shell: pwsh
-        run: ./scripts/package.ps1 -IncludeTunnel -SkipTests
+        run: |
+          ./third-party/tunnel-client/build.ps1 -GoCompiler (Get-Command go).Source
+          ./scripts/package.ps1 -IncludeTunnel -SkipTests
       - name: Build and validate single-file Setup
         shell: pwsh
         run: |

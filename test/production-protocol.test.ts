@@ -12,6 +12,7 @@ import { ProbeEvents } from '../src/events.js';
 import { callerSchemas, createProductionService, productionWorker, VERSION, type RuntimeStatusProvider } from '../src/bridge.js';
 import { DesktopConversationsError, type DesktopConversationsService } from '../src/desktop-conversations.js';
 import { writeProductionConfig, acquireLock } from '../src/runtime.js';
+import { ProbeError } from '../src/store.js';
 
 const tokens={caller:'a'.repeat(64),worker:'b'.repeat(64)};
 const meta={'io.modelcontextprotocol/protocolVersion':'2026-07-28','io.modelcontextprotocol/clientCapabilities':{}};
@@ -122,7 +123,7 @@ test('worker ingress observes auth and parsing boundaries with private correlati
     const task=(await f.control('dots_submit',{idempotency_key:'ingress-only',title:'Synthetic',input:{text:'SECRET_BODY'}})).body;
     const rpcId=randomUUID();
     await f.rpc('tools/call',{name:'get_task',arguments:{task_id:task.task_id}},rpcId);
-    const valid=rows().slice(1);assert.deepEqual(valid.map(d=>d.stage),['arrived','auth_accepted','handler_entered','tool_invoked','http_finished']);
+    const valid=rows().slice(1);assert.deepEqual(valid.map(d=>d.stage),['arrived','auth_accepted','handler_entered','tool_invoked','tool_finished','http_finished']);
     assert.equal(new Set(valid.map(d=>d.ingress_id)).size,1);assert.notEqual(valid[0].ingress_id,rpcId);
     assert.ok(valid.slice(0,3).every(d=>d.task_id===undefined));assert.ok(valid.slice(3).every(d=>d.task_id===task.task_id));
     assert.equal(valid.at(-1).http_status,200);
@@ -220,6 +221,7 @@ test('worker diagnostic UUIDs are collected only inside SDK-accepted tool callba
         const observed=raw().slice(before);assert.ok(observed.length>0);
         for(const row of observed) {
           const detail=JSON.parse(row.detail);assert.equal(row.task_id,null);assert.equal(detail.task_id,undefined);assert.equal(detail.request_id,undefined);
+          assert.notEqual(detail.stage,'tool_finished','SDK refusals must not invent a tool completion');
         }
         const exported=f.store.evidence().filter(row=>row.kind.startsWith('worker_'));
         for(const data of [JSON.stringify(observed),JSON.stringify(exported)]) for(const hidden of [task.task_id,request_id,thread_id,'SECRET_BODY','SECRET_SEND_TEXT']) assert.ok(!data.includes(hidden),hidden);
@@ -274,6 +276,155 @@ test('worker invocation correlation stays isolated across concurrent requests an
     const raw=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
     for(const observed of [JSON.stringify(raw),JSON.stringify(f.store.evidence())])for(const hidden of ['SECRET_BODY','SECRET_SEND_TEXT','SECRET_OBSERVER_FAILURE','SECRET_WRITE_FAILURE'])assert.ok(!observed.includes(hidden));
   } finally {await handler.close();await f.close();}
+});
+
+const taskIngress=(store:TaskStore)=>store.evidence().filter(row=>row.kind==='worker_ingress').map(row=>JSON.parse(row.detail));
+function deferred() { let resolve!:()=>void;const promise=new Promise<void>(done=>resolve=done);return {promise,resolve}; }
+async function until(check:()=>boolean) {const deadline=Date.now()+5000;while(!check()){assert.ok(Date.now()<deadline,'isolated observation timed out');await delay(10);}}
+const localToolRequest=(name:string,args:unknown)=>new Request('http://localhost/mcp/dot',{method:'POST',headers:{'content-type':'application/json',accept:'application/json, text/event-stream','MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/call','Mcp-Name':name},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{_meta:meta,name,arguments:args}})});
+
+test('task finish distinguishes returned tools from missing, expired, FIFO and occupied-slot refusals',async()=>{
+  const f=await fixture();
+  try {
+    const first=f.store.submit({idempotency_key:'finish-head',title:'Synthetic',input:{text:'SECRET_INPUT'}}),second=f.store.submit({idempotency_key:'finish-tail',title:'Synthetic',input:{text:'Synthetic'}});
+    const check=async(name:string,args:unknown,code?:string)=>{
+      const response=await f.rpc('tools/call',{name,arguments:args});assert.equal(response.status,200);
+      if(code)toolError(response.body,code);else unpack(response.body);
+      const finished=taskIngress(f.store).filter(row=>row.stage==='tool_finished').at(-1)!;
+      assert.equal(finished.tool_name,name);assert.equal(finished.outcome,code?'error':'returned');assert.equal(finished.error_code,code);
+      const trace=taskIngress(f.store).filter(row=>row.ingress_id===finished.ingress_id);
+      assert.equal(trace.filter(row=>row.stage==='tool_invoked').length,1);assert.equal(trace.filter(row=>row.stage==='tool_finished').length,1);
+      return response;
+    };
+    await check('get_task',{task_id:first.task_id});await check('list_tasks',{});
+    await check('get_task',{task_id:randomUUID()},'task_not_found');
+    await check('claim_task',{task_id:second.task_id,claim_key:'tail'},'not_queue_head');
+    await check('claim_task',{task_id:first.task_id,claim_key:'head'});
+    await check('claim_task',{task_id:second.task_id,claim_key:'slot'},'execution_slot_occupied');
+    const now=Date.now(),sub=`sub_${'1'.repeat(40)}`;
+    f.store.saveSubscription({id:sub,url:'https://callback.example/synthetic',secret:'synthetic-secret',active:true,expires_at:now+600000,verified_until:now+600000,generation:1});
+    const chat=f.store.chats.send({request_id:randomUUID(),text:'SECRET_CHAT'});
+    const chatTask=f.store.db.prepare('SELECT task_id FROM bridge_chat_messages WHERE request_id=?').get(chat.request_id) as {task_id:string};
+    f.store.db.prepare("UPDATE tasks SET data=json_set(data,'$.deadline',?) WHERE id=?").run(new Date(now-1).toISOString(),chatTask.task_id);
+    await check('get_task',{task_id:chatTask.task_id},'reply_subscription_unavailable');
+    assert.equal(f.store.inspectChatTask(chatTask.task_id).attempt,0);assert.equal(f.store.inspectChatTask(first.task_id).attempt,1);
+  } finally {await f.close();}
+});
+
+test('task returned means callback return, including non-final completion and a saved business failure',async()=>{
+  const f=await fixture();
+  try {
+    const task=f.store.submit({idempotency_key:'finish-semantics',title:'Synthetic',input:{text:'SECRET_INPUT'}});
+    const owned=await f.worker('claim_task',{task_id:task.task_id,claim_key:'owner'}),claim={task_id:task.task_id,claim_token:owned.claim_token};
+    await f.worker('checkpoint_task',{...claim,input_revision:1,summary:'SECRET_CHECKPOINT'});
+    f.store.message({task_id:task.task_id,message_key:'new',text:'SECRET_MESSAGE'});
+    const stale=await f.worker('complete_task',{...claim,input_revision:1,completion_key:'stale',result:{text:'SECRET_RESULT'}});
+    assert.equal(stale.accepted_as_final,false);assert.equal(stale.status,'running');
+    await f.worker('checkpoint_task',{...claim,input_revision:2});
+    const failed=await f.worker('fail_task',{...claim,input_revision:2,failure_key:'business-failure',error:{code:'SECRET_BUSINESS_CODE',message:'SECRET_BUSINESS_MESSAGE'}});
+    assert.equal(failed.status,'failed');assert.equal(failed.accepted_as_final,true);
+    const next=f.store.submit({idempotency_key:'finish-question',title:'Synthetic',input:{text:'Synthetic'}});
+    const questionOwner=await f.worker('claim_task',{task_id:next.task_id,claim_key:'question'});
+    await f.worker('request_input',{task_id:next.task_id,claim_token:questionOwner.claim_token,question_key:'question',question:'SECRET_QUESTION'});
+    const last=f.store.submit({idempotency_key:'finish-cancel',title:'Synthetic',input:{text:'Synthetic'}});
+    const cancelOwner=await f.worker('claim_task',{task_id:last.task_id,claim_key:'cancel'});
+    f.store.cancel({task_id:last.task_id,request_key:'cancel'});
+    await f.worker('ack_cancel',{task_id:last.task_id,claim_token:cancelOwner.claim_token,ack_key:'ack',note:'SECRET_NOTE'});
+    const finished=taskIngress(f.store).filter(row=>row.stage==='tool_finished');
+    assert.ok(finished.every(row=>row.outcome==='returned'&&row.error_code===undefined));
+    assert.ok(['complete_task','fail_task','checkpoint_task','request_input','ack_cancel'].every(name=>finished.some(row=>row.tool_name===name)));
+    const raw=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
+    for(const observed of [JSON.stringify(raw),JSON.stringify(f.store.evidence())])assert.ok(!observed.includes('SECRET_'));
+  } finally {await f.close();}
+});
+
+test('task finish uses per-call snapshots across reordered returns and HTTP close without re-execution',async()=>{
+  const f=await fixture(),gates=new Map<string,ReturnType<typeof deferred>>(),counts=new Map<string,number>();
+  const original=f.store.fail;
+  f.store.fail=((args:Parameters<TaskStore['fail']>[0])=>{
+    counts.set(args.task_id,(counts.get(args.task_id)??0)+1);
+    return gates.get(args.task_id)!.promise.then(()=>({task_id:args.task_id,status:'synthetic_once'}));
+  }) as unknown as TaskStore['fail'];
+  const args=(task_id:string)=>({task_id,claim_token:'x'.repeat(32),failure_key:'synthetic',input_revision:1,error:{code:'SECRET_CODE',message:'SECRET_MESSAGE'}});
+  const ids=[randomUUID(),randomUUID(),randomUUID()];for(const id of ids)gates.set(id,deferred());
+  try {
+    const pending=ids.slice(0,2).map(id=>f.worker('fail_task',args(id)));
+    await until(()=>ids.slice(0,2).every(id=>counts.get(id)===1));
+    gates.get(ids[1]!)!.resolve();assert.equal((await pending[1]).task_id,ids[1]);
+    gates.get(ids[0]!)!.resolve();assert.equal((await pending[0]).task_id,ids[0]);
+    const id=ids[2]!;let client!:ReturnType<typeof httpRequest>;
+    // Own the aborted socket directly: an Undici pool may open an unrelated replacement
+    // connection after fetch abort, making fixture teardown wait for its keepalive timeout.
+    const aborted=new Promise<boolean>(resolve=>{
+      client=httpRequest(new URL('mcp/dot',f.endpoint),{method:'POST',agent:false,headers:{connection:'close','content-type':'application/json',accept:'application/json, text/event-stream','MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/call','Mcp-Name':'fail_task','X-Codex-Dots-Worker-Token':tokens.worker}},response=>{response.resume();response.once('end',()=>resolve(false));});
+      client.once('error',()=>resolve(true));client.end(JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{_meta:meta,name:'fail_task',arguments:args(id)}}));
+    });
+    await until(()=>counts.get(id)===1);
+    const invoked=taskIngress(f.store).find(row=>row.stage==='tool_invoked'&&row.task_id===id)!;
+    client.destroy();assert.equal(await aborted,true);
+    await until(()=>taskIngress(f.store).some(row=>row.ingress_id===invoked.ingress_id&&row.stage==='http_aborted'));
+    gates.get(id)!.resolve();
+    await until(()=>taskIngress(f.store).some(row=>row.ingress_id===invoked.ingress_id&&row.stage==='tool_finished'));
+    const details=taskIngress(f.store),finished=details.filter(row=>row.stage==='tool_finished');
+    assert.deepEqual(finished.map(row=>row.task_id),[ids[1],ids[0],ids[2]]);
+    assert.equal(new Set(finished.map(row=>row.ingress_id)).size,3);
+    for(const row of finished){assert.equal(row.outcome,'returned');assert.equal(counts.get(row.task_id),1);const trace=details.filter(item=>item.ingress_id===row.ingress_id);assert.ok(trace.filter(item=>item.task_id).every(item=>item.task_id===row.task_id));assert.equal(trace.filter(item=>item.stage==='tool_finished').length,1);}
+    assert.ok(!JSON.stringify(f.store.evidence()).includes('SECRET_'));
+  } finally {for(const gate of gates.values())gate.resolve();f.store.fail=original;f.closeIdleConnections();await f.close();}
+});
+
+test('task start/finish observer exceptions and audit failures preserve responses and one business execution',async()=>{
+  const f=await fixture(),handlers:ReturnType<typeof createMcpHandler>[]=[];
+  try {
+    const task=f.store.submit({idempotency_key:'finish-audit',title:'Synthetic',input:{text:'Synthetic'}});let observations=0,reads=0;
+    const originalGet=f.store.get.bind(f.store);
+    f.store.get=(...args:Parameters<TaskStore['get']>)=>{if(args[1]?.worker)reads++;return originalGet(...args);};
+    for(const observer of [()=>{throw Error('SECRET_START');},()=>()=>{observations++;throw Error('SECRET_FINISH');}]){
+      const handler=createMcpHandler(()=>productionWorker(f.store,f.events,undefined,undefined,undefined,undefined,observer),{legacy:'reject',responseMode:'json'});handlers.push(handler);
+      const response=await handler.fetch(localToolRequest('get_task',{task_id:task.task_id}));assert.equal(response.status,200);assert.equal(unpack(await response.json()).task_id,task.task_id);
+    }
+    assert.equal(observations,1);assert.equal(reads,2,'each throwing observer still executes its one get_task exactly once');
+    const original=f.store.audit.bind(f.store);let failedStage='tool_invoked';
+    f.store.audit=(kind,id,detail)=>{if(kind==='worker_ingress'&&detail?.stage===failedStage)throw Error('SECRET_AUDIT');original(kind,id,detail);};
+    const owned=await f.worker('claim_task',{task_id:task.task_id,claim_key:'once'});assert.equal(owned.attempt,1);
+    assert.ok(taskIngress(f.store).some(row=>row.stage==='tool_finished'&&row.tool_name==='claim_task'));
+    failedStage='tool_finished';
+    await f.worker('checkpoint_task',{task_id:task.task_id,claim_token:owned.claim_token,input_revision:1});
+    failedStage='';await f.worker('get_task',{task_id:task.task_id});
+    const saved=f.store.inspectChatTask(task.task_id);assert.equal(saved.attempt,1);assert.equal(saved.attempts[0]!.checkpoints.length,1);
+    assert.ok(taskIngress(f.store).filter(row=>row.stage==='audit_gap').length>=2);
+    assert.ok(!JSON.stringify(f.store.evidence()).includes('SECRET_'));assert.equal(f.deliveries.length,0);
+  } finally {for(const handler of handlers)await handler.close();await f.close();}
+});
+
+test('task error diagnostics allow fixed codes only and never parse secret error/result bodies',async()=>{
+  const f=await fixture();const original=f.store.get;let calls=0;
+  try {
+    const specimens=[new ProbeError('SECRET_UNKNOWN_CODE'),Object.assign(Error('SECRET_MESSAGE'),{stack:'SECRET_STACK',code:'SECRET_SYSTEM_CODE'})];
+    for(const error of specimens){
+      f.store.get=(()=>{calls++;throw error;}) as TaskStore['get'];
+      const response=await f.rpc('tools/call',{name:'get_task',arguments:{task_id:randomUUID()}});
+      toolError(response.body,error instanceof ProbeError?'SECRET_UNKNOWN_CODE':'bridge_operation_failed');
+      const finished=taskIngress(f.store).filter(row=>row.stage==='tool_finished').at(-1)!;
+      assert.equal(finished.outcome,'error');assert.equal(finished.error_code,'unclassified_tool_error');
+    }
+    assert.equal(calls,2);f.store.get=original;
+    const originalFail=f.store.fail;
+    try {
+      f.store.fail=(()=>{calls++;return {toJSON(){throw Error('SECRET_SERIALIZATION_STACK');}};}) as unknown as TaskStore['fail'];
+      const before=taskIngress(f.store).length;
+      const response=await f.rpc('tools/call',{name:'fail_task',arguments:{task_id:randomUUID(),claim_token:'x'.repeat(32),failure_key:'serialize',input_revision:1,error:{code:'SECRET_CODE',message:'SECRET_MESSAGE'}}});
+      toolError(response.body,'bridge_operation_failed');assert.equal(calls,3);
+      const finished=taskIngress(f.store).slice(before).filter(row=>row.stage==='tool_finished');
+      assert.equal(finished.length,1);assert.equal(finished[0].outcome,'error');assert.equal(finished[0].error_code,'unclassified_tool_error');
+    } finally {f.store.fail=originalFail;}
+    const raw=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
+    for(const observed of [JSON.stringify(raw),JSON.stringify(f.store.evidence())])assert.ok(!observed.includes('SECRET_'));
+    f.store.audit('worker_ingress',null,{stage:'tool_finished',outcome:'SECRET_OUTCOME',error_code:'SECRET_CODE',message:'SECRET_MESSAGE',stack:'SECRET_STACK',result:{text:'SECRET_RESULT'}});
+    assert.deepEqual(JSON.parse(f.store.evidence().at(-1)!.detail),{stage:'tool_finished'});
+    f.store.audit('worker_protocol_response',null,{outcome:'error',error_code:'task_not_found'});
+    assert.deepEqual(JSON.parse(f.store.evidence().at(-1)!.detail),{});
+  } finally {f.store.get=original;await f.close();}
 });
 
 test('worker tools/list definitions remain identical across task state changes and duplicate RPCs',async()=>{
@@ -468,13 +619,16 @@ test('in-flight bounded delivery cannot adopt a replacement claimed attempt',asy
 });
 
 test('dots_status adds bounded diagnostics and retains task state when diagnostics are absent or fail',async()=>{
-  const observed={tunnel_configured:true,tunnel_health:'ready',supervisor:'running',bridge:'running',tunnel:'running',guardian:'running'};
+  const observed={tunnel_configured:true,tunnel_health:'ready',tunnel_connection:'auth_required',tunnel_connection_reason:'auth_required',tunnel_checked_at:'2026-10-22T00:00:00.000Z',supervisor:'running',bridge:'running',tunnel:'running',guardian:'running'};
   const cases:[RuntimeStatusProvider|undefined,string][]=[
     [()=>({...observed,private_path:'PRIVATE_PATH',secret:'PRIVATE_SECRET',error:'PRIVATE_ERROR'}),'ready'],
     [()=>({...observed,tunnel_health:'unreachable'}),'unreachable'],
     [()=>({...observed,tunnel_configured:false,tunnel_health:'not_configured',supervisor:'stopped',tunnel:'stopped',guardian:'stopped'}),'not_configured'],
     [undefined,'unknown'],[()=>{throw new Error('PRIVATE_ERROR');},'unknown'],
     [()=>({...observed,tunnel_health:'PRIVATE_INVALID'}),'unknown'],
+    [()=>({...observed,tunnel_connection:'PRIVATE_INVALID'}),'unknown'],
+    [()=>({...observed,tunnel_connection_reason:'PRIVATE_INVALID'}),'unknown'],
+    [()=>({...observed,tunnel_checked_at:'PRIVATE_INVALID'}),'unknown'],
   ];
   for(const [provider,expected] of cases) {
     const f=await fixture(provider);
@@ -483,6 +637,7 @@ test('dots_status adds bounded diagnostics and retains task state when diagnosti
       const response=await f.control('dots_status',{}),status=response.body;
       assert.equal(response.status,200);assert.equal(status.version,VERSION);assert.equal(status.service_reachable,true);
       assert.equal(status.tunnel_health,expected);assert.equal(status.diagnostics,expected==='unknown'?'unavailable':'available');
+      if(expected!=='unknown'){assert.equal(status.tunnel_connection,'auth_required');assert.equal(status.tunnel_connection_reason,'auth_required');assert.equal(status.tunnel_checked_at,observed.tunnel_checked_at);}
       assert.deepEqual(status.task_counts,{queued:1});assert.equal(status.active_subscription_count,0);
       assert.equal(status.tasks.length,1);assert.equal(status.phase,'P1');assert.equal(status.production_ready,false);
       assert.ok(Array.isArray(status.subscriptions));assert.ok(Array.isArray(status.deliveries));

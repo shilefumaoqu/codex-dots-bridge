@@ -43,6 +43,8 @@
     "docs/项目规划.md": "07c26324f3774d8c059098b2786259f7b5a6367e5f0ae0874376199e99dfb5fa"
   },
   "verifiedVendorFiles": {
+    "vendor/tunnel-client-v0.0.17-local-refusal.1-windows-amd64/cloudflared.exe": "eb85d58854b21bf3e48b178377ada9521af58ecd947413afceb6abe718d3a71e",
+    "vendor/tunnel-client-v0.0.17-local-refusal.1-windows-amd64/tunnel-client.exe": "2f16db50d315e9a25073cb59f523b489f826f0a54a96b9fdeabd0b7d7a48f3ea",
     "vendor/tunnel-client-v0.0.16-windows-amd64/cloudflared.exe": "cd0bc49aec24d0d62a37b6e842dad46000f7b401f6167b4cbace4e170819c9a2",
     "vendor/tunnel-client-v0.0.16-windows-amd64/tunnel-client.exe": "4226bb74a72388147882881f29f79801b95e285d731a138071812e3aa6766571"
   }

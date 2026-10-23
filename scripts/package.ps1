@@ -1,5 +1,5 @@
 ﻿[CmdletBinding()]
-param([string]$OutputDirectory, [switch]$IncludeTunnel, [switch]$SkipTests)
+param([string]$OutputDirectory, [switch]$IncludeTunnel, [switch]$SkipTests, [string]$TunnelClientExecutable)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 if (-not [Environment]::Is64BitOperatingSystem -or $env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { throw 'Packaging requires Windows x64.' }
@@ -30,7 +30,7 @@ try {
 New-Item -ItemType Directory -Path $staging | Out-Null
 & (Join-Path $PSScriptRoot 'build-tray.ps1') -OutputDirectory $staging | Out-Null
 & (Join-Path $PSScriptRoot 'build-launcher.ps1') -OutputDirectory $staging | Out-Null
-foreach ($name in @('dist','skills','licenses')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) -Recurse }
+foreach ($name in @('dist','skills','licenses','third-party')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) -Recurse }
 $publicPolicy = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'public-release-policy.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 foreach ($relative in $publicPolicy.documents) {
   $destination=Join-Path $staging $relative
@@ -42,7 +42,7 @@ foreach ($relative in $publicPolicy.assetPrefixes) {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
   Copy-Item -LiteralPath (Join-Path $projectRoot $relative) -Destination $destination -Recurse
 }
-foreach ($name in @('package.json','package-lock.json','LICENSE','THIRD_PARTY_NOTICES.md','README.md','README.en.md','CHANGELOG.md','CONTRIBUTING.md','SECURITY.md')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) }
+foreach ($name in @('package.json','package-lock.json','LICENSE','THIRD_PARTY_NOTICES.md','README.md','README.en.md','CHANGELOG.md','CONTRIBUTING.md','SECURITY.md','ACCEPTANCE.md')) { Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination (Join-Path $staging $name) }
 New-Item -ItemType Directory -Path (Join-Path $staging 'scripts') | Out-Null
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install.ps1') -Destination (Join-Path $staging 'scripts\install.ps1')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'setup-lifecycle.ps1') -Destination (Join-Path $staging 'scripts\setup-lifecycle.ps1')
@@ -50,7 +50,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'desktop-warm-load.ps1') -Destin
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'recover-reboot-locks.ps1') -Destination (Join-Path $staging 'scripts\recover-reboot-locks.ps1')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'launch-background.ps1') -Destination (Join-Path $staging 'scripts\launch-background.ps1')
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'check-package.ps1') -Destination (Join-Path $staging 'scripts\check-package.ps1')
-foreach ($name in @('check-public-content.mjs','public-release-policy.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $staging ('scripts\'+$name)) }
+foreach ($name in @('check-public-content.mjs','public-release-policy.json','tunnel-payload.json')) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $staging ('scripts\'+$name)) }
 $packagedRuntime = Join-Path $staging 'runtime\node-v24.21.0-win-x64'
 New-Item -ItemType Directory -Path $packagedRuntime | Out-Null
 foreach ($name in @('node.exe','LICENSE','README.md')) { Copy-Item -LiteralPath (Join-Path $runtime $name) -Destination (Join-Path $packagedRuntime $name) }
@@ -74,17 +74,13 @@ foreach ($relative in @('node_modules/fast-uri/test/security-utf8-encoding.test.
   if (Test-Path -LiteralPath $fixture -PathType Leaf) { [IO.File]::Delete($fixture) }
 }
 if ($IncludeTunnel) {
-  $archiveName = 'tunnel-client-v0.0.16-windows-amd64.zip'
-  $archive = Join-Path $projectRoot ".runtime\$archiveName"
-  if (-not (Test-Path -LiteralPath $archive)) { Invoke-WebRequest -UseBasicParsing "https://github.com/openai/tunnel-client/releases/download/v0.0.16/$archiveName" -OutFile $archive }
-  if ((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne 'edef7241b0c647fcb30f1a80ff376b6b25c51927960f257a3f01e21b17c2aba6') { throw 'Official Tunnel archive checksum mismatch.' }
-  $vendor = Join-Path $staging 'vendor\tunnel-client-v0.0.16-windows-amd64'
-  New-Item -ItemType Directory -Path $vendor | Out-Null
-  Expand-Archive -LiteralPath $archive -DestinationPath $vendor
-  foreach ($name in @('LICENSE','NOTICE','tunnel-client-v0.0.16-windows-amd64-licenses.txt','tunnel-client-v0.0.16-windows-amd64.spdx.json')) { if (-not (Test-Path -LiteralPath (Join-Path $vendor $name))) { throw "Tunnel notice missing: $name" } }
+  $tunnelPayload=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'tunnel-payload.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  $vendor = Join-Path $staging ('vendor/'+$tunnelPayload.directory)
+  & (Join-Path $PSScriptRoot 'prepare-tunnel.ps1') -Destination $vendor -ClientExecutable $TunnelClientExecutable
 }
 $files = @(Get-ChildItem -LiteralPath $staging -Recurse -File | ForEach-Object { [ordered]@{path=$_.FullName.Substring($staging.Length+1).Replace('\','/');sha256=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()} } | Sort-Object { $_.path })
-$manifest = [ordered]@{schema=1;version=$version;platform='windows-x64';node='24.21.0';tunnel=$(if ($IncludeTunnel) {'0.0.16'} else {$null});files=$files}
+$manifest = [ordered]@{schema=1;version=$version;platform='windows-x64';node='24.21.0';tunnel=$(if ($IncludeTunnel) {$tunnelPayload.version} else {$null});files=$files}
+if($IncludeTunnel) { $manifest.tunnel_client=[ordered]@{path=('vendor/'+$tunnelPayload.directory+'/tunnel-client.exe');sha256=$tunnelPayload.clientSha256;upstream_version=$tunnelPayload.upstreamVersion;upstream_commit=$tunnelPayload.upstreamCommit;patch_sha256=$tunnelPayload.patchSha256} }
 [IO.File]::WriteAllText((Join-Path $staging 'release-manifest.json'), ($manifest | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
 & (Join-Path $staging 'scripts\check-package.ps1') -PackageRoot $staging
 # Explicit source allowlist; generated manifest verifies every extracted file.

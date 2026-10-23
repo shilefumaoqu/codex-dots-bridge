@@ -25,7 +25,7 @@ const {values,positionals}=parseArgs({allowPositionals:true,options:{
   'result':{type:'string'},'request-key':{type:'string'},'reason':{type:'string'},'after':{type:'string'},'timeout':{type:'string'},
   'hours':{type:'string'},'safe-to-retry':{type:'boolean'},'user-accepted':{type:'boolean'},
   'status':{type:'string'},'logical-session':{type:'string'},'limit':{type:'string'},
-  'tunnel-id':{type:'string'},'organization-id':{type:'string'},'tunnel-client':{type:'string'},'tunnel-env':{type:'string'},
+  'tunnel-id':{type:'string'},'organization-id':{type:'string'},'tunnel-client':{type:'string'},'tunnel-env':{type:'string'},'tunnel-startup-wait-seconds':{type:'string'},
   'codex-home':{type:'string'},'codex-command':{type:'string'},'desktop-access':{type:'string'},'autostart':{type:'boolean'},'no-register':{type:'boolean'},
   'upgrade-registration':{type:'boolean'},'startup-launcher':{type:'string'},'startup-link-content':{type:'string'},'preserve-autostart':{type:'boolean'},'registration-root':{type:'string'},
   'foreground':{type:'boolean'},'supervisor':{type:'boolean'},'start':{type:'boolean'},'stop':{type:'boolean'},
@@ -116,14 +116,15 @@ async function setup() {
   const config=initProduction(dataDir);
   assertStopped(dataDir);
   if(values['desktop-access']!==undefined)validateDesktopAccess(dataDir,values['desktop-access'],values['codex-home']);
-  const tunnelFlags=[values['tunnel-id'],values['organization-id'],values['tunnel-client'],values['tunnel-env']];
+  const startupWait=values['tunnel-startup-wait-seconds']===undefined?undefined:z.number().int().min(1).max(300).parse(Number(values['tunnel-startup-wait-seconds']));
+  const tunnelFlags=[values['tunnel-id'],values['organization-id'],values['tunnel-client'],values['tunnel-env'],values['tunnel-startup-wait-seconds']];
   if(tunnelFlags.some(Boolean)) {
     const prior=config.tunnel;
     const merged={tunnel_id:values['tunnel-id']??prior?.tunnel_id,organization_id:values['organization-id']??prior?.organization_id,
       client_path:values['tunnel-client']?resolve(values['tunnel-client']):prior?.client_path,key_file:values['tunnel-env']?resolve(values['tunnel-env']):prior?.key_file};
     if(Object.values(merged).some(v=>!v))throw new ProbeError('tunnel_configuration_incomplete');
     z.string().regex(/^tunnel_[A-Za-z0-9_-]+$/).parse(merged.tunnel_id);
-    config.tunnel=merged as NonNullable<typeof config.tunnel>;
+    config.tunnel={...merged,startup_wait_seconds:startupWait??prior?.startup_wait_seconds} as NonNullable<typeof config.tunnel>;
   }
   const registrationRoot=values['registration-root']?resolve(values['registration-root']):root;
   if(registrationRoot!==root){
@@ -165,7 +166,7 @@ async function tasks() {
 }
 try {
   if(values.version)output({name:'codex-dots-bridge',version:VERSION});
-  else if(values.help||!positionals[0])process.stdout.write(`Codex Dots Bridge ${VERSION}\nWindows x64 prerelease; keep P0 evidence separate.\n\nsetup [--tunnel-id ID --organization-id ID --tunnel-client EXE --tunnel-env ENV_FILE] [--autostart]\nsetup --desktop-access off|read|read-send [--codex-home PATH] (service stopped)\nrun [--start | --stop | --foreground]\nstatus [--tray] | doctor\nsetup --autostart-state enabled|disabled (no restart)\ntasks list|get|submit|message|followup|cancel|ack|wait [--request JSON_FILE]\nresolve --request JSON_FILE\nbackup --to PROTECTED_DIRECTORY\nrestore --from BACKUP_DIRECTORY [--data-dir EMPTY_TARGET]\nuninstall [--codex-command NEW_NATIVE_EXE]\n\nAll commands accept --data-dir PATH. stdio and run --supervisor are managed entry points.\nNo command accepts a plaintext Tunnel key. Registration is not proof that Codex loaded the tools.\n`);
+  else if(values.help||!positionals[0])process.stdout.write(`Codex Dots Bridge ${VERSION}\nWindows x64 prerelease; keep P0 evidence separate.\n\nsetup [--tunnel-id ID --organization-id ID --tunnel-client EXE --tunnel-env ENV_FILE] [--tunnel-startup-wait-seconds 1..300] [--autostart]\nsetup --desktop-access off|read|read-send [--codex-home PATH] (service stopped)\nrun [--start | --stop | --foreground]\nstatus [--tray] | doctor\nsetup --autostart-state enabled|disabled (no restart)\ntasks list|get|submit|message|followup|cancel|ack|wait [--request JSON_FILE]\nresolve --request JSON_FILE\nbackup --to PROTECTED_DIRECTORY\nrestore --from BACKUP_DIRECTORY [--data-dir EMPTY_TARGET]\nuninstall [--codex-command NEW_NATIVE_EXE]\n\nAll commands accept --data-dir PATH. stdio and run --supervisor are managed entry points.\nNo command accepts a plaintext Tunnel key. Registration is not proof that Codex loaded the tools.\n`);
   else switch(positionals[0]) {
     case 'setup':await setup();break;
     case 'run':

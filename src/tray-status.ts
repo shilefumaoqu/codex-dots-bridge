@@ -135,8 +135,8 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
   if(observed.supervisor==='failed'||hint.phase==='failed')return state('failed',control);
   if(observed.diagnostics!=='available'||observed.supervisor!=='running'||observed.bridge!=='running'){result.error='runtime_diagnostics_unavailable';return state('unknown');}
   if(observed.tunnel_configured===false){result.cloud='未配置';result.dot='未连接';return state('setup',control);}
-  const cloudReady=observed.tunnel_configured===true&&observed.tunnel_health==='ready'&&observed.tunnel==='running';
-  result.cloud=cloudReady?'已连接':observed.tunnel_health==='unknown'?'待确认':'未连接';
+  const cloudReady=observed.tunnel_configured===true&&observed.tunnel_health==='ready'&&observed.tunnel==='running'&&(observed.tunnel_connection===undefined||observed.tunnel_connection==='ready');
+  result.cloud=cloudReady?'已连接':observed.tunnel_connection==='auth_required'?'待授权':observed.tunnel_connection==='starting'?'正在连接':observed.tunnel_connection==='unknown'||observed.tunnel_health==='unknown'?'待确认':'未连接';
   const dotReady=Number.isSafeInteger(observed.active_subscription_count)&&Number(observed.active_subscription_count)>0;
   result.dot=dotReady?'订阅有效':'无有效订阅';
   return state(cloudReady&&dotReady?'ready':'disconnected',control);

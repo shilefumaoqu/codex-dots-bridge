@@ -2,7 +2,7 @@ import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import { existsSync, readFileSync, writeFileSync, unlinkSync, lstatSync, renameSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { readProductionConfig, protectProductionDirectory } from './runtime.js';
+import { readProductionConfig, protectProductionDirectory, type ProductionConfig } from './runtime.js';
 import { isolatedEnvironment, launchWindowsTunnel } from './tunnel-runner.js';
 export { isolatedEnvironment } from './tunnel-runner.js';
 import { processIsAlive } from './maintenance.js';
@@ -12,6 +12,9 @@ import { launchWindowsSupervisor } from './windows-background.js';
 import { createStartupDiagnostic, startupErrorCode, writeStartupDiagnostic } from './startup-diagnostics.js';
 
 export interface SupervisorOptions {nodePath:string;entryPath:string}
+export function tunnelRunArguments(dir:string,endpoint:string,tunnel:NonNullable<ProductionConfig['tunnel']>):string[] {
+  return ['run','--control-plane.tunnel-id',tunnel.tunnel_id,'--control-plane.api-key','env:CONTROL_PLANE_API_KEY','--control-plane.organization-id',tunnel.organization_id,'--mcp.server-url',`url=${new URL('mcp/dot',endpoint).href},channel=main`,'--mcp.extra-headers',`X-Codex-Dots-Worker-Token: file:${join(resolve(dir),'worker.key')}`,'--mcp.startup-wait-timeout',`${tunnel.startup_wait_seconds??30}s`,'--health.listen-addr','127.0.0.1:0','--health.url-file',join(resolve(dir),'tunnel-health.url'),'--log.level','warn','--log.format','json'];
+}
 interface LifecycleEvent {at:string;event:'child_exit'|'child_error'|'uncaught_exception';child?:'bridge'|'guardian';pid?:number;exit_code?:number|null;signal?:string|null}
 interface SupervisorState {owner:string;pid:number;bridge_pid?:number;tunnel_pid?:number;guardian_pid?:number;phase:'starting'|'running'|'stopping'|'failed';error?:string;cleanup_complete?:boolean;lifecycle?:LifecycleEvent[]}
 const delay=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
@@ -226,7 +229,7 @@ export async function runSupervisor(dir:string,options:SupervisorOptions) {
       if(config.tunnel) {
         protectExternalKey(config.tunnel.key_file);
         if(existsSync(join(dir,'tunnel-health.url')))unlinkSync(join(dir,'tunnel-health.url'));
-        const launched=launchWindowsTunnel(config.tunnel.client_path,['run','--control-plane.tunnel-id',config.tunnel.tunnel_id,'--control-plane.api-key','env:CONTROL_PLANE_API_KEY','--control-plane.organization-id',config.tunnel.organization_id,'--mcp.server-url',`url=${new URL('mcp/dot',endpoint).href},channel=main`,'--mcp.extra-headers',`X-Codex-Dots-Worker-Token: file:${join(resolve(dir),'worker.key')}`,'--health.listen-addr','127.0.0.1:0','--health.url-file',join(resolve(dir),'tunnel-health.url'),'--log.level','warn','--log.format','json'],config.tunnel.key_file);
+        const launched=launchWindowsTunnel(config.tunnel.client_path,tunnelRunArguments(dir,endpoint,config.tunnel),config.tunnel.key_file);
         // State publication can yield while the guardian fails. Observe readiness
         // immediately, but await the original promise below to preserve failure.
         void launched.ready.catch(()=>{});

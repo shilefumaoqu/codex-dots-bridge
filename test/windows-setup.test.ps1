@@ -3,6 +3,7 @@ param(
   [Parameter(Mandatory=$true)][string]$SetupExecutable,
   [string]$UpgradeSetupExecutable,
   [switch]$ExpectOfficialTunnelMigration,
+  [switch]$ExpectPatchedTunnelMigration,
   [string]$LegacyPackageRoot,
   [switch]$ExpectDirectTrayShortcut,
   [Parameter(Mandatory=$true)][string]$InstallerAppId,
@@ -10,6 +11,7 @@ param(
   [Parameter(Mandatory=$true)][string]$TestDirectory
 )
 $ErrorActionPreference='Stop'
+if($ExpectOfficialTunnelMigration -and $ExpectPatchedTunnelMigration){throw 'Choose one Tunnel migration expectation.'}
 if($InstallerAppId -notmatch '^CodexDotsBridgeSetup\.Test\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$') { throw 'Real installer tests require a distinct strict-GUID test AppId.' }
 $testInstance=$Matches[1]
 $buildReceipt=Get-Content -LiteralPath (Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($SetupExecutable))) 'setup-build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -201,14 +203,28 @@ try {
   }
   $checks.Add('real_setup_per_user_isolated_paths_and_pending_connection')
   # Start the real compiled local control service in this isolated data-dir, without any Tunnel configuration.
-  Bridge @('run','--data-dir',$data) | Out-Null
+  $startReceipt=Bridge @('run','--data-dir',$data)
+  [IO.File]::WriteAllText((Join-Path $work 'runtime-start-receipt.json'),($startReceipt|ConvertTo-Json -Depth 8),[Text.UTF8Encoding]::new($false))
+  # Exit 0 may report "starting". Observe that same startup reaching readiness
+  # before taking a read-only-operation baseline; never start it a second time.
+  $readyWatch=[Diagnostics.Stopwatch]::StartNew()
+  do {
+    $startupState=Bridge @('status','--data-dir',$data)
+    if($startupState.supervisor -eq 'running' -and $startupState.service -eq 'running'){break}
+    Start-Sleep -Milliseconds 500
+  }while($readyWatch.ElapsedMilliseconds -lt 30000)
+  Assert-Condition ($startupState.supervisor -eq 'running' -and $startupState.service -eq 'running') 'The original isolated runtime startup did not become ready.'
   $runningConfig=[IO.File]::ReadAllText((Join-Path $data 'config.json'))
   $runningManifest=[IO.File]::ReadAllText((Join-Path $data 'installation.json'))
   $runningToml=[IO.File]::ReadAllText((Join-Path $CodexDirectory 'config.toml'))
   foreach($readOnlyAction in @('Connect','PreflightUninstall')) {
     & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $app 'setup-lifecycle.ps1') -Action $readOnlyAction -InstallDirectory $app | Out-Null
     Assert-Condition ($LASTEXITCODE -eq 0) ('Running instance read-only entry failed: '+$readOnlyAction)
-    Assert-Condition ([IO.File]::ReadAllText((Join-Path $data 'config.json')) -ceq $runningConfig -and [IO.File]::ReadAllText((Join-Path $data 'installation.json')) -ceq $runningManifest -and [IO.File]::ReadAllText((Join-Path $CodexDirectory 'config.toml')) -ceq $runningToml) 'Read-only maintenance or uninstall initialization changed owned configuration.'
+    $afterConfig=[IO.File]::ReadAllText((Join-Path $data 'config.json'));$afterManifest=[IO.File]::ReadAllText((Join-Path $data 'installation.json'));$afterToml=[IO.File]::ReadAllText((Join-Path $CodexDirectory 'config.toml'))
+    if($afterConfig -cne $runningConfig -or $afterManifest -cne $runningManifest -or $afterToml -cne $runningToml){
+      [IO.File]::WriteAllText((Join-Path $work 'read-only-mutation-evidence.json'),([ordered]@{action=$readOnlyAction;start=$startReceipt;ready=$startupState;before=@{config=$runningConfig;manifest=$runningManifest;toml=$runningToml};after=@{config=$afterConfig;manifest=$afterManifest;toml=$afterToml}}|ConvertTo-Json -Depth 10),[Text.UTF8Encoding]::new($false))
+    }
+    Assert-Condition ($afterConfig -ceq $runningConfig -and $afterManifest -ceq $runningManifest -and $afterToml -ceq $runningToml) 'Read-only maintenance or uninstall initialization changed owned configuration.'
     $runningStatus=Bridge @('status','--data-dir',$data)
     Assert-Condition ($runningStatus.supervisor -eq 'running' -and $runningStatus.service -eq 'running') 'Read-only maintenance or uninstall initialization stopped the running instance.'
   }
@@ -374,14 +390,14 @@ public static class OneAddFailure {
   [IO.File]::WriteAllBytes($skillPath,$skill)
   $checks.Add('modified_skill_blocks_upgrade_and_uninstall_before_removal')
   $legacyOfficialClient=$null;$legacyTunnelIdentity=$null
-  if($UpgradeSetupExecutable -and $ExpectOfficialTunnelMigration) {
+  if($UpgradeSetupExecutable -and ($ExpectOfficialTunnelMigration -or $ExpectPatchedTunnelMigration)) {
     $beforeUpgradeState=Read-State
     $oldOfficial=Join-Path $beforeUpgradeState.payload_root 'vendor\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe'
     $legacyOfficialClient=Join-Path $work 'legacy development client.exe'
     Copy-Item -LiteralPath $oldOfficial -Destination $legacyOfficialClient
     # A missing synthetic key keeps this real installation test offline; it
     # verifies executable/configuration association without launching a Tunnel.
-    $legacyTunnelIdentity=[pscustomobject]@{tunnel_id='tunnel_synthetic_installation';organization_id='org_synthetic';client_path=$legacyOfficialClient;key_file=(Join-Path $work 'missing synthetic runtime key.env')}
+    $legacyTunnelIdentity=[pscustomobject]@{tunnel_id='tunnel_synthetic_installation';organization_id='org_synthetic';client_path=$(if($ExpectPatchedTunnelMigration){$oldOfficial}else{$legacyOfficialClient});key_file=(Join-Path $work 'missing synthetic runtime key.env')}
     $migrationConfig=Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $migrationConfig | Add-Member -Force -NotePropertyName tunnel -NotePropertyValue $legacyTunnelIdentity
     [IO.File]::WriteAllText($configPath,($migrationConfig | ConvertTo-Json -Depth 15),[Text.UTF8Encoding]::new($false))
@@ -400,11 +416,19 @@ public static class OneAddFailure {
   Assert-TrayShortcut
   $config=Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
   if($legacyOfficialClient) {
-    $newOfficial=Join-Path $after.payload_root 'vendor\tunnel-client-v0.0.16-windows-amd64\tunnel-client.exe'
+    $afterManifest=Get-Content -LiteralPath (Join-Path $after.payload_root 'release-manifest.json') -Raw -Encoding UTF8|ConvertFrom-Json
+    $newRelative=if($afterManifest.tunnel_client){$afterManifest.tunnel_client.path}else{'vendor/tunnel-client-v0.0.16-windows-amd64/tunnel-client.exe'}
+    $newOfficial=Join-Path $after.payload_root $newRelative
     Assert-Condition ($config.tunnel.client_path -ieq $newOfficial) 'Legacy official Tunnel executable binding was not migrated.'
-    Assert-Condition ((Get-FileHash -LiteralPath $legacyOfficialClient -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath $newOfficial -Algorithm SHA256).Hash) 'Legacy official executable was deleted or modified.'
+    if($ExpectPatchedTunnelMigration){
+      Assert-Condition ((Get-FileHash -LiteralPath $legacyOfficialClient -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath $oldOfficial -Algorithm SHA256).Hash) 'Old owned v16 executable was deleted or modified.'
+      Assert-Condition ($afterManifest.tunnel -ceq '0.0.17-local-refusal.1' -and (Get-FileHash -LiteralPath $newOfficial -Algorithm SHA256).Hash.ToLowerInvariant() -ceq $afterManifest.tunnel_client.sha256) 'New patched executable differs from the authenticated payload.'
+      Assert-Condition ((Get-FileHash -LiteralPath $legacyOfficialClient -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $newOfficial -Algorithm SHA256).Hash) 'Patched migration did not select a distinct client.'
+    }else{
+      Assert-Condition ((Get-FileHash -LiteralPath $legacyOfficialClient -Algorithm SHA256).Hash -ceq (Get-FileHash -LiteralPath $newOfficial -Algorithm SHA256).Hash) 'Legacy official executable was deleted or modified.'
+    }
     foreach($field in @('tunnel_id','organization_id','key_file')) { Assert-Condition ($config.tunnel.$field -ceq $legacyTunnelIdentity.$field) 'Tunnel account or key reference changed.' }
-    $checks.Add('real_legacy_official_tunnel_binding_migrates_without_connection_or_identity_change')
+    $checks.Add($(if($ExpectPatchedTunnelMigration){'real_owned_v16_migrates_to_authenticated_patched_vendor_without_connection_or_account_change'}else{'real_legacy_official_tunnel_binding_migrates_without_connection_or_identity_change'}))
   }
   Assert-Condition ($config.instance_id -eq $instance) 'Instance identity changed.'
   Assert-Condition ([IO.File]::ReadAllText((Join-Path $data 'caller.key')) -ceq $caller) 'Caller key changed.'

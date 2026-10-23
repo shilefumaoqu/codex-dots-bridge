@@ -9,7 +9,7 @@ import { serveStdio } from '@modelcontextprotocol/server/stdio';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { z } from 'zod';
 import { TaskStore } from './task-store.js';
-import { diagnosticMethod, diagnosticTool, diagnosticUuid, workerDiagnosticField } from './worker-diagnostics.js';
+import { diagnosticMethod, diagnosticTool, diagnosticUuid, diagnosticTaskTool, diagnosticTaskError, workerDiagnosticField, type TaskToolFinish, type TaskToolOutcome } from './worker-diagnostics.js';
 import { deliveryWindowSchema, DispatchContextError } from './caller-dispatch.js';
 import { chatInstructions, chatSchemas, type ChatName } from './chat.js';
 import { DesktopEchoError, type DesktopEchoService } from './desktop-echo.js';
@@ -22,11 +22,14 @@ import { CallbackError } from './webhook.js';
 import { readProductionConfig, readToken } from './runtime.js';
 import { notifyOwnerSchema, notifyOwner, submitNotificationReply, notificationConfigurationCurrent, type OwnerNotificationOptions } from './owner-notification.js';
 
-export const VERSION = '0.2.0-alpha.30';
+export const VERSION = '0.2.0-alpha.31';
 export type RuntimeStatusProvider = () => unknown | Promise<unknown>;
 const runtimeStatusSchema = z.object({
   tunnel_configured: z.boolean().nullable(),
   tunnel_health: z.enum(['ready','not_ready','unreachable','unknown','not_configured']),
+  tunnel_connection: z.enum(['starting','ready','auth_required','failed','unknown']).optional(),
+  tunnel_connection_reason: z.enum(['startup_pending','startup_ready','auth_required','startup_failed','startup_timeout','component_failed','health_conflict','health_unavailable','health_unsupported','startup_unconfirmed','not_configured']).optional(),
+  tunnel_checked_at: z.string().datetime().optional(),
   supervisor: z.enum(['starting','running','stopping','failed','orphaned_children','stopped','unknown']),
   bridge: z.enum(['running','stopped','unknown']),
   tunnel: z.enum(['running','stopped','unknown']),
@@ -203,16 +206,25 @@ async function callContext(contexts: ContextService | undefined, name: ContextTo
   if (name === 'codex_update_context') return contexts.update(contextUpdateSchema.parse(args));
   return contexts.forget(contextForgetSchema.parse(args));
 }
-export function productionWorker(store: TaskStore, events: ProbeEvents, notification?: OwnerNotificationOptions, desktop?: DesktopEchoService, conversations?: DesktopConversationsService, contexts?: ContextService, onToolInvoked?: (name:string,args:unknown)=>void) {
-  const invoked = (name:string,args:unknown) => { try { onToolInvoked?.(name,args); } catch { /* Observation cannot change execution. */ } };
+export function productionWorker(store: TaskStore, events: ProbeEvents, notification?: OwnerNotificationOptions, desktop?: DesktopEchoService, conversations?: DesktopConversationsService, contexts?: ContextService, onToolInvoked?: (name:string,args:unknown)=>TaskToolFinish|void) {
+  const invoked = (name:string,args:unknown) => { try { return onToolInvoked?.(name,args); } catch { /* Observation cannot change execution. */ } };
+  const finished = (finish:TaskToolFinish|void, outcome:TaskToolOutcome) => { try { finish?.(outcome); } catch { /* Observation cannot change the original result or repeat work. */ } };
   const capabilities: ServerCapabilities & { events: Record<string, never> } = { tools: {}, events: {} };
   const workerRules = currentWorkerRules(conversations?.enabled === true, contexts?.enabled === true);
   const server = new McpServer({ name: 'codex-dots-bridge-worker', version: VERSION, icons: xingduIcons() }, { capabilities, instructions: workerRules.instructions });
   for (const name of Object.keys(workerSchemas) as WorkerName[]) {
     server.registerTool(name, { icons: xingduIcons(), description: workerDescriptions[name], inputSchema: workerSchemas[name],
       annotations: { readOnlyHint: ['list_tasks','get_task'].includes(name), destructiveHint: false, idempotentHint: true, openWorldHint: name === 'notify_owner' } }, async (args: unknown) => {
-      invoked(name,args);
-      try { return toolResult(await callWorker(store, name, args, notification, workerRules)); } catch (e) { return toolResult({ error: errorCode(e) }, true); }
+      const observation = invoked(name,args), finish = diagnosticTaskTool(name) ? observation : undefined;
+      try {
+        const response = toolResult(await callWorker(store, name, args, notification, workerRules));
+        finished(finish,{outcome:'returned'}); return response;
+      } catch (e) {
+        const code = errorCode(e), response = toolResult({ error: code }, true);
+        const diagnosticCode = e instanceof z.ZodError ? 'invalid_parameters'
+          : e instanceof ProbeError || e instanceof DispatchContextError ? diagnosticTaskError(code) : 'unclassified_tool_error';
+        finished(finish,{outcome:'error',error_code:diagnosticCode}); return response;
+      }
     });
   }
   for (const name of Object.keys(chatSchemas) as ChatName[]) {
@@ -355,7 +367,7 @@ export function createProductionService(store: TaskStore, events: ProbeEvents, t
     const state = ingress.get(request);
     if (state) audit('worker_ingress', {...state.metadata,endpoint:'mcp_dot',ingress_id:state.id,bridge_version:VERSION,stage,...extra});
   };
-  const toolInvoked = (name:string,args:unknown) => {
+  const toolInvoked = (name:string,args:unknown):TaskToolFinish|void => {
     const current = workerRequest.getStore();
     if (!current || !ingress.has(current.request) || !diagnosticTool(name)) return;
     current.metadata.tool_name = name;
@@ -364,6 +376,19 @@ export function createProductionService(store: TaskStore, events: ProbeEvents, t
       for (const key of ['request_id','task_id']) if (diagnosticUuid(accepted[key])) current.metadata[key] = accepted[key];
     }
     observe(current.request,'tool_invoked');
+    if (!diagnosticTaskTool(name)) return;
+    // A callback owns this scalar snapshot even after HTTP close removes the WeakMap entry.
+    // Never look up ambient context again or inspect the tool's response content.
+    const state = ingress.get(current.request);
+    if (!state) return;
+    const taskId = args && typeof args === 'object' ? (args as Record<string,unknown>).task_id : undefined;
+    const snapshot = { endpoint:'mcp_dot',ingress_id:state.id,bridge_version:VERSION,method:'tools/call',tool_name:name,
+      ...(diagnosticUuid(taskId) ? {task_id:taskId} : {}) };
+    let observed = false;
+    return outcome => {
+      if (observed) return; observed = true;
+      audit('worker_ingress',{...snapshot,stage:'tool_finished',...outcome});
+    };
   };
   const mcp = createMcpHandler(() => productionWorker(store, events, notification, desktop, conversations, contexts, toolInvoked), { legacy: 'reject', responseMode: 'json', maxRequestBodySize: 262144 });
   const handle = toNodeHandler(mcp, { maxRequestBodySize: 262144 });

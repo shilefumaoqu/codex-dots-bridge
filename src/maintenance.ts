@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import Database from 'better-sqlite3';
 import { initProduction, readProductionConfig, readOwnerNotificationConfig, writeProductionConfig, protectProductionDirectory } from './runtime.js';
 import { ProbeError } from './store.js';
+import { tunnelHealthSnapshot, type TunnelConnectionDiagnostic } from './tunnel-diagnostics.js';
 
 const digest=(path:string)=>createHash('sha256').update(readFileSync(path)).digest('hex');
 function regular(path:string) { if(lstatSync(path).isSymbolicLink() || !lstatSync(path).isFile()) throw new ProbeError('unsafe_file'); }
@@ -35,14 +36,14 @@ export function statusData(dir:string) {
 }
 export async function connectionDiagnosticsData(dir:string) {
   const config=readProductionConfig(dir);
-  if(!config.tunnel) return {tunnel_configured:false,tunnel_health:'not_configured' as const};
-  let tunnel_health:'unknown'|'ready'|'not_ready'|'unreachable'='unknown';
+  const unknown:TunnelConnectionDiagnostic={tunnel_connection:'unknown',tunnel_connection_reason:'health_unavailable',tunnel_checked_at:new Date().toISOString()};
+  if(!config.tunnel) return {tunnel_configured:false,tunnel_health:'not_configured' as const,...unknown,tunnel_connection_reason:'not_configured' as const};
   if(existsSync(join(dir,'tunnel-health.url'))) {
     const u=new URL(readFileSync(join(dir,'tunnel-health.url'),'utf8').trim());
     if(u.protocol!=='http:'||u.hostname!=='127.0.0.1'||!u.port||u.username||u.password||u.search||u.hash||u.pathname!=='/') throw new ProbeError('invalid_tunnel_health_endpoint');
-    try {const result=await fetch(new URL('readyz',u),{signal:AbortSignal.timeout(1500),redirect:'error'});tunnel_health=result.ok?'ready':'not_ready';}catch{tunnel_health='unreachable';}
+    return {tunnel_configured:true,...await tunnelHealthSnapshot(u)};
   }
-  return {tunnel_configured:true,tunnel_health};
+  return {tunnel_configured:true,tunnel_health:'unknown' as const,...unknown};
 }
 export async function doctorData(dir:string) {
   const status=statusData(dir),config=readProductionConfig(dir),checks:Record<string,unknown>={...status};

@@ -7,18 +7,18 @@
 <p align="center">把任务交给你的 Dot，在 Codex 中跟进过程并取回结果。</p>
 
 <p align="center">
-  <a href="README.en.md">English</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.30">v0.2.0-alpha.30</a> · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.en.md">English</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.31">v0.2.0-alpha.31</a> · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.30/Codex-Dots-Bridge-0.2.0-alpha.30-Setup.exe"><strong>下载 Windows 安装程序</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.31/Codex-Dots-Bridge-0.2.0-alpha.31-Setup.exe"><strong>下载 Windows 安装程序</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.30">Windows ZIP、SHA256 校验文件与完整发布说明</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.31">Windows ZIP、SHA256 校验文件与完整发布说明</a>
 </p>
 
-> **当前发布：0.2.0-alpha.30（实验性预发布）**。包含启动恢复、托盘重开、完整历史与增量接续、最小聊天入口和脱敏诊断。ChatGPT→Dot 连续聊天仍未通过，原自然 Events 后续也有零领取样本；请先阅读 [本版验收与限制](ACCEPTANCE.md)。程序就绪不等于消息往返成功。
+> **当前发布：0.2.0-alpha.31（实验性预发布）**。新增 Windows 连接拒绝恢复、准确健康状态和接单工具结果诊断，保留已有托盘、完整历史与增量接续功能。配套 Tunnel 为本地修补版，并非官方原版。ChatGPT→Dot 连续聊天仍未通过，原自然 Events 后续也有零领取样本；请先阅读 [本版验收与限制](ACCEPTANCE.md)。程序就绪不等于消息往返成功。
 
 Codex Dots Bridge 是连接 Codex 与你已有 Dot 的协作插件。派出一项文本任务后，可以沿同一任务查看进度、回答澄清、补充要求并取回结果。
 
@@ -113,3 +113,9 @@ alpha.30 的启动辅助环境和回执修复已有定向测试、专门审查�
 ---
 
 本项目采用 [MIT License](LICENSE)。
+
+## Codex 云端开发环境
+
+云端环境连接本仓库，用于源码开发、类型检查和构建。使用 Node 24，执行 `npm ci`、`npm run typecheck` 和 `npm run build`。Linux 环境不能替代 Windows 安装器、托盘、桌面 IPC、登录自启和真实 Dot 通道验收；不要在云端运行安装器或连接生产数据目录。个人运行密钥、数据库及本机配置不随源码上传。
+
+仓库推送与 Codex 云端环境发布是两个步骤。更新已有环境时检查实际仓库版本、安装依赖并验证，再重新发布环境；已有云端任务保留各自状态，不能据此宣布其自动切换到新版本。

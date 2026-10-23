@@ -1,0 +1,661 @@
+diff --git a/pkg/mcpclient/connection_refused_test.go b/pkg/mcpclient/connection_refused_test.go
+new file mode 100644
+index 0000000..96f5e33
+--- /dev/null
++++ b/pkg/mcpclient/connection_refused_test.go
+@@ -0,0 +1,53 @@
++package mcpclient
++
++import (
++	"context"
++	"errors"
++	"net"
++	"testing"
++	"time"
++)
++
++func TestStartupProbeNativeRefusalRequiresOptInAndRecovers(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	address := listener.Addr().String()
++	listener.Close()
++	connection, refusal := net.Dial("tcp", address)
++	if connection != nil {
++		connection.Close()
++		t.Fatal("expected closed listener")
++	}
++	if refusal == nil {
++		t.Fatal("expected native refusal")
++	}
++	for _, timeout := range []time.Duration{0, time.Second} {
++		state := NewProbeState()
++		attempts := 0
++		runStartupProbeWithRetry(context.Background(), startupProbeRetryOptions{
++			waitTimeout: timeout,
++			wait: func(context.Context, time.Duration) error {
++				if state.IsDone() {
++					t.Error("refusal prematurely settled probe")
++				}
++				return nil
++			},
++		}, func(context.Context) (probeSession, error) {
++			attempts++
++			if attempts == 1 {
++				return nil, refusal
++			}
++			return &fakeProbeSession{}, nil
++		}, nil, state)
++		_, finalErr, done := state.Wait(time.Second)
++		if timeout == 0 {
++			if !done || attempts != 1 || !errors.Is(finalErr, refusal) {
++				t.Fatalf("default changed: done=%v attempts=%d err=%v", done, attempts, finalErr)
++			}
++		} else if !done || attempts != 2 || finalErr != nil {
++			t.Fatalf("opt-in did not recover: done=%v attempts=%d err=%v", done, attempts, finalErr)
++		}
++	}
++}
+diff --git a/pkg/mcpclient/fxmodule.go b/pkg/mcpclient/fxmodule.go
+index c700bae..6e976c5 100644
+--- a/pkg/mcpclient/fxmodule.go
++++ b/pkg/mcpclient/fxmodule.go
+@@ -435,7 +435,7 @@ func isRetryableStartupProbeError(err error, retryUnixSocketENOENT bool) bool {
+ 	if errors.As(err, &statusErr) && statusErr.StatusCode != 0 {
+ 		return isRetryableStartupProbeHTTPError(err)
+ 	}
+-	if errors.Is(err, syscall.ECONNREFUSED) {
++	if tctransport.IsConnectionRefused(err) {
+ 		return true
+ 	}
+ 	return retryUnixSocketENOENT && errors.Is(err, syscall.ENOENT)
+diff --git a/pkg/oauth/auth_meta.go b/pkg/oauth/auth_meta.go
+index 2ca6354..df20dfc 100644
+--- a/pkg/oauth/auth_meta.go
++++ b/pkg/oauth/auth_meta.go
+@@ -67,6 +67,7 @@ type AuthServerMetadataFetchResult struct {
+ 	// Startup discovery uses this classification without changing the public
+ 	// diagnostics or best-effort behavior of ordinary metadata enrichment.
+ 	failureType discoveryFailureType
++	failureErr  error
+ }
+ 
+ type authServerWellKnownPathSpec struct {
+@@ -142,6 +143,7 @@ func FetchAuthServerMetadataWithResult(
+ 	}
+ 
+ 	result.failureType = failureType
++	result.failureErr = errors.Join(errs...)
+ 	return nil, result, fmt.Errorf(
+ 		"oauth auth-server metadata fetch failed for issuer %q: %w",
+ 		tclog.RedactURLString(issuerURL),
+@@ -159,7 +161,7 @@ func runFetchAuthServerMetadataPass(
+ ) (*AuthServerMetadata, []error, discoveryFailureType) {
+ 	var errs []error
+ 	failureType := discoveryFailureTypeTimeoutOnly
+-	var responseFailures discoveryResponseFailures
++	responseFailures := discoveryResponseFailures{retryConnectionRefused: startupConnectionRetryEnabled(ctx)}
+ 	var fallbackMeta *AuthServerMetadata
+ 	fallbackAttemptIndex := -1
+ 	fallbackSelectedURL := ""
+diff --git a/pkg/oauth/connection_refused_test.go b/pkg/oauth/connection_refused_test.go
+new file mode 100644
+index 0000000..919bf1f
+--- /dev/null
++++ b/pkg/oauth/connection_refused_test.go
+@@ -0,0 +1,212 @@
++package oauth
++
++import (
++	"context"
++	"errors"
++	"io"
++	"log/slog"
++	"net"
++	"net/http"
++	"net/url"
++	"strings"
++	"sync/atomic"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/openai/tunnel-client/pkg/mcpclient"
++	"github.com/openai/tunnel-client/pkg/runtimeconfig"
++	"github.com/openai/tunnel-client/pkg/runtimeharpoon/hostbus"
++	"go.uber.org/fx"
++)
++
++func startRefusalApp(t *testing.T, client *http.Client, timeout time.Duration, policy oauthDiscoveryRetryPolicy) (*DiscoveryState, *hostbus.StartupCatalogState, *recordingBus) {
++	t.Helper()
++	state, catalog := NewDiscoveryState(), hostbus.NewStartupCatalogState()
++	bus := &recordingBus{notify: make(chan struct{})}
++	serverURL, _ := url.Parse("https://mcp.example.test/mcp")
++	probe := mcpclient.NewProbeState()
++	probe.Set(nil)
++	app := fx.New(fx.NopLogger, fx.Provide(
++		func() *runtimeconfig.MCPConfig {
++			return &runtimeconfig.MCPConfig{ServerURL: serverURL, StartupWaitTimeout: timeout}
++		},
++		fx.Annotate(func() *http.Client { return client }, fx.ResultTags(`name:"mcp_client"`)),
++		func() hostbus.HostRegistrationBus { return bus },
++		func() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) },
++		func() *mcpclient.ProbeState { return probe },
++		func() *DiscoveryState { return state },
++		func() *hostbus.StartupCatalogState { return catalog },
++	), fx.Invoke(func(p discoveryParams) error { return startOAuthDiscoveryWithRetryPolicy(p, policy) }))
++	if err := app.Start(context.Background()); err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = app.Stop(context.Background()) })
++	return state, catalog, bus
++}
++
++func refusalResponse(req *http.Request, status int, body string) *http.Response {
++	return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: io.NopCloser(strings.NewReader(body)), Request: req}
++}
++
++func TestOAuthStartupRefusalRecoveryAndCatalogPending(t *testing.T) {
++	for _, stage := range []string{"protected-resource", "auth-server"} {
++		t.Run(stage, func(t *testing.T) {
++			var recovered atomic.Bool
++			entered, allow := make(chan time.Duration, 1), make(chan struct{})
++			refusal := &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
++			client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				path := req.URL.Path
++				if path == "/mcp" {
++					return refusalResponse(req, 404, ""), nil
++				}
++				if strings.Contains(path, "oauth-protected-resource") {
++					if stage == "protected-resource" && !recovered.Load() {
++						return nil, refusal
++					}
++					return refusalResponse(req, 200, `{"resource":"https://mcp.example.test/mcp","authorization_servers":["https://mcp.example.test"]}`), nil
++				}
++				if !recovered.Load() {
++					return nil, refusal
++				}
++				return refusalResponse(req, 200, `{"issuer":"https://mcp.example.test","token_endpoint":"https://mcp.example.test/token"}`), nil
++			})}
++			state, catalog, bus := startRefusalApp(t, client, time.Second, deterministicOAuthDiscoveryRetryPolicy(entered, allow))
++			select {
++			case <-entered:
++			case <-time.After(time.Second):
++				t.Fatal("refusal did not enter retry")
++			}
++			if state.IsDone() {
++				t.Fatal("refusal settled state")
++			}
++			if done, _, err := catalog.Snapshot(); done {
++				t.Fatalf("refusal settled catalog: %v", err)
++			}
++			bus.mu.Lock()
++			published := len(bus.bundles)
++			bus.mu.Unlock()
++			if published != 0 {
++				t.Fatal("refusal published partial catalog")
++			}
++			recovered.Store(true)
++			close(allow)
++			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++			defer cancel()
++			if err := catalog.Wait(ctx); err != nil {
++				t.Fatalf("catalog did not recover: %v", err)
++			}
++			if _, _, _, err, done := state.Wait(time.Second); !done || err != nil {
++				t.Fatalf("state did not recover: done=%v err=%v", done, err)
++			}
++			bus.mu.Lock()
++			defer bus.mu.Unlock()
++			if len(bus.bundles) != 1 {
++				t.Fatalf("bundles=%d", len(bus.bundles))
++			}
++		})
++	}
++}
++
++func TestOAuthRefusalDefaultAndDeadline(t *testing.T) {
++	for _, stage := range []string{"protected-resource", "auth-server"} {
++		for _, timeout := range []time.Duration{0, 40 * time.Millisecond} {
++			t.Run(stage+timeout.String(), func(t *testing.T) {
++				refusal := syscall.ECONNREFUSED
++				var waits atomic.Int32
++				client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++					if req.URL.Path == "/mcp" {
++						return refusalResponse(req, 404, ""), nil
++					}
++					if stage == "auth-server" && strings.Contains(req.URL.Path, "oauth-protected-resource") {
++						return refusalResponse(req, 200, `{"resource":"https://mcp.example.test/mcp","authorization_servers":["https://mcp.example.test"]}`), nil
++					}
++					return nil, refusal
++				})}
++				policy := oauthDiscoveryRetryPolicy{wait: func(ctx context.Context, delay time.Duration) bool {
++					waits.Add(1)
++					return waitForOAuthDiscoveryRetry(ctx, delay)
++				}}
++				state, catalog, _ := startRefusalApp(t, client, timeout, policy)
++				_, _, _, err, done := state.Wait(time.Second)
++				if !done {
++					t.Fatal("refusal did not settle")
++				}
++				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++				defer cancel()
++				catalogErr := catalog.Wait(ctx)
++				if timeout == 0 {
++					if waits.Load() != 0 {
++						t.Fatal("default began retrying refusal")
++					}
++					if stage == "auth-server" {
++						if err != nil || catalogErr != nil {
++							t.Fatalf("default best effort changed: %v %v", err, catalogErr)
++						}
++					} else if !errors.Is(err, refusal) || catalogErr == nil {
++						t.Fatalf("default fail fast changed: %v %v", err, catalogErr)
++					}
++				} else if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, refusal) || catalogErr == nil || waits.Load() != 1 {
++					t.Fatalf("deadline/cause mismatch: %v catalog=%v waits=%d", err, catalogErr, waits.Load())
++				}
++			})
++		}
++	}
++}
++
++func TestRefusalFailureAccumulationPreservesPermanentAnd404(t *testing.T) {
++	for _, permanent := range []bool{false, true} {
++		ctx := context.WithValue(context.Background(), startupConnectionRetryKey{}, true)
++		candidate, _ := url.Parse("https://mcp.example.test/first")
++		fallback, _ := url.Parse("https://mcp.example.test/last")
++		client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++			if req.URL.Path == "/first" {
++				return nil, syscall.ECONNREFUSED
++			}
++			if permanent {
++				return nil, syscall.EACCES
++			}
++			return refusalResponse(req, 404, ""), nil
++		})}
++		_, _, _, err := FetchOAuthMetadata(ctx, client, []DiscoveryCandidate{{URL: candidate}, {URL: fallback}}, nil, candidate)
++		want := discoveryFailureTypeConnectionRefused
++		if permanent {
++			want = discoveryFailureTypeNonTimeout
++		}
++		if classifyDiscoveryFailure(err) != want {
++			t.Fatalf("permanent=%v classification=%v err=%v", permanent, classifyDiscoveryFailure(err), err)
++		}
++		if !errors.Is(err, syscall.ECONNREFUSED) {
++			t.Fatalf("refusal cause lost: %v", err)
++		}
++	}
++}
++
++func TestStartupWaitDoesNotBoundExistingHTTPRetryPolicy(t *testing.T) {
++	var recovered atomic.Bool
++	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++		if req.URL.Path == "/mcp" {
++			return refusalResponse(req, 404, ""), nil
++		}
++		if !recovered.Load() {
++			return refusalResponse(req, 503, "starting"), nil
++		}
++		return refusalResponse(req, 200, `{"resource":"https://mcp.example.test/mcp"}`), nil
++	})}
++	policy := oauthDiscoveryRetryPolicy{wait: func(ctx context.Context, _ time.Duration) bool {
++		if !waitForOAuthDiscoveryRetry(ctx, 80*time.Millisecond) {
++			return false
++		}
++		recovered.Store(true)
++		return true
++	}}
++	state, catalog, _ := startRefusalApp(t, client, 20*time.Millisecond, policy)
++	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
++	defer cancel()
++	if err := catalog.Wait(ctx); err != nil {
++		t.Fatalf("existing HTTP retry acquired refusal deadline: %v", err)
++	}
++	if _, _, _, err, done := state.Wait(time.Second); !done || err != nil {
++		t.Fatalf("HTTP retry did not recover: done=%v err=%v", done, err)
++	}
++}
+diff --git a/pkg/oauth/discovery.go b/pkg/oauth/discovery.go
+index 7a9907c..03ccff2 100644
+--- a/pkg/oauth/discovery.go
++++ b/pkg/oauth/discovery.go
+@@ -101,7 +101,7 @@ func runOAuthMetadataDiscoveryPass(
+ ) (*types.TunnelResponse, *url.URL, discoveryFailureType, error) {
+ 	var lastErr error
+ 	failureType := discoveryFailureTypeTimeoutOnly
+-	var responseFailures discoveryResponseFailures
++	responseFailures := discoveryResponseFailures{retryConnectionRefused: startupConnectionRetryEnabled(ctx)}
+ 	for i, candidate := range filtered {
+ 		urlForLog := tclog.RedactURL(candidate.URL)
+ 		attempts[i].Tried = true
+@@ -164,7 +164,7 @@ func runOAuthMetadataDiscoveryPass(
+ 				}
+ 				continue
+ 			}
+-			return nil, nil, responseFailures.classify(failureType), lastErr
++			return nil, nil, responseFailures.classify(failureType), responseFailures.cause(lastErr)
+ 		}
+ 		failureType = discoveryFailureTypeNonTimeout
+ 		if len(body) > protectedResourceMetadataBodyLimitBytes {
+@@ -181,7 +181,7 @@ func runOAuthMetadataDiscoveryPass(
+ 				}
+ 				continue
+ 			}
+-			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), lastErr
++			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), responseFailures.cause(lastErr)
+ 		}
+ 
+ 		if len(body) == 0 {
+@@ -194,7 +194,7 @@ func runOAuthMetadataDiscoveryPass(
+ 				}
+ 				continue
+ 			}
+-			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), lastErr
++			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), responseFailures.cause(lastErr)
+ 		}
+ 
+ 		// Retry on known fallback-friendly statuses.
+@@ -221,14 +221,14 @@ func runOAuthMetadataDiscoveryPass(
+ 				}
+ 				continue
+ 			}
+-			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), lastErr
++			return nil, nil, responseFailures.classify(discoveryFailureTypeNotApplicable), responseFailures.cause(lastErr)
+ 		}
+ 
+ 		attempts[i].Selected = true
+ 		return types.NewOAuthDiscoveryResponse(types.DefaultChannel, body, resp.StatusCode, resp.Header), candidate.URL, discoveryFailureTypeNotApplicable, nil
+ 	}
+ 
+-	return nil, nil, responseFailures.classify(failureType), lastErr
++	return nil, nil, responseFailures.classify(failureType), responseFailures.cause(lastErr)
+ }
+ 
+ // withSameOriginRedirects returns a shallow client copy that preserves the
+diff --git a/pkg/oauth/discovery_retry_policy.go b/pkg/oauth/discovery_retry_policy.go
+index 6fa5121..f95ecad 100644
+--- a/pkg/oauth/discovery_retry_policy.go
++++ b/pkg/oauth/discovery_retry_policy.go
+@@ -6,6 +6,8 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"time"
++
++	"github.com/openai/tunnel-client/pkg/transport"
+ )
+ 
+ const (
+@@ -29,17 +31,31 @@ const (
+ 	discoveryFailureTypeTimeoutOnly
+ 	discoveryFailureTypeNonTimeout
+ 	discoveryFailureTypeRetryableResponse
++	discoveryFailureTypeConnectionRefused
+ )
+ 
++type startupConnectionRetryKey struct{}
++
++func startupConnectionRetryEnabled(ctx context.Context) bool {
++	enabled, _ := ctx.Value(startupConnectionRetryKey{}).(bool)
++	return enabled
++}
++
+ // discoveryResponseFailures distinguishes a temporarily unusable metadata
+ // response from permanent request/configuration failures. Missing fallback URLs
+ // do not veto recovery of another endpoint, but trust or transport failures do.
+ type discoveryResponseFailures struct {
+-	retryable bool
+-	permanent bool
++	retryable              bool
++	permanent              bool
++	retryConnectionRefused bool
++	connectionRefused      error
+ }
+ 
+ func (f *discoveryResponseFailures) record(status int, err error, invalidBody bool) {
++	if status == 0 && f.retryConnectionRefused && transport.IsConnectionRefused(err) {
++		f.connectionRefused = err
++		return
++	}
+ 	if classifyDiscoveryFailure(err) == discoveryFailureTypeTimeoutOnly {
+ 		return
+ 	}
+@@ -62,12 +78,31 @@ func (f discoveryResponseFailures) classify(fallback discoveryFailureType) disco
+ 	if f.permanent {
+ 		return discoveryFailureTypeNonTimeout
+ 	}
++	if f.connectionRefused != nil {
++		return discoveryFailureTypeConnectionRefused
++	}
+ 	if f.retryable {
+ 		return discoveryFailureTypeRetryableResponse
+ 	}
+ 	return fallback
+ }
+ 
++// Keep the refused cause even if a later fallback only returned 404. An
++// explicitly permanent failure still vetoes retry through the classification.
++func (f discoveryResponseFailures) cause(lastErr error) error {
++	if f.connectionRefused != nil {
++		return errors.Join(lastErr, f.connectionRefused)
++	}
++	return lastErr
++}
++
++func isConnectionRefusedDiscoveryFailure(err error) bool {
++	if classified, ok := errors.AsType[*classifiedDiscoveryError](err); ok {
++		return classified.failureType == discoveryFailureTypeConnectionRefused
++	}
++	return transport.IsConnectionRefused(err)
++}
++
+ // classifiedDiscoveryError preserves the complete discovery cycle's retry
+ // classification while retaining the final error's text and errors.Is/As chain.
+ type classifiedDiscoveryError struct {
+diff --git a/pkg/oauth/module.go b/pkg/oauth/module.go
+index 1b5a434..cdacb25 100644
+--- a/pkg/oauth/module.go
++++ b/pkg/oauth/module.go
+@@ -190,6 +190,14 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
+ 			}
+ 
+ 			go func() {
++				// Only connection-refused recovery uses this opt-in startup
++				// budget. Existing timeout/HTTP-response retry policy is unchanged.
++				refusedCtx := ctx
++				if p.MCPConfig.StartupWaitTimeout > 0 {
++					var refusedCancel context.CancelFunc
++					refusedCtx, refusedCancel = context.WithTimeout(ctx, p.MCPConfig.StartupWaitTimeout)
++					defer refusedCancel()
++				}
+ 				if p.MCPConfig.StartupWaitTimeout > 0 {
+ 					logger.InfoContext(ctx, "waiting for MCP startup probe before OAuth discovery",
+ 						slog.Duration("timeout", p.MCPConfig.StartupWaitTimeout),
+@@ -206,14 +214,40 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
+ 				}
+ 
+ 				retryBackoff := retryPolicy.backoff()
++				retryRefused := func(err error) (bool, error) {
++					if p.MCPConfig.StartupWaitTimeout <= 0 || !isConnectionRefusedDiscoveryFailure(err) {
++						return false, err
++					}
++					if refusedCtx.Err() == nil {
++						retryIn := retryBackoff.Duration()
++						logger.WarnContext(ctx, "OAuth startup connection refused; retrying", slog.Duration("retry_in", retryIn))
++						if retryPolicy.waitForRetry(refusedCtx, retryIn) && refusedCtx.Err() == nil {
++							return true, nil
++						}
++					}
++					if ctx.Err() != nil {
++						return false, ctx.Err()
++					}
++					return false, fmt.Errorf("oauth startup connection wait timed out after %s: %w",
++						p.MCPConfig.StartupWaitTimeout, errors.Join(context.DeadlineExceeded, err))
++				}
+ 				// Retry the full discovery sequence with a fresh timeout so a
+ 				// transient startup failure can observe recovered probe and metadata
+ 				// endpoints without terminally settling readiness.
+ 				for {
+ 					fetchCtx, fetchCancel := context.WithTimeout(ctx, DefaultDiscoveryTimeout)
++					if p.MCPConfig.StartupWaitTimeout > 0 {
++						fetchCtx = context.WithValue(fetchCtx, startupConnectionRetryKey{}, true)
++					}
+ 					start := time.Now()
+ 					candidates, probe, err := BuildOAuthDiscoveryCandidates(fetchCtx, p.HTTPClient, serverURL, logger, p.MCPConfig.OAuthTrustedOrigins...)
+ 					if err != nil {
++						var retry bool
++						retry, err = retryRefused(err)
++						if retry {
++							fetchCancel()
++							continue
++						}
+ 						if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+ 							fetchCancel()
+ 							return
+@@ -246,12 +280,19 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
+ 					}
+ 					result := BuildDiscoveryResult(resp, sourceURL, start, attempts)
+ 					if err != nil {
++						var retry bool
++						retry, err = retryRefused(err)
++						if retry {
++							fetchCancel()
++							continue
++						}
+ 						if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+ 							fetchCancel()
+ 							return
+ 						}
+ 						failureType := classifyDiscoveryFailure(err)
+-						if failureType == discoveryFailureTypeTimeoutOnly || failureType == discoveryFailureTypeRetryableResponse {
++						if (failureType == discoveryFailureTypeTimeoutOnly || failureType == discoveryFailureTypeRetryableResponse) &&
++							!isConnectionRefusedDiscoveryFailure(err) {
+ 							retryIn := retryBackoff.Duration()
+ 							logger.WarnContext(fetchCtx, "OAuth discovery failed; retrying",
+ 								slog.String("error", err.Error()),
+@@ -305,6 +346,22 @@ func startOAuthDiscoveryWithRetryPolicy(p discoveryParams, retryPolicy oauthDisc
+ 					if result != nil && authServerMetaFetch != nil {
+ 						result.AuthServerMetadata = authServerMetaFetch
+ 					}
++					if p.MCPConfig.StartupWaitTimeout > 0 && authServerMetaFetch != nil &&
++						authServerMetaFetch.failureType == discoveryFailureTypeConnectionRefused {
++						refusedErr := withDiscoveryFailureType(authServerMetaFetch.failureErr, discoveryFailureTypeConnectionRefused)
++						retry, finalErr := retryRefused(refusedErr)
++						fetchCancel()
++						if retry {
++							continue
++						}
++						if ctx.Err() != nil {
++							return
++						}
++						p.State.Set(result, finalErr, probe, candidateStrings)
++						completeStartupCatalog(finalErr)
++						logger.WarnContext(ctx, "OAuth discovery failed", slog.String("error", finalErr.Error()))
++						return
++					}
+ 					if authServerMetaFetch != nil && (authServerMetaFetch.failureType == discoveryFailureTypeRetryableResponse ||
+ 						authServerMetaFetch.failureType == discoveryFailureTypeTimeoutOnly) {
+ 						retryIn := retryBackoff.Duration()
+diff --git a/pkg/transport/connection_refused.go b/pkg/transport/connection_refused.go
+new file mode 100644
+index 0000000..770ba65
+--- /dev/null
++++ b/pkg/transport/connection_refused.go
+@@ -0,0 +1,12 @@
++package transport
++
++import (
++	"errors"
++	"syscall"
++)
++
++// IsConnectionRefused checks the original error chain, never error text or the
++// broad net.Error interface. Windows uses a different native socket errno.
++func IsConnectionRefused(err error) bool {
++	return errors.Is(err, syscall.ECONNREFUSED) || isNativeConnectionRefused(err)
++}
+diff --git a/pkg/transport/connection_refused_other.go b/pkg/transport/connection_refused_other.go
+new file mode 100644
+index 0000000..062df7c
+--- /dev/null
++++ b/pkg/transport/connection_refused_other.go
+@@ -0,0 +1,5 @@
++//go:build !windows
++
++package transport
++
++func isNativeConnectionRefused(error) bool { return false }
+diff --git a/pkg/transport/connection_refused_test.go b/pkg/transport/connection_refused_test.go
+new file mode 100644
+index 0000000..b392acb
+--- /dev/null
++++ b/pkg/transport/connection_refused_test.go
+@@ -0,0 +1,51 @@
++package transport
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"net/url"
++	"os"
++	"runtime"
++	"syscall"
++	"testing"
++)
++
++func TestIsConnectionRefusedPreservesNativeErrorChain(t *testing.T) {
++	listener, err := net.Listen("tcp", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	address := listener.Addr().String()
++	if err := listener.Close(); err != nil {
++		t.Fatal(err)
++	}
++	connection, err := net.Dial("tcp", address)
++	if connection != nil {
++		connection.Close()
++		t.Fatal("closed listener unexpectedly accepted")
++	}
++	if err == nil {
++		t.Fatal("expected native refusal")
++	}
++	wrapped := &url.Error{Op: "Post", URL: "http://" + address, Err: fmt.Errorf("probe: %w", err)}
++	if !IsConnectionRefused(wrapped) {
++		t.Fatalf("native error not recognized: %v", wrapped)
++	}
++	var errno syscall.Errno
++	if !errors.As(wrapped, &errno) {
++		t.Fatalf("native errno missing: %v", wrapped)
++	}
++	if runtime.GOOS == "windows" && errno != syscall.Errno(10061) {
++		t.Fatalf("Windows errno=%d, want 10061", errno)
++	}
++	for _, unrelated := range []error{nil, context.Canceled, context.DeadlineExceeded, syscall.EACCES, syscall.ECONNRESET, os.ErrNotExist, errors.New("connection refused"), &net.DNSError{IsTimeout: true}} {
++		if IsConnectionRefused(unrelated) {
++			t.Errorf("unrelated error accepted: %v", unrelated)
++		}
++	}
++	if !IsConnectionRefused(fmt.Errorf("wrapped: %w", syscall.ECONNREFUSED)) {
++		t.Fatal("portable errno rejected")
++	}
++}
+diff --git a/pkg/transport/connection_refused_windows.go b/pkg/transport/connection_refused_windows.go
+new file mode 100644
+index 0000000..31a0c68
+--- /dev/null
++++ b/pkg/transport/connection_refused_windows.go
+@@ -0,0 +1,10 @@
++package transport
++
++import (
++	"errors"
++	"golang.org/x/sys/windows"
++)
++
++func isNativeConnectionRefused(err error) bool {
++	return errors.Is(err, windows.WSAECONNREFUSED)
++}

@@ -43,6 +43,15 @@ test('tray treats mismatch, missing diagnostics, timeout and identity ambiguity 
     const foreign=await check(ready);assert.equal(foreign.state,'unknown');assert.equal(foreign.control,'disabled');
   }finally{f.close();}
 });
+test('tray requires structured startup readiness when supplied, including the readyz200 auth boundary',async()=>{
+  const f=fixture();try {
+    for(const [connection,label] of [['auth_required','待授权'],['starting','正在连接'],['failed','未连接'],['unknown','待确认']] as const) {
+      const status=await getTrayStatus(f.dir,version,{call:async()=>({...ready,tunnel_connection:connection})});
+      assert.equal(status.cloud,label);assert.notEqual(status.state,'ready');assert.notEqual(status.tone,'green');
+    }
+    const status=await getTrayStatus(f.dir,version,{call:async()=>({...ready,tunnel_connection:'ready'})});assert.equal(status.cloud,'已连接');assert.equal(status.state,'ready');
+  }finally{f.close();}
+});
 test('confirmed cleanup is stopped; starting and prolonged stopping never show green',async()=>{
   const f=fixture();try {
     const fail=async()=>{throw new ProbeError('local_service_unreachable');};

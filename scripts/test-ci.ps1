@@ -64,7 +64,7 @@ Write-Output ('CI child owner verified: '+$owner)
             & (Join-Path $PSScriptRoot 'dev.ps1') test
             # Guard fixtures use the same current-user default owner as the core tests.
             # Restore the original token owner in the existing finally block below.
-            foreach ($test in @('setup-lifecycle-guards','setup-data-discovery','setup-runtime-binding')) {
+            foreach ($test in @('setup-lifecycle-guards','setup-data-discovery','setup-runtime-binding','tunnel-payload','tunnel-source-eol')) {
                 foreach ($shell in @('powershell.exe', (Get-Process -Id $PID).Path)) {
                     & $shell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path (Split-Path -Parent $PSScriptRoot) "test/$test.test.ps1")
                     if ($LASTEXITCODE -ne 0) { throw "Installer guard failed: $test in $shell" }

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "version": "0.0.17-local-refusal.1",
+  "directory": "tunnel-client-v0.0.17-local-refusal.1-windows-amd64",
+  "clientSha256": "2f16db50d315e9a25073cb59f523b489f826f0a54a96b9fdeabd0b7d7a48f3ea",
+  "cloudflaredSha256": "eb85d58854b21bf3e48b178377ada9521af58ecd947413afceb6abe718d3a71e",
+  "upstreamVersion": "0.0.17",
+  "upstreamCommit": "a248b7f725fc989c1eb26680cf4351ee33421f61",
+  "archiveName": "tunnel-client-v0.0.17-windows-amd64.zip",
+  "archiveUrl": "https://github.com/openai/tunnel-client/releases/download/v0.0.17/tunnel-client-v0.0.17-windows-amd64.zip",
+  "archiveSha256": "b89074637596262067061308cf174959561a1a8bcffe2db956650dad7303052b",
+  "patchSha256": "bcf65bc43f67490c17486ee91a5b29c08661cce47b940ff4ef1747161abc2f5d",
+  "notices": ["LICENSE", "NOTICE", "tunnel-client-v0.0.17-windows-amd64-licenses.txt", "tunnel-client-v0.0.17-windows-amd64.spdx.json"]
+}

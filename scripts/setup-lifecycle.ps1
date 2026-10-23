@@ -45,16 +45,27 @@ function Write-Json([string]$Path,$Value) {
 function Read-Json([string]$Path) { Assert-SafePath $Path; Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
 function Select-TunnelClientForUpgrade($Settings) {
   if(-not $Settings.old_config -or -not $Settings.old_config.tunnel -or -not $Settings.old_root) { return '' }
-  $relative='vendor/tunnel-client-v0.0.16-windows-amd64/tunnel-client.exe'
+  $manifest=Read-Json (Join-Path $Settings.new_root 'release-manifest.json')
+  $relative=if($manifest.tunnel_client){[string]$manifest.tunnel_client.path}else{'vendor/tunnel-client-v0.0.16-windows-amd64/tunnel-client.exe'}
+  if($relative -cnotmatch '^vendor/tunnel-client-v[0-9A-Za-z.-]+-windows-amd64/tunnel-client\.exe$') { throw 'bundled_tunnel_identity_mismatch' }
   $next=Join-Path $Settings.new_root $relative
   if(-not (Test-Path -LiteralPath $next -PathType Leaf)) { return '' }
   Assert-SafePath $next
   # Commit calls this only after check-package and the transaction fingerprint
   # have authenticated the new payload; bind the selected executable again.
-  $entries=@((Read-Json (Join-Path $Settings.new_root 'release-manifest.json')).files | Where-Object { $_.path -ceq $relative })
+  $entries=@($manifest.files | Where-Object { $_.path -ceq $relative })
   if($entries.Count -ne 1 -or $entries[0].sha256 -notmatch '^[a-f0-9]{64}$' -or (Get-FileHash -LiteralPath $next -Algorithm SHA256).Hash.ToLowerInvariant() -cne $entries[0].sha256) { throw 'bundled_tunnel_identity_mismatch' }
   $previous=$Settings.old_config.tunnel.client_path
-  $owned=Join-Path $Settings.old_root $relative
+  $oldRelative='vendor/tunnel-client-v0.0.16-windows-amd64/tunnel-client.exe'
+  $oldManifestPath=Join-Path $Settings.old_root 'release-manifest.json'
+  if(Test-Path -LiteralPath $oldManifestPath -PathType Leaf) {
+    $oldManifest=Read-Json $oldManifestPath
+    if($oldManifest.tunnel_client) {
+      $oldRelative=[string]$oldManifest.tunnel_client.path
+      if($oldRelative -cnotmatch '^vendor/tunnel-client-v[0-9A-Za-z.-]+-windows-amd64/tunnel-client\.exe$') { throw 'bundled_tunnel_identity_mismatch' }
+    }
+  }
+  $owned=Join-Path $Settings.old_root $oldRelative
   if($previous -ieq $owned) { return $next }
   if(-not $previous -or -not (Test-Path -LiteralPath $previous -PathType Leaf)) { return '' }
   Assert-SafePath $previous

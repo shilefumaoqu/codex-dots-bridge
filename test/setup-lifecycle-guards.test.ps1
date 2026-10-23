@@ -302,6 +302,35 @@ Remove-Item -LiteralPath Function:\Get-FileHash
 $results.Add([pscustomobject]@{name='external_read_failure_is_controlled_before_registration';passed=$true})
 if((Select-TunnelClientForUpgrade ([pscustomobject]@{old_config=$null;old_root=$null;new_root=$tunnelNew})) -cne ''){throw 'Fresh install invented a prior Tunnel'}
 $results.Add([pscustomobject]@{name='fresh_install_without_tunnel_is_unchanged';passed=$true})
+# Cross-version migration follows the owned old vendor path, even when the
+# new executable intentionally differs. An external pinned binary is preserved.
+$patchedRelative='vendor/tunnel-client-v0.0.17-local-refusal.1-windows-amd64/tunnel-client.exe'
+$patchedNext=Join-Path $tunnelNew $patchedRelative
+New-Item -ItemType Directory -Path (Split-Path -Parent $patchedNext),(Split-Path -Parent (Join-Path $tunnelOld $tunnelRelative)) -Force | Out-Null
+[IO.File]::WriteAllText($patchedNext,'synthetic patched binary identity')
+[IO.File]::WriteAllText((Join-Path $tunnelOld $tunnelRelative),'synthetic old official binary identity')
+$patchedDigest=(Get-FileHash -LiteralPath $patchedNext -Algorithm SHA256).Hash.ToLowerInvariant()
+Write-Json (Join-Path $tunnelNew 'release-manifest.json') ([pscustomobject]@{tunnel_client=[pscustomobject]@{path=$patchedRelative};files=@([pscustomobject]@{path=$patchedRelative;sha256=$patchedDigest})})
+$tunnelSettings.old_config.tunnel.client_path=Join-Path $tunnelOld $tunnelRelative
+$beforeMigration=$tunnelSettings|ConvertTo-Json -Depth 8
+if((Select-TunnelClientForUpgrade $tunnelSettings) -cne $patchedNext -or ($tunnelSettings|ConvertTo-Json -Depth 8) -cne $beforeMigration -or [IO.File]::ReadAllText((Join-Path $tunnelOld $tunnelRelative)) -cne 'synthetic old official binary identity'){throw 'Owned v16 did not migrate to the distinct patched vendor without mutating original state'}
+$results.Add([pscustomobject]@{name='owned_v16_migrates_to_distinct_patched_vendor';passed=$true})
+$tunnelSettings.old_config.tunnel.client_path=$customClient
+if((Select-TunnelClientForUpgrade $tunnelSettings) -cne ''){throw 'Cross-version upgrade replaced a custom external client'}
+$tunnelSettings.old_config.tunnel.client_path=$externalClient
+if((Select-TunnelClientForUpgrade $tunnelSettings) -cne ''){throw 'Cross-version upgrade replaced an explicitly pinned external old binary'}
+$results.Add([pscustomobject]@{name='cross_version_preserves_custom_and_different_external_clients';passed=$true})
+Write-Json (Join-Path $tunnelOld 'release-manifest.json') ([pscustomobject]@{tunnel_client=[pscustomobject]@{path=$patchedRelative}})
+$tunnelSettings.old_config.tunnel.client_path=Join-Path $tunnelOld $patchedRelative
+if((Select-TunnelClientForUpgrade $tunnelSettings) -cne $patchedNext){throw 'Subsequent patched vendor upgrade did not follow the recorded old path'}
+$results.Add([pscustomobject]@{name='patched_owned_vendor_path_migrates_on_subsequent_upgrade';passed=$true})
+$tunnelSettings.old_config.tunnel.client_path=Join-Path $tunnelRoot 'matching patched external.exe'
+Copy-Item -LiteralPath $patchedNext -Destination $tunnelSettings.old_config.tunnel.client_path
+if((Select-TunnelClientForUpgrade $tunnelSettings) -cne $patchedNext){throw 'Same-byte external migration regressed for patched clients'}
+$results.Add([pscustomobject]@{name='matching_patched_external_migrates_by_exact_hash';passed=$true})
+Write-Json (Join-Path $tunnelNew 'release-manifest.json') ([pscustomobject]@{tunnel_client=[pscustomobject]@{path='../outside.exe'};files=@()})
+try{Select-TunnelClientForUpgrade $tunnelSettings|Out-Null;throw 'Unsafe manifest Tunnel path accepted'}catch{if($_.Exception.Message -cne 'bundled_tunnel_identity_mismatch'){throw}}
+$results.Add([pscustomobject]@{name='unsafe_tunnel_manifest_path_rejected';passed=$true})
 # Exercise the actual rollback with real Shell links in a custom Unicode group.
 # Prior bytes are intentionally opaque: restoring them must never execute them.
 function Shortcut-RollbackCase([string]$Name,[bool]$OldExists,[bool]$NewExists,[bool]$Modified=$false) {

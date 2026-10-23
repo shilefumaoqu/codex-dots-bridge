@@ -93,7 +93,14 @@ if ($seen.ContainsKey('dist/windows-background.js') -and -not $seen.ContainsKey(
 if ($seen.ContainsKey('dist/tray-status.js') -and (-not $seen.ContainsKey('CodexDotsBridge.Tray.exe') -or -not $seen.ContainsKey('CodexDotsBridge.ico'))) { throw 'Tray runtime requires the matching Windows executable and icon.' }
 $inventory = Get-Content -LiteralPath (Join-Path $PackageRoot 'licenses/npm-inventory.json') -Raw | ConvertFrom-Json
 foreach ($dependency in $inventory.packages) { foreach ($notice in $dependency.notices) { if (-not $seen.ContainsKey($notice)) { throw "Dependency notice missing: $($dependency.name)" } } }
-if ($manifest.tunnel) { foreach ($notice in @('LICENSE','NOTICE','tunnel-client-v0.0.16-windows-amd64-licenses.txt','tunnel-client-v0.0.16-windows-amd64.spdx.json')) { if (-not $seen.ContainsKey('vendor/tunnel-client-v0.0.16-windows-amd64/'+$notice)) { throw "Tunnel notice missing: $notice" } } }
+if ($manifest.tunnel) {
+  $tunnelPayload=Get-Content -LiteralPath (Join-Path $PackageRoot 'scripts/tunnel-payload.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  $prefix='vendor/'+$tunnelPayload.directory+'/'
+  if($manifest.tunnel -cne $tunnelPayload.version -or $manifest.tunnel_client.path -cne ($prefix+'tunnel-client.exe') -or $manifest.tunnel_client.sha256 -cne $tunnelPayload.clientSha256) { throw 'Tunnel manifest identity mismatch.' }
+  foreach($notice in @($tunnelPayload.notices)+@('cloudflared.exe','cloudflared-manifest.json','local-patch.json','tunnel-client.exe')) { if(-not $seen.ContainsKey($prefix+$notice)) { throw ('Tunnel companion file missing: '+$notice) } }
+  if((Get-FileHash -LiteralPath (Join-Path $PackageRoot ($prefix+'tunnel-client.exe')) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $tunnelPayload.clientSha256 -or (Get-FileHash -LiteralPath (Join-Path $PackageRoot ($prefix+'cloudflared.exe')) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $tunnelPayload.cloudflaredSha256) { throw 'Tunnel executable origin mismatch.' }
+  if((Get-FileHash -LiteralPath (Join-Path $PackageRoot 'third-party/tunnel-client/refusal-recovery.patch') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $tunnelPayload.patchSha256) { throw 'Tunnel source patch identity mismatch.' }
+}
 $node = Join-Path $PackageRoot 'runtime\node-v24.21.0-win-x64\node.exe'
 $actual = (& $node (Join-Path $PackageRoot 'dist\main.js') --version) -join ''
 if ($LASTEXITCODE -ne 0 -or ($actual | ConvertFrom-Json).version -ne $package.version) { throw 'Compiled runtime version mismatch.' }

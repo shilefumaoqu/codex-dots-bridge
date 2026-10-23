@@ -7,18 +7,18 @@
 <p align="center">Hand work to your Dot, follow it in Codex, and retrieve the result.</p>
 
 <p align="center">
-  <a href="README.md">简体中文</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.30">v0.2.0-alpha.30</a> · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.md">简体中文</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.31">v0.2.0-alpha.31</a> · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.30/Codex-Dots-Bridge-0.2.0-alpha.30-Setup.exe"><strong>Download the Windows installer</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.31/Codex-Dots-Bridge-0.2.0-alpha.31-Setup.exe"><strong>Download the Windows installer</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.30">Windows ZIP, SHA256 files and full release notes</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.31">Windows ZIP, SHA256 files and full release notes</a>
 </p>
 
-> **Current release: 0.2.0-alpha.30 (experimental prerelease).** Includes startup recovery, tray reopening, stored-history and incremental handoff, a minimal chat entry and redacted diagnostics. ChatGPT-to-Dot continuous chat has not passed; later natural Events samples also expired without pickup. Read [acceptance and limits](ACCEPTANCE.md). A ready service does not prove a message round trip.
+> **Current release: 0.2.0-alpha.31 (experimental prerelease).** Adds Windows connection-refusal recovery, structured startup health and worker tool-result diagnostics. Includes a locally patched Tunnel build, not the unmodified official release; existing tray, history and handoff features are retained. ChatGPT-to-Dot continuous chat has not passed; later natural Events samples also expired without pickup. Read [acceptance and limits](ACCEPTANCE.md). A ready service does not prove a message round trip.
 
 Codex Dots Bridge connects Codex to your existing Dot. Delegate a text task, then use the same task ID to follow progress, answer questions, add requirements and retrieve the result.
 
@@ -113,3 +113,7 @@ Builds require Node/npm and access to the official Tunnel download source. A loc
 ---
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Codex cloud development
+
+Connect this repository with Node 24, then run `npm ci`, `npm run typecheck` and `npm run build`. Linux cloud checks do not validate the Windows installer, tray, desktop IPC or live Dot channel. Do not upload personal runtime keys, databases or local configurations. Publishing the repository and republishing a Codex environment are separate operations; existing cloud tasks retain their own state.

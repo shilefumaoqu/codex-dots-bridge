@@ -163,7 +163,7 @@ export function acquireLock(dir:string) {
 export const defaultProductionDataDir=()=>join(process.env.LOCALAPPDATA??join(homedir(),'.local','share'),'CodexDotsBridge','data');
 const productionSchema=z.object({
   owner:z.literal('codex-dots-bridge'),schema_version:z.literal(1),instance_id:z.string().uuid(),endpoint:z.string().optional(),
-  tunnel:z.object({tunnel_id:z.string().regex(/^tunnel_[A-Za-z0-9_-]+$/),organization_id:z.string().min(1),client_path:z.string().min(1),key_file:z.string().min(1)}).strict().optional(),
+  tunnel:z.object({tunnel_id:z.string().regex(/^tunnel_[A-Za-z0-9_-]+$/),organization_id:z.string().min(1),client_path:z.string().min(1),key_file:z.string().min(1),startup_wait_seconds:z.number().int().min(1).max(300).optional()}).strict().optional(),
   installation:z.object({root:z.string(),node_path:z.string()}).strict().optional(),
   plugin:z.object({subscription_verified_at:z.string().datetime().optional()}).strict().optional(),
 }).strict();

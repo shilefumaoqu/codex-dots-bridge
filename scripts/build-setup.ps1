@@ -3,7 +3,8 @@ param(
   [Parameter(Mandatory=$true)][string]$Compiler,
   [string]$PackageRoot,
   [string]$OutputDirectory,
-  [switch]$SkipTests
+  [switch]$SkipTests,
+  [string]$TunnelClientExecutable
 )
 $ErrorActionPreference='Stop'
 $projectRoot=Split-Path -Parent $PSScriptRoot
@@ -16,7 +17,7 @@ if(Test-Path -LiteralPath (Join-Path $OutputDirectory 'Setup.exe')) { throw 'Exi
 New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 if(-not $PackageRoot) {
   $packageOutput=Join-Path $OutputDirectory 'package'
-  $options=@{OutputDirectory=$packageOutput;IncludeTunnel=$true;SkipTests=[bool]$SkipTests}
+  $options=@{OutputDirectory=$packageOutput;IncludeTunnel=$true;SkipTests=[bool]$SkipTests;TunnelClientExecutable=$TunnelClientExecutable}
   & (Join-Path $PSScriptRoot 'package.ps1') @options
   $roots=@(Get-ChildItem -LiteralPath $packageOutput -Directory)
   if($roots.Count -ne 1) { throw 'Expected exactly one prepared package.' }
@@ -27,7 +28,8 @@ $PackageRoot=[IO.Path]::GetFullPath($PackageRoot)
 $manifest=Get-Content -LiteralPath (Join-Path $PackageRoot 'release-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 if(@($manifest.files | Where-Object {$_.path -ceq 'scripts/launch-background.ps1'}).Count -ne 1) { throw 'Setup requires its authenticated background-launch helper.' }
 if(@($manifest.files | Where-Object {$_.path -ceq 'scripts/recover-reboot-locks.ps1'}).Count -ne 1) { throw 'Setup requires its authenticated lock-recovery helper.' }
-if($manifest.node -ne '24.21.0' -or $manifest.tunnel -ne '0.0.16') { throw 'Setup requires the complete Node 24 and official Tunnel payload.' }
+$tunnelPayload=Get-Content -LiteralPath (Join-Path $PackageRoot 'scripts/tunnel-payload.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+if($manifest.node -ne '24.21.0' -or $manifest.tunnel -cne $tunnelPayload.version -or $manifest.tunnel_client.sha256 -cne $tunnelPayload.clientSha256) { throw 'Setup requires the complete Node 24 and verified patched Tunnel payload.' }
 $fingerprint=(Get-FileHash -LiteralPath (Join-Path $PackageRoot 'release-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
 $launcher=Get-Content -LiteralPath (Join-Path $PackageRoot 'launcher-build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 if($launcher.protocol -ne 1 -or $launcher.source_sha256 -notmatch '^[a-f0-9]{64}$'){throw 'Unsupported Launcher identity.'}
