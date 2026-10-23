@@ -145,6 +145,8 @@ function protectExternalKey(path:string) {
   if(!lstatSync(path).isFile())throw new ProbeError('invalid_tunnel_key_file');
   if(process.platform==='win32') {
     const script=String.raw`$ErrorActionPreference='Stop'
+# Get-Acl must not depend on first-use discovery in this isolated child.
+Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Security','Microsoft.PowerShell.Security.psd1')) -Global -ErrorAction Stop
 $p=[Environment]::GetEnvironmentVariable('CODEX_DOTS_KEY_PATH')
 $acl=Get-Acl -LiteralPath $p
 $user=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value

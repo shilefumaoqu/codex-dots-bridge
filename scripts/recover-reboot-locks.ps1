@@ -1,6 +1,9 @@
 param([string]$DataDir)
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+# Resolve only the built-in modules this recovery probe uses.
+Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1')) -Global -ErrorAction Stop
+Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','CimCmdlets','CimCmdlets.psd1')) -Global -ErrorAction Stop
 
 # CodeDom must use the current user's known folder, even when the launcher
 # inherited the machine TEMP. Never change the user or machine environment.

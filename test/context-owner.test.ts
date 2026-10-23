@@ -49,9 +49,27 @@ test('an update after an idle snapshot remains unknown', async () => {
 for (const options of [{ noOwner: true }, { discoveryError: 'PRIVATE_NATIVE_ERROR' }] as const) test('unavailable owner remains unknown with a sanitized timestamped failure', async () => {
   const start = Date.now(), f = ownerFixture(options), result = await f.run(); snapshot(result, start, 'unavailable'); assert.equal(result.status, 'unknown'); assert.equal(result.reason, options.noOwner ? 'native_owner_unavailable' : 'ipc_owner_discovery_failed'); released(f);
 });
-test('wrong owner snapshot is ignored and deadline closes the connection without navigation or send', async () => {
-  const start = Date.now(), f = ownerFixture({ source: 'forged-owner' }), result = await f.run(30); snapshot(result, start, 'unavailable'); assert.equal(result.status, 'unknown'); assert.equal(result.reason, 'ipc_aborted');
-  assert.equal(f.socket.closed, true); assert(!f.socket.frames.some(frame => ['thread-follower-start-turn', 'navigate-to-conversation'].includes(frame.method)));
+for (const deadline of [30, 3000]) test(`wrong owner snapshot is ignored until ${deadline === 30 ? 'the overall deadline' : 'the snapshot budget'} closes the connection without navigation or send`, async t => {
+  // Keep Date and timers on one clock: real timers can fire just before the
+  // Date.now boundary, making a snapshot timeout race the overall deadline.
+  const start = Date.now(); t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: start });
+  const f = ownerFixture({ source: 'forged-owner' }); let settled = false;
+  const pending = f.run(deadline).then(result => { settled = true; return result; });
+  t.after(async () => { f.controller.abort(); await pending; });
+  // The fixture delivers its forged snapshot in microtasks. Let those finish
+  // before checking that the observation still waits for a trusted owner.
+  await new Promise<void>(setImmediate);
+  assert.equal(settled, false);
+  assert.deepEqual(f.socket.frames.filter(frame => frame.method === 'thread-stream-following-changed').map(frame => frame.params.following), [true]);
+  const expires = Math.min(deadline, 2000);
+  t.mock.timers.tick(expires - 1); await new Promise<void>(setImmediate);
+  assert.equal(settled, false); assert.equal(f.socket.closed, false);
+  t.mock.timers.tick(1);
+  const result = await pending; snapshot(result, start, 'unavailable'); assert.equal(result.status, 'unknown');
+  assert.equal(result.reason, deadline === 30 ? 'ipc_aborted' : 'ipc_snapshot_unavailable');
+  assert.equal(f.connections(), 1); assert.equal(f.socket.closed, true); assert.equal(f.socket.destroyed, true);
+  assert.deepEqual(f.socket.frames.filter(frame => frame.method === 'thread-stream-following-changed').map(frame => frame.params.following), deadline === 30 ? [true] : [true, false]);
+  assert(f.socket.frames.every(frame => ['initialize', 'thread-owner-discovery', 'thread-stream-following-changed'].includes(frame.method)));
 });
 for (const stopAt of ['connect', 'initialize', 'discovery', 'snapshot'] as const) for (const cause of ['signal', 'deadline'] as const) test(`${cause} during ${stopAt} settles unknown and releases its injected connection`, async () => {
   const start = Date.now(), f = ownerFixture({ stopAt });

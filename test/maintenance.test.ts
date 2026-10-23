@@ -200,13 +200,18 @@ test('hidden supervisor owns one bridge, rejects duplicate and stops without tas
   const root=mkdtempSync(join(tmpdir(),'dots supervisor ')),dir=join(root,'data'),entry=join(root,'synthetic main.mjs');initProduction(dir);
   const diagnosticHelper=join(root,'launch-background-diagnostic.ps1');
   let helper=readFileSync(resolve('scripts/launch-background.ps1'),'utf8');
+  // Exercise explicit dependency coverage instead of a warm module-discovery cache.
+  helper=helper.replace("$ErrorActionPreference='Stop'","$ErrorActionPreference='Stop';$PSModuleAutoLoadingPreference='None'");
   for(const [statement,stage] of [
     ["$ErrorActionPreference='Stop'",'script_started'],
     ["try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch { }",'output_encoding'],
     ["try { [Console]::InputEncoding=[Text.UTF8Encoding]::new($false) } catch { }",'input_encoding'],
     ["Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1')) -Global -ErrorAction Stop",'utility_import'],
+    ["Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Management','Microsoft.PowerShell.Management.psd1')) -Global -ErrorAction Stop",'management_import'],
+    ["Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','CimCmdlets','CimCmdlets.psd1')) -Global -ErrorAction Stop",'cim_import'],
     ['$text=[Console]::In.ReadToEnd()','stdin_read'],
     ['$request=$text|ConvertFrom-Json','request_json'],
+    ["if($Leaf -and -not (Test-Path -LiteralPath $full -PathType Leaf)){throw 'background_launch_invalid_request'}",'path_leaf_check'],
     ['$compilationTemp=Set-DotsUserCompilationTemp','compilation_temp'],
     ['$startup=New-DotsProcessStartup $environment','process_startup'],
     ['$result=Invoke-DotsProcessCreate $command (Split-Path -Parent $exe) $startup','process_create'],
@@ -224,7 +229,7 @@ test('hidden supervisor owns one bridge, rejects duplicate and stops without tas
     if(helperIndex>=0){
       const started=Date.now(),receipt:{elapsedMs?:number;pid?:number;status?:number;signal?:string;stdout:string;stderr:string}={pid:child.pid,stdout:'',stderr:''};brokerReceipts.push(receipt);
       child.stdout?.on('data',(data:Buffer)=>{receipt.stdout=(receipt.stdout+String(data)).slice(0,1200);receipt.elapsedMs=Date.now()-started;});
-      child.stderr?.on('data',(data:Buffer)=>{receipt.stderr=(receipt.stderr+String(data)).slice(0,1200);receipt.elapsedMs=Date.now()-started;});
+      child.stderr?.on('data',(data:Buffer)=>{receipt.stderr=(receipt.stderr+String(data)).slice(0,2400);receipt.elapsedMs=Date.now()-started;});
       child.on('close',(status:number,signal:string)=>{receipt.status=status;receipt.signal=signal;receipt.elapsedMs=Date.now()-started;});
     }
     return child;

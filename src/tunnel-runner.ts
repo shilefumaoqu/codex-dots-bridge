@@ -12,6 +12,8 @@ $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 [Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)
 try {
+# Add-Type and JSON parsing must use this isolated host's built-in module.
+Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1')) -Global -ErrorAction Stop
 Add-Type -TypeDefinition @'
 using System;
 using System.IO;
