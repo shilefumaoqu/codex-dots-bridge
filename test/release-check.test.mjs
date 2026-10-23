@@ -25,8 +25,10 @@ function scratch(fn) {
   finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-function historicalDocumentCheck({ body, reviewedBody = body, current = false }) {
+function historicalDocumentCheck({ body, reviewedBody = body, current = false, lowercaseCwd = false, repositoryAtParent = false }) {
   return scratch(dir => {
+    const repositoryRoot = dir;
+    if (repositoryAtParent) { dir = join(dir, 'source'); mkdirSync(dir); }
     const path = 'docs/legacy-technical.md', version = '0.1.0-test';
     mkdirSync(join(dir, 'scripts')); mkdirSync(join(dir, 'src')); mkdirSync(join(dir, 'docs'));
     for (const file of ['check-release.mjs', 'check-public-content.mjs']) copyFileSync(new URL('../scripts/' + file, import.meta.url), join(dir, 'scripts', file));
@@ -36,10 +38,10 @@ function historicalDocumentCheck({ body, reviewedBody = body, current = false })
     writeFileSync(join(dir, 'src', 'bridge.ts'), `export const VERSION = '${version}';`);
     for (const file of ['README.md', 'README.en.md', 'CHANGELOG.md']) writeFileSync(join(dir, file), version);
     writeFileSync(join(dir, path), body);
-    const git = (...args) => execFileSync('git', ['-c', 'user.name=Synthetic Test', '-c', 'user.email=synthetic@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd: dir, stdio: 'pipe' });
+    const git = (...args) => execFileSync('git', ['-c', 'user.name=Synthetic Test', '-c', 'user.email=synthetic@example.invalid', '-c', 'commit.gpgsign=false', ...args], { cwd: repositoryRoot, stdio: 'pipe' });
     git('init', '-b', 'main'); git('add', '.'); git('commit', '-m', 'Synthetic historical document');
-    if (!current) { git('rm', path); git('commit', '-m', 'Remove synthetic document from current release'); }
-    return spawnSync(process.execPath, ['scripts/check-release.mjs', ...(current ? [] : ['--history'])], { cwd: dir, encoding: 'utf8' });
+    if (!current) { git('rm', repositoryAtParent ? 'source/' + path : path); git('commit', '-m', 'Remove synthetic document from current release'); }
+    return spawnSync(process.execPath, ['scripts/check-release.mjs', ...(current ? [] : ['--history'])], { cwd: lowercaseCwd ? dir.toLowerCase() : dir, encoding: 'utf8' });
   });
 }
 
@@ -47,6 +49,19 @@ test('exact reviewed historical technical document passes the real Git history c
   const result = historicalDocumentCheck({ body: 'Synthetic legacy technical guidance.' });
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /History scanned:/);
+});
+
+test('Windows directory case aliases still scan the same Git history', { skip: process.platform !== 'win32' }, () => {
+  const result = historicalDocumentCheck({ body: 'Synthetic legacy technical guidance.', lowercaseCwd: true });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /History scanned:/);
+});
+
+test('a parent repository cannot supply history for a nested source archive', () => {
+  const result = historicalDocumentCheck({ body: 'Synthetic legacy technical guidance.', repositoryAtParent: true });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /History scan requires a Git repository/);
+  assert.doesNotMatch(result.stdout, /History scanned:/);
 });
 test('changed historical bytes cannot reuse a prior document review', () => {
   const result = historicalDocumentCheck({ body: 'Changed synthetic technical guidance.', reviewedBody: 'Synthetic legacy technical guidance.' });
