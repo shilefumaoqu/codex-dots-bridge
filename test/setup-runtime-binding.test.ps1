@@ -7,7 +7,7 @@ $work=Join-Path ([IO.Path]::GetFullPath($TestDirectory)) ('runtime-'+[Guid]::New
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $projectRoot 'scripts\setup-lifecycle.ps1'),[ref]$tokens,[ref]$errors)
-foreach($name in @('Assert-SafePath','Read-Json','Write-Json','Runtime-Node','Resolve-OldRuntimeRoot','Rollback-Transaction')) {
+foreach($name in @('Assert-SafePath','Read-Json','Write-Json','Runtime-Node','Resolve-OldRuntimeRoot','Test-JsonEquivalent','Read-OriginalRuntimeSnapshot','Test-OriginalEndpointAuthentication','Set-TransactionProperty','Rollback-Transaction')) {
   $definition=$ast.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name},$true)
   if(-not $definition) { throw ('Missing lifecycle function: '+$name) }
   . ([ScriptBlock]::Create($definition.Extent.Text))
@@ -76,9 +76,19 @@ function Start-InstallerSupervisor([string]$Root,[string]$Directory) {Invoke-Bri
 $transaction=[pscustomobject]@{old_root=$callerRoot;old_runtime_root=$runtimeRoot;old_config=$binding;old_config_text=$originalConfig;data_dir=$data;app_data=(Join-Path $work 'AppData');was_running=$true;registration_changed=$true;old_autostart=$false;current_registration_root=(Join-Path $work 'new caller')}
 Write-Json $transactionPath $transaction
 Rollback-Transaction $transaction
-if($calls.Count -ne 3 -or $calls[0].root -cne $callerRoot -or $calls[1].root -cne $runtimeRoot -or $calls[2].root -cne $runtimeRoot -or $calls[2].version -cne '0.2.0-alpha.7' -or $calls[2].node -cne $node -or ($calls[2].arguments -join '|') -cne ('run|--supervisor|--data-dir|'+$data)) { throw 'Rollback dispatched wrong caller/runtime/version/arguments.' }
+if($calls.Count -ne 2 -or $calls[0].operation -cne 'registration' -or $calls[0].root -cne $callerRoot -or $calls[1].operation -cne 'run' -or $calls[1].root -cne $runtimeRoot -or $calls[1].version -cne '0.2.0-alpha.7' -or $calls[1].node -cne $node -or ($calls[1].arguments -join '|') -cne ('run|--supervisor|--data-dir|'+$data)) { throw 'Rollback dispatched wrong caller/runtime/version/arguments.' }
 if([IO.File]::ReadAllText($configPath) -cne $originalConfig -or (Test-Path -LiteralPath $transactionPath)) { throw 'Rollback did not preserve config and finish transaction.' }
 $checks.Add('restores_caller_registration_then_exact_config_then_original_runtime_dispatch')
+# The actual snapshot guard must preserve an original runtime with locks when
+# the synthetic readiness adapter cannot confirm it; never restart over it.
+$lockPath=Join-Path $data 'service.lock';$lockText='synthetic unconfirmed original runtime'
+[IO.File]::WriteAllText($lockPath,$lockText)
+Write-Json $transactionPath $transaction;$calls.Clear()
+try { Rollback-Transaction $transaction;throw 'Unconfirmed original runtime was restarted.' } catch { if($_.Exception.Message -cne 'rollback_original_runtime_unconfirmed') { throw } }
+if($calls.Count -eq 0 -or @($calls|Where-Object{$_.operation -cne 'status' -or $_.root -cne $runtimeRoot}).Count -ne 0) { throw 'Unconfirmed original runtime changed registration or dispatched a restart.' }
+if([IO.File]::ReadAllText($configPath) -cne $originalConfig -or [IO.File]::ReadAllText($lockPath) -cne $lockText -or -not (Test-Path -LiteralPath $transactionPath)) { throw 'Unconfirmed original runtime lost config, lock or pending transaction.' }
+Remove-Item -LiteralPath $lockPath
+$checks.Add('unconfirmed_original_runtime_preserves_lock_config_transaction_without_restart')
 $materials=@{'caller.key'='synthetic caller unchanged';'worker.key'='synthetic worker unchanged';'tasks.sqlite'='synthetic task data unchanged'}
 foreach($name in $materials.Keys){[IO.File]::WriteAllText((Join-Path $data $name),$materials[$name])}
 $transaction.current_registration_root=Join-Path $work 'new caller'
@@ -87,16 +97,16 @@ Write-Json $transactionPath $transaction;$calls.Clear();$script:failOldRegistrat
 try {Rollback-Transaction $transaction;throw 'Partial old registration failure was accepted.'}catch{if($_.Exception.Message -cne 'synthetic_old_registration_partial_failure'){throw}}
 $partial=Read-Json $transactionPath
 if($partial.current_registration_root -cne $callerRoot -or $partial.registration_changed -ne $true -or (Read-Json (Join-Path $data 'installation.json')).synthetic_partial_old_registration -cne $callerRoot) {throw 'Partial old registration lost its persisted owner or pending transaction.'}
-if(@($calls|Where-Object{$_.operation -ceq 'registration'}).Count -ne 1 -or @($calls|Where-Object{$_.operation -cin @('run','status')}).Count -ne 0) {throw 'Unknown old registration result retried setup or started background work.'}
+if($calls.Count -ne 3 -or $calls[0].operation -cne 'cleanup' -or $calls[1].operation -cne 'registration' -or $calls[1].root -cne $callerRoot -or $calls[2].operation -cne 'run' -or $calls[2].root -cne $runtimeRoot -or $calls[2].version -cne '0.2.0-alpha.7' -or $calls[2].node -cne $node -or ($calls[2].arguments -join '|') -cne ('run|--supervisor|--data-dir|'+$data)) {throw 'Partial old registration failure retried setup or resumed a different runtime.'}
 if([IO.File]::ReadAllText($configPath) -cne $originalConfig){throw 'Partial old registration changed original config.'}
 foreach($name in $materials.Keys){if([IO.File]::ReadAllText((Join-Path $data $name)) -cne $materials[$name]){throw 'Partial old registration changed protected fixture data.'}}
 $checks.Add('partial_old_registration_failure_persists_old_owner_before_write_and_keeps_transaction')
-$checks.Add('partial_old_registration_failure_preserves_config_tasks_keys_without_retry_or_start')
+$checks.Add('partial_old_registration_failure_preserves_config_tasks_keys_and_resumes_only_verified_original_runtime')
 $script:failOldRegistration=$false
 $calls.Clear();$transaction.registration_changed=$false
 Write-Json $transactionPath $transaction
 Rollback-Transaction $transaction
-if($calls.Count -ne 2 -or $calls[1].root -cne $runtimeRoot) { throw 'Pre-Commit rollback failed to resume original runtime.' }
+if($calls.Count -ne 1 -or $calls[0].operation -cne 'run' -or $calls[0].root -cne $runtimeRoot -or $calls[0].node -cne $node -or ($calls[0].arguments -join '|') -cne ('run|--supervisor|--data-dir|'+$data)) { throw 'Pre-Commit rollback failed to resume original runtime.' }
 $checks.Add('stopped_before_registration_change_resumes_original_runtime')
 $transaction.registration_changed=$true;$script:failRuntimeRun=$true
 Write-Json $transactionPath $transaction

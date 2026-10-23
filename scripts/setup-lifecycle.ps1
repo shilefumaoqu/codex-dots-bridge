@@ -702,7 +702,11 @@ function Rollback-Transaction($Transaction) {
     $runtimeRoot=Resolve-OldRuntimeRoot $Transaction.old_config $Transaction.old_root
     if(-not $runtimeRoot) { throw 'invalid_old_runtime_metadata' }
     if($Transaction.old_runtime_root -and $Transaction.old_runtime_root -cne $runtimeRoot) { throw 'old_runtime_binding_changed' }
-  } } catch { $errors.Add($_.Exception.Message) }
+  } } catch {
+    # An unverified runtime identity must stop rollback before any registration
+    # or process mutation. Keep the transaction for explicit recovery.
+    throw
+  }
   $preserveLiveOriginal=$false
   try { if($runtimeRoot -and $Transaction.old_config_text){
     $originalSnapshot=Read-OriginalRuntimeSnapshot $Transaction $runtimeRoot
