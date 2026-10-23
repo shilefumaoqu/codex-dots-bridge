@@ -111,6 +111,29 @@ function Bridge([string[]]$BridgeArguments) {
 function Installer-Arguments {
   @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/TASKS=autostart',('/TESTINSTANCE='+$testInstance),('/DIR='+$app),('/DATADIR='+$data),('/CODEXHOME='+$CodexDirectory),('/CODEXCOMMAND='+$CodexCommand),('/APPDATADIR='+$startup))
 }
+function Assert-OwnedStartup {
+  $current=Read-State
+  $manifest=Get-Content -LiteralPath (Join-Path $data 'installation.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  $entry=$manifest.autostart
+  Assert-Condition ([bool]$entry -and [bool]$current.autostart) 'Owned startup registration is missing.'
+  $isLink=$entry.kind -eq 'startup-link'
+  $name=if($isLink){'CodexDotsBridge.lnk'}else{'CodexDotsBridge.vbs'}
+  $path=Join-Path $startup ('Microsoft\Windows\Start Menu\Programs\Startup\'+$name)
+  Assert-Condition ($entry.path -ieq $path -and (Test-Path -LiteralPath $path -PathType Leaf)) 'Startup path is not the isolated owned entry.'
+  if($isLink) {
+    $launcher=Join-Path $app 'CodexDotsBridge.Launcher.exe'
+    Assert-Condition ($entry.launcher -ieq $launcher -and $manifest.autostart_launcher -ieq $launcher -and (Test-Path -LiteralPath $launcher -PathType Leaf)) 'Startup launcher identity is inconsistent.'
+    Assert-Condition ([Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) -ceq $entry.content) 'Startup bytes differ from the owned manifest.'
+    $link=Read-TestShellLink $path
+    Assert-Condition ($link.TargetPath -ieq $launcher -and $link.Arguments -ceq '--autostart' -and $link.WorkingDirectory -ieq $app) 'Startup shortcut does not target the stable Launcher with the expected arguments and directory.'
+    Assert-Condition ($manifest.mcp.args[0] -ieq (Join-Path $current.payload_root 'dist\main.js')) 'Launcher selected payload differs from the registered payload.'
+  } else {
+    Assert-Condition (-not $entry.kind -or $entry.kind -eq 'legacy-vbs') 'Unknown startup format.'
+    $content=[IO.File]::ReadAllText($path)
+    Assert-Condition ($content -ceq $entry.content -and $content.Contains($current.payload_root)) 'Legacy startup differs from its manifest or points to an old payload.'
+  }
+  return $path
+}
 function Assert-TrayShortcut {
   if(-not $ExpectDirectTrayShortcut) { return }
   $current=Read-State
@@ -309,15 +332,16 @@ public static class OneAddFailure {
   $rollbackState=[IO.File]::ReadAllText((Join-Path $app 'installation-state.json'))
   $rollbackConfig=[IO.File]::ReadAllText($configPath)
   $rollbackSkill=[IO.File]::ReadAllBytes((Join-Path $CodexDirectory 'skills\codex-dots-bridge\SKILL.md'))
-  $startupFile=Join-Path $startup 'Microsoft\Windows\Start Menu\Programs\Startup\CodexDotsBridge.vbs'
-  $rollbackStartup=[IO.File]::ReadAllText($startupFile)
+  $startupFile=Assert-OwnedStartup
+  $rollbackStartup=[Convert]::ToBase64String([IO.File]::ReadAllBytes($startupFile))
   $failureArgs=@(Installer-Arguments | Where-Object {$_ -notlike '/CODEXCOMMAND=*'}) + @('/CODEXCOMMAND='+$failureCli)
   Run-Executable $SetupExecutable $failureArgs $false
   Assert-Condition ($lastInstallerExitCode -eq 20 -and (Test-Path -LiteralPath $failureMarker)) 'Commit failure did not propagate its custom nonzero exit code.'
   Assert-Condition ([IO.File]::ReadAllText((Join-Path $app 'installation-state.json')) -ceq $rollbackState) 'Rollback changed prior installer state.'
   Assert-Condition ([IO.File]::ReadAllText($configPath) -ceq $rollbackConfig) 'Rollback did not restore original configuration bytes.'
   Assert-Condition ([Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $CodexDirectory 'skills\codex-dots-bridge\SKILL.md'))) -ceq [Convert]::ToBase64String($rollbackSkill)) 'Rollback did not restore the owned Skill.'
-  Assert-Condition ([IO.File]::ReadAllText($startupFile) -ceq $rollbackStartup) 'Rollback did not restore owned startup.'
+  Assert-Condition ([Convert]::ToBase64String([IO.File]::ReadAllBytes($startupFile)) -ceq $rollbackStartup) 'Rollback did not restore owned startup bytes.'
+  Assert-OwnedStartup | Out-Null
   Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $app '.setup-transaction.json'))) 'Rollback retained an unresolved transaction.'
   $rollbackManifest=Get-Content -LiteralPath (Join-Path $data 'installation.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   $rollbackStateData=Read-State
@@ -360,7 +384,8 @@ public static class OneAddFailure {
     foreach($property in $fallbackState.PSObject.Properties) {
       if($property.Name -ne 'codex_command') { Assert-Condition (($property.Value | ConvertTo-Json -Depth 30 -Compress) -ceq ($recoveredState.($property.Name) | ConvertTo-Json -Depth 30 -Compress)) ('Fallback changed installer state field: '+$property.Name) }
     }
-    Assert-Condition ([IO.File]::ReadAllText($configPath) -ceq $fallbackConfig -and [IO.File]::ReadAllText($startupFile) -ceq $rollbackStartup -and [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $CodexDirectory 'skills\codex-dots-bridge\SKILL.md'))) -ceq [Convert]::ToBase64String($rollbackSkill)) 'Fallback changed preserved configuration, Skill or startup.'
+    Assert-Condition ([IO.File]::ReadAllText($configPath) -ceq $fallbackConfig -and [Convert]::ToBase64String([IO.File]::ReadAllBytes($startupFile)) -ceq $rollbackStartup -and [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $CodexDirectory 'skills\codex-dots-bridge\SKILL.md'))) -ceq [Convert]::ToBase64String($rollbackSkill)) 'Fallback changed preserved configuration, Skill or startup.'
+    Assert-OwnedStartup | Out-Null
     Assert-Condition (-not (Test-Path -LiteralPath (Join-Path $app '.setup-transaction.json'))) 'Fallback retained an unresolved transaction.'
     Run-Executable $SetupExecutable (Installer-Arguments)
     $followingState=Read-State
@@ -429,8 +454,7 @@ public static class OneAddFailure {
   Assert-Condition ([IO.File]::ReadAllText((Join-Path $data 'worker.key')) -ceq $worker) 'Worker key changed.'
   Assert-Condition ([IO.File]::ReadAllText($desktopPath) -ceq $desktop) 'Desktop access configuration changed.'
   Assert-Condition ([IO.File]::ReadAllText($configToml).Contains('preserve-command')) 'Unrelated MCP changed.'
-  $startupFile=Join-Path $startup 'Microsoft\Windows\Start Menu\Programs\Startup\CodexDotsBridge.vbs'
-  Assert-Condition ([IO.File]::ReadAllText($startupFile).Contains($after.payload_root)) 'Startup points to old payload.'
+  $startupFile=Assert-OwnedStartup
   $node=Join-Path $after.payload_root 'runtime\node-v24.21.0-win-x64\node.exe'
   Push-Location $after.payload_root
   try {
