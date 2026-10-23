@@ -38,9 +38,50 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $originalOwner = $identity.Owner
 $user = $identity.User
 Write-Output ('CI default owner: ' + $originalOwner.Value + '; expected user: ' + $user.Value)
-$probe = Join-Path ([IO.Path]::GetTempPath()) ('dots-ci-owner-' + [Guid]::NewGuid().ToString('N'))
+$originalTemp = $env:TEMP
+$originalTmp = $env:TMP
+$probe = $null
 try {
     [DotsCiTokenOwner]::SetOwner($user)
+    # Inspect actual PS5/CIM/CodeDom prerequisites. The token change above only
+    # affects new objects, so also report the pre-existing known user Temp owner.
+    $environmentCheck = @'
+$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+if($env:GITHUB_ACTIONS -ne 'true' -or $PSVersionTable.PSVersion.Major -ne 5){throw 'Expected disposable Windows CI with Windows PowerShell 5.'}
+$user=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$local=[Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+if(-not $local -or -not [IO.Path]::IsPathRooted($local)){throw 'CI known user Temp is unavailable.'}
+$directory=[IO.Path]::GetFullPath([IO.Path]::Combine($local,'Temp'))
+if(-not [IO.Directory]::Exists($directory)){throw 'CI known user Temp is missing.'}
+$reparse=@()
+for($cursor=$directory;$cursor;$cursor=[IO.Path]::GetDirectoryName($cursor)){
+    if(([IO.File]::GetAttributes($cursor) -band [IO.FileAttributes]::ReparsePoint) -ne 0){$reparse+=$cursor}
+}
+$acl=[IO.Directory]::GetAccessControl($directory)
+$owner=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+$cim='passed'
+try{
+    foreach($command in @('Get-CimInstance','New-CimInstance','Invoke-CimMethod')){$null=Get-Command $command -ErrorAction Stop}
+    $process=Get-CimInstance Win32_Process -Filter ('ProcessId='+$PID) -OperationTimeoutSec 5 -ErrorAction Stop
+    if(-not $process -or $process.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId){throw 'CIM process/session mismatch.'}
+}catch{$cim=$_.Exception.GetType().Name+': '+$_.Exception.Message}
+$inheritedTemp=$env:TEMP;$env:TEMP=$directory;$env:TMP=$directory
+$compile='passed'
+try{Add-Type -TypeDefinition 'public static class DotsCiCompilerProbe { public static int Value() { return 1; } }' -ErrorAction Stop;if([DotsCiCompilerProbe]::Value() -ne 1){throw 'CodeDom result mismatch.'}}
+catch{$compile=$_.Exception.GetType().Name+': '+$_.Exception.Message}
+@{powershell=$PSVersionTable.PSVersion.ToString();edition=$PSVersionTable.PSEdition;temp=$inheritedTemp;knownTemp=$directory;owner=$owner;user=$user.Value;ownerTrusted=($owner -in @($user.Value,'S-1-5-18'));reparseAncestors=$reparse;cimProcessQuery=$cim;compilation=$compile}|ConvertTo-Json -Compress
+'@
+    $environmentOutput = @(& powershell.exe -NoProfile -NonInteractive -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($environmentCheck))))
+    $environmentExit = $LASTEXITCODE
+    $environmentOutput | ForEach-Object { Write-Output ('CI native environment: ' + $_) }
+    if ($environmentExit -ne 0) { throw 'CI native environment preflight failed.' }
+    $environmentResult = $environmentOutput[-1] | ConvertFrom-Json
+    if (-not $environmentResult.ownerTrusted -or @($environmentResult.reparseAncestors).Count) { throw 'CI known user Temp does not satisfy the unchanged production path/owner guard.' }
+    if ($environmentResult.cimProcessQuery -ne 'passed' -or $environmentResult.compilation -ne 'passed') { throw 'CI native CIM/CodeDom prerequisite probe failed.' }
+    # Avoid RUNNER~1 aliases in Node fixtures and native path receipts.
+    $env:TEMP = $environmentResult.knownTemp
+    $env:TMP = $environmentResult.knownTemp
+    $probe = Join-Path ([IO.Path]::GetTempPath()) ('dots-ci-owner-' + [Guid]::NewGuid().ToString('N'))
     $env:CODEX_DOTS_CI_OWNER_PROBE = $probe
     # Verify the actual Node child creates current-user-owned objects before running unchanged tests.
     $node = Join-Path (Split-Path -Parent $PSScriptRoot) '.runtime\node-v24.21.0-win-x64\node.exe'
@@ -74,8 +115,10 @@ Write-Output ('CI child owner verified: '+$owner)
     }
 } finally {
     [DotsCiTokenOwner]::SetOwner($originalOwner)
+    $env:TEMP = $originalTemp
+    $env:TMP = $originalTmp
     $identity.Dispose()
     Remove-Item Env:CODEX_DOTS_CI_OWNER_PROBE -ErrorAction SilentlyContinue
     # The probe is a unique empty directory. Never recursively delete a computed target.
-    if (Test-Path -LiteralPath $probe) { [IO.Directory]::Delete($probe, $false) }
+    if ($probe -and (Test-Path -LiteralPath $probe)) { [IO.Directory]::Delete($probe, $false) }
 }
