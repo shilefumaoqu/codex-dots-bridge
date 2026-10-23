@@ -196,13 +196,33 @@ test('legacy Startup ownership survives failed MCP readback and failed replaceme
   }finally{mock.restoreAll();syncBuiltinESMExports();if(priorAppData===undefined)delete process.env.APPDATA;else process.env.APPDATA=priorAppData;cleanup(root);}
 });
 
-test('hidden supervisor owns one bridge, rejects duplicate and stops without task cancellation',async()=>{
+test('hidden supervisor owns one bridge, rejects duplicate and stops without task cancellation',async t=>{
   const root=mkdtempSync(join(tmpdir(),'dots supervisor ')),dir=join(root,'data'),entry=join(root,'synthetic main.mjs');initProduction(dir);
+  const diagnosticHelper=join(root,'launch-background-diagnostic.ps1');
+  let helper=readFileSync(resolve('scripts/launch-background.ps1'),'utf8');
+  for(const [statement,stage] of [["$ErrorActionPreference='Stop'",'script_started'],['$compilationTemp=Set-DotsUserCompilationTemp','compilation_temp'],['$startup=New-DotsProcessStartup $environment','process_startup'],['$result=Invoke-DotsProcessCreate $command (Split-Path -Parent $exe) $startup','process_create'],['$created=Get-DotsCreatedProcess ([uint32]$result.ProcessId)','process_query'],['$owner=Get-DotsCreatedOwner $created','owner_query']]) {
+    assert.ok(helper.includes(statement));helper=helper.replace(statement,`[Console]::Error.WriteLine('fixture_before:${stage}');${statement};[Console]::Error.WriteLine('fixture_after:${stage}')`);
+  }
+  writeFileSync(diagnosticHelper,helper);
+  const originalSpawn=childProcess.spawn,brokerReceipts:unknown[]=[];
+  childProcess.spawn=((...args:unknown[])=>{
+    const argv=args[1],helperIndex=Array.isArray(argv)?argv.findIndex(value=>String(value).endsWith('launch-background.ps1')):-1;
+    if(helperIndex>=0){const instrumented=[...(argv as string[])];instrumented[helperIndex]=diagnosticHelper;args[1]=instrumented;}
+    const child=(originalSpawn as Function)(...args);
+    if(helperIndex>=0){
+      const started=Date.now(),receipt:{elapsedMs?:number;pid?:number;status?:number;signal?:string;stdout:string;stderr:string}={pid:child.pid,stdout:'',stderr:''};brokerReceipts.push(receipt);
+      child.stdout?.on('data',(data:Buffer)=>{receipt.stdout=(receipt.stdout+String(data)).slice(0,1200);receipt.elapsedMs=Date.now()-started;});
+      child.stderr?.on('data',(data:Buffer)=>{receipt.stderr=(receipt.stderr+String(data)).slice(0,1200);receipt.elapsedMs=Date.now()-started;});
+      child.on('close',(status:number,signal:string)=>{receipt.status=status;receipt.signal=signal;receipt.elapsedMs=Date.now()-started;});
+    }
+    return child;
+  }) as typeof childProcess.spawn;syncBuiltinESMExports();
   const moduleURL=pathToFileURL(resolve('dist/supervisor.js')).href;
   writeFileSync(entry,`import { readFileSync,writeFileSync,unlinkSync } from 'node:fs'; import { join } from 'node:path'; import {createServer} from 'node:http'; const args=process.argv.slice(2),dir=args[args.indexOf('--data-dir')+1]; if(args.includes('--supervisor')) {const {runSupervisor}=await import(${JSON.stringify(moduleURL)}); await runSupervisor(dir,{nodePath:process.execPath,entryPath:process.argv[1]});} else { const server=createServer((_,res)=>res.end('test'));server.listen(0,'127.0.0.1',()=>{const config=JSON.parse(readFileSync(join(dir,'config.json'),'utf8'));config.endpoint='http://127.0.0.1:'+server.address().port+'/';writeFileSync(join(dir,'service.lock'),JSON.stringify({pid:process.pid,owner:'synthetic'}));writeFileSync(join(dir,'config.json'),JSON.stringify(config));process.send?.({type:'bridge_ready',endpoint:config.endpoint});});process.on('message',m=>{if(m.type==='shutdown')server.close(()=>{unlinkSync(join(dir,'service.lock'));process.disconnect();});});}`);
   try {
     const options={nodePath:process.execPath,entryPath:entry};const started=await startSupervisor(dir,options);assert.equal(started.supervisor,'running');assert.equal(started.bridge,'running');assert.equal(started.tunnel,'stopped');assert.ok(readProductionConfig(dir).endpoint);await assert.rejects(()=>startSupervisor(dir,options),/supervisor_already_running|supervisor_recovery_endpoint_active_or_unknown|supervisor_recovery_same_data_process_active/);const stopped=await stopSupervisor(dir);assert.equal(stopped.dot_tasks,'not_cancelled');assert.ok(!existsSync(join(dir,'service.lock')));assert.ok(!existsSync(join(dir,'supervisor.lock')));
-  }finally{try{await stopSupervisor(dir);}catch{}cleanup(root);}
+  }catch(error){let state:unknown=null;try{if(existsSync(join(dir,'supervisor-state.json')))state=JSON.parse(readFileSync(join(dir,'supervisor-state.json'),'utf8'));}catch{state={unreadable:true};}t.diagnostic(JSON.stringify({brokerReceipts,state}));throw error;}
+  finally{childProcess.spawn=originalSpawn;syncBuiltinESMExports();try{await stopSupervisor(dir);}catch{}cleanup(root);}
 });
 test('foreign MCP collision is preserved; changed owned registration is retained during uninstall',{skip:!process.env.CODEX_DOTS_TEST_CODEX},()=>{
   const root=mkdtempSync(join(tmpdir(),'dots mcp collision '));try {

@@ -31,6 +31,12 @@ $errors=$null;$tokens=$null;$ast=[Management.Automation.Language.Parser]::ParseF
 # isolated Temp copy; otherwise its automatic PSScriptRoot would be empty.
 $helperRoot="'"+$PSScriptRoot.Replace("'","''")+"'"
 foreach($definition in $ast.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst]},$true)){. ([ScriptBlock]::Create($definition.Extent.Text.Replace('$PSScriptRoot',$helperRoot)))}
+$script:actualInstallerHelper=(Get-Command Invoke-InstallerHelper -CommandType Function).ScriptBlock
+function Invoke-InstallerHelper([string]$Kind,[string]$Directory,[string]$Root='',[int]$TimeoutMs=20000,[int]$ExpectedPid=0,[string]$PreviousOwner=''){
+  $clock=[Diagnostics.Stopwatch]::StartNew();[Console]::Error.WriteLine('fixture_helper_started:'+ $Kind)
+  try{& $script:actualInstallerHelper @PSBoundParameters}
+  finally{[Console]::Error.WriteLine('fixture_helper_finished:'+ $Kind+':'+$clock.ElapsedMilliseconds)}
+}
 $main=@($ast.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})[-1]
 $nl=[Environment]::NewLine
 $body=(@($main.Body.Statements | Where-Object {$_ -isnot [Management.Automation.Language.ExitStatementAst]} | ForEach-Object {$_.Extent.Text}) -join $nl)
@@ -48,18 +54,24 @@ function Assert-OwnedRegistration{return [pscustomobject]@{mcp_present=$script:r
 function Setup-Registration{$script:setupCalls++;throw 'unexpected_registration_write_on_live_original'}
 function Stop-Tray{$script:stopCalls++;throw 'unexpected_stop_on_live_original'}
 function Start-InstallerSupervisor{throw 'unexpected_duplicate_original_start'}
+[Console]::Error.WriteLine('fixture_initial_snapshot_started')
 $initial=Read-Json $transactionPath;$snapshot=Read-OriginalRuntimeSnapshot $initial $r.source
+[Console]::Error.WriteLine('fixture_initial_snapshot_finished')
 if(-not $snapshot.ready){
   $helper=Invoke-InstallerHelper -Kind Ready -Directory $initial.data_dir -Root $r.source
   $auth=Test-OriginalEndpointAuthentication $initial.data_dir ((Read-Json (Join-Path $initial.data_dir 'config.json')).endpoint)
   throw ('initial_snapshot_probe:'+(@{persistent_match=$snapshot.persistent_match;locks=$snapshot.locks;ready=$helper.ready;auth=$auth}|ConvertTo-Json -Compress))
 }
 for($attempt=0;$attempt -lt 2;$attempt++){
+  [Console]::Error.WriteLine('fixture_rollback_started:'+ $attempt)
   $transaction=Read-Json $transactionPath
   try{Rollback-Transaction $transaction;throw 'incomplete registration accepted'}catch{if($_.Exception.Message -cne 'rollback_registration_requires_stopped_runtime'){throw}}
+  [Console]::Error.WriteLine('fixture_rollback_finished:'+ $attempt)
 }
 $script:registrationComplete=$true;$Action='RecoverRollback';$DeferAutostart=$true;$InstallerIdentity='CodexDotsBridgeSetup';$validatedDirectory=$false;$ownsTransaction=$false;$code=''
+[Console]::Error.WriteLine('fixture_recovery_started')
 . $lifecycle | Out-Null
+[Console]::Error.WriteLine('fixture_recovery_finished')
 if($code){throw $code}
 $state=Read-Json $statePath
 @{setup_calls=$script:setupCalls;stop_calls=$script:stopCalls;pending=(Test-Path -LiteralPath $transactionPath);record=$state.recovery_record;record_sha256=$state.recovery_sha256}|ConvertTo-Json -Compress

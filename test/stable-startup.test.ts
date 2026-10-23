@@ -10,13 +10,34 @@ import { createHash } from 'node:crypto';
 import { initProduction, writeProductionConfig } from '../src/runtime.js';
 import { installCodex, uninstallCodex, type InstallManifest } from '../src/maintenance.js';
 import { inspectStartupLink, startupPath } from '../src/startup-link.js';
-import { readTrayAutostart, setTrayAutostart } from '../src/tray-autostart.js';
+import { readTrayAutostart, setTrayAutostart as setNativeTrayAutostart } from '../src/tray-autostart.js';
 
 const enabled=process.platform==='win32';
 const build=enabled?mkdtempSync(join(tmpdir(),'dots launcher build ')):'';
 if(enabled)execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',resolve('scripts/build-launcher.ps1'),'-OutputDirectory',build],{windowsHide:true,stdio:'pipe'});
 const binary=join(build,'CodexDotsBridge.Launcher.exe');
 const hash=(path:string)=>createHash('sha256').update(readFileSync(path)).digest('hex');
+let launcherFailureDiagnosed=false;
+function setTrayAutostart(dir:string,enable:boolean) {
+  try{return setNativeTrayAutostart(dir,enable);}
+  catch(error) {
+    if(!launcherFailureDiagnosed&&(error as {code?:string}).code==='launcher_operation_failed') {
+      launcherFailureDiagnosed=true;
+      // Only this synthetic fixture is retried through reflection, so the real
+      // Launcher exposes the exception its production receipt intentionally hides.
+      try {
+      const launcher=JSON.parse(readFileSync(join(dir,'installation.json'),'utf8')).autostart_launcher;
+      const probe=String.raw`$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
+$assembly=[Reflection.Assembly]::LoadFile($env:DOTS_TEST_LAUNCHER)
+$method=$assembly.GetType('CodexDotsBridge.Launcher.Program').GetMethod('StartupCommand',[Reflection.BindingFlags]'NonPublic,Static')
+try{$null=$method.Invoke($null,@('enable',$null));@{result='reflection_enable_passed'}|ConvertTo-Json -Compress}
+catch{$chain=@();$exception=$_.Exception;while($exception){$chain+=@{type=$exception.GetType().FullName;hresult=$exception.HResult;message=$exception.Message};$exception=$exception.InnerException};@{result='reflection_enable_failed';session=[Diagnostics.Process]::GetCurrentProcess().SessionId;apartment=[Threading.Thread]::CurrentThread.ApartmentState.ToString();exceptions=$chain}|ConvertTo-Json -Compress -Depth 5}`;
+      console.error('Launcher synthetic failure detail: '+execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(probe,'utf16le').toString('base64')],{encoding:'utf8',windowsHide:true,timeout:15000,env:{...process.env,DOTS_TEST_LAUNCHER:launcher}}).trim());}
+      catch(probeError){console.error('Launcher synthetic diagnostic failed: '+String(probeError));}
+    }
+    throw error;
+  }
+}
 function fixture(inspectUnicode=false){
   const base=mkdtempSync(join(tmpdir(),"dots stable 中文"+(inspectUnicode?'ع😀':'')+" O'Brien $literal ")),root=join(base,'app'),payload=join(root,'payload','0.2.0-alpha.24'),dir=join(base,'data'),appdata=join(base,'appdata'),home=join(base,'home');
   mkdirSync(join(payload,'dist'),{recursive:true});mkdirSync(join(payload,'skills','codex-dots-bridge'),{recursive:true});mkdirSync(home,{recursive:true});

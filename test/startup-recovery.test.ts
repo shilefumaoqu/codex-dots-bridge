@@ -98,12 +98,20 @@ test('startup diagnostics retain foreign files',()=>{
 
 test('startup diagnostics replace an existing receipt with real Windows PowerShell 5 and retain valid foreign JSON',()=>{
   const f=fixture(false);
+  const original=childProcess.execFileSync,nativeWrites:unknown[]=[];
   try {
     const path=startupDiagnosticPath(f.dir);
+    childProcess.execFileSync=((command:unknown,args:unknown,options:unknown)=>{
+      const settings=options as {env?:NodeJS.ProcessEnv};
+      if(settings?.env?.CODEX_DOTS_STARTUP_PATH!==path)return (original as Function)(command,args,options);
+      const started=Date.now();
+      try{const result=(original as Function)(command,args,{...settings,stdio:['pipe','pipe','pipe']});nativeWrites.push({elapsedMs:Date.now()-started,status:0});return result;}
+      catch(error){const native=error as {code?:string;status?:number;signal?:string;stderr?:Buffer};nativeWrites.push({elapsedMs:Date.now()-started,code:native.code,status:native.status,signal:native.signal,stderr:String(native.stderr??'').slice(0,2400)});throw error;}
+    }) as typeof childProcess.execFileSync;syncBuiltinESMExports();
     const first={schema:1 as const,owner:'codex-dots-bridge-startup' as const,mode:'manual' as const,outcome:'failed' as const,events:[]};
     const second={...first,mode:'autostart' as const,outcome:'running' as const};
     writeStartupDiagnostic(f.dir,first);assert.deepEqual(JSON.parse(readFileSync(path,'utf8')),first);
-    writeStartupDiagnostic(f.dir,second);assert.deepEqual(JSON.parse(readFileSync(path,'utf8')),second);
+    writeStartupDiagnostic(f.dir,second);assert.deepEqual(JSON.parse(readFileSync(path,'utf8')),second,JSON.stringify({nativeWrites}));
     if(process.platform==='win32') {
       const script=String.raw`$ErrorActionPreference='Stop';$acl=[IO.File]::GetAccessControl($env:DOTS_TEST_RECEIPT);@{major=$PSVersionTable.PSVersion.Major;owner_valid=$acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value;protected=$acl.AreAccessRulesProtected;rules=@($acl.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])).Count}|ConvertTo-Json -Compress`;
       const actual=JSON.parse(childProcess.execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(script,'utf16le').toString('base64')],{encoding:'utf8',windowsHide:true,env:{...process.env,DOTS_TEST_RECEIPT:path}}));
@@ -111,7 +119,7 @@ test('startup diagnostics replace an existing receipt with real Windows PowerShe
     }
     const foreign=JSON.stringify({...first,owner:'isolated-foreign-receipt'});writeFileSync(path,foreign);
     writeStartupDiagnostic(f.dir,second);assert.equal(readFileSync(path,'utf8'),foreign);
-  }finally {f.close();}
+  }finally {childProcess.execFileSync=original;syncBuiltinESMExports();f.close();}
 });
 
 test('autostart and stop conflict before any startup or shutdown side effect',()=>{
