@@ -104,8 +104,21 @@ test('startup diagnostics replace an existing receipt with real Windows PowerShe
     childProcess.execFileSync=((command:unknown,args:unknown,options:unknown)=>{
       const settings=options as {env?:NodeJS.ProcessEnv};
       if(settings?.env?.CODEX_DOTS_STARTUP_PATH!==path)return (original as Function)(command,args,options);
+      const instrumented=[...(args as string[])],encoded=instrumented.indexOf('-EncodedCommand')+1;
+      assert.ok(encoded>0);
+      let script=Buffer.from(instrumented[encoded]!,'base64').toString('utf16le');
+      for(const [statement,stage] of [
+        ['$text=[Console]::In.ReadToEnd()','stdin_read'],
+        ["Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1')) -Global -ErrorAction Stop",'utility_import'],
+        ['$old=[IO.File]::ReadAllText($path)|ConvertFrom-Json','existing_json'],
+        ['[IO.File]::Replace($temp,$path,[NullString]::Value)','replace_file'],
+        ['[IO.File]::Move($temp,$path)','move_file'],
+      ]) {
+        assert.ok(script.includes(statement));script=script.replace(statement,`[Console]::Error.WriteLine('fixture_before:${stage}');${statement};[Console]::Error.WriteLine('fixture_after:${stage}')`);
+      }
+      instrumented[encoded]=Buffer.from(script,'utf16le').toString('base64');
       const started=Date.now();
-      try{const result=(original as Function)(command,args,{...settings,stdio:['pipe','pipe','pipe']});nativeWrites.push({elapsedMs:Date.now()-started,status:0});return result;}
+      try{const result=(original as Function)(command,instrumented,{...settings,stdio:['pipe','pipe','pipe']});nativeWrites.push({elapsedMs:Date.now()-started,status:0});return result;}
       catch(error){const native=error as {code?:string;status?:number;signal?:string;stderr?:Buffer};nativeWrites.push({elapsedMs:Date.now()-started,code:native.code,status:native.status,signal:native.signal,stderr:String(native.stderr??'').slice(0,2400)});throw error;}
     }) as typeof childProcess.execFileSync;syncBuiltinESMExports();
     const first={schema:1 as const,owner:'codex-dots-bridge-startup' as const,mode:'manual' as const,outcome:'failed' as const,events:[]};

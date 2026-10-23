@@ -1,8 +1,8 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, existsSync, rmSync, statSync, unlinkSync } from 'node:fs';
-import { join, resolve } from 'node:path';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, copyFileSync, existsSync, rmSync, statSync, unlinkSync, readdirSync } from 'node:fs';
+import { join, resolve, dirname } from 'node:path';
+import { tmpdir, release } from 'node:os';
 import childProcess, { execFileSync } from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import fs from 'node:fs';
@@ -10,39 +10,18 @@ import { createHash } from 'node:crypto';
 import { initProduction, writeProductionConfig } from '../src/runtime.js';
 import { installCodex, uninstallCodex, type InstallManifest } from '../src/maintenance.js';
 import { inspectStartupLink, startupPath } from '../src/startup-link.js';
-import { readTrayAutostart, setTrayAutostart as setNativeTrayAutostart } from '../src/tray-autostart.js';
+import { readTrayAutostart, setTrayAutostart } from '../src/tray-autostart.js';
 
 const enabled=process.platform==='win32';
 const build=enabled?mkdtempSync(join(tmpdir(),'dots launcher build ')):'';
 if(enabled)execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',resolve('scripts/build-launcher.ps1'),'-OutputDirectory',build],{windowsHide:true,stdio:'pipe'});
 const binary=join(build,'CodexDotsBridge.Launcher.exe');
 const hash=(path:string)=>createHash('sha256').update(readFileSync(path)).digest('hex');
-let launcherFailureDiagnosed=false;
-function setTrayAutostart(dir:string,enable:boolean) {
-  try{return setNativeTrayAutostart(dir,enable);}
-  catch(error) {
-    if(!launcherFailureDiagnosed&&(error as {code?:string}).code==='launcher_operation_failed') {
-      launcherFailureDiagnosed=true;
-      // Only this synthetic fixture is retried through reflection, so the real
-      // Launcher exposes the exception its production receipt intentionally hides.
-      try {
-      const launcher=JSON.parse(readFileSync(join(dir,'installation.json'),'utf8')).autostart_launcher;
-      const probe=String.raw`$ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
-$assembly=[Reflection.Assembly]::LoadFile($env:DOTS_TEST_LAUNCHER)
-$method=$assembly.GetType('CodexDotsBridge.Launcher.Program').GetMethod('StartupCommand',[Reflection.BindingFlags]'NonPublic,Static')
-try{$null=$method.Invoke($null,@('enable',$null));@{result='reflection_enable_passed'}|ConvertTo-Json -Compress}
-catch{$chain=@();$exception=$_.Exception;while($exception){$chain+=@{type=$exception.GetType().FullName;hresult=$exception.HResult;message=$exception.Message};$exception=$exception.InnerException};@{result='reflection_enable_failed';session=[Diagnostics.Process]::GetCurrentProcess().SessionId;apartment=[Threading.Thread]::CurrentThread.ApartmentState.ToString();exceptions=$chain}|ConvertTo-Json -Compress -Depth 5}`;
-      console.error('Launcher synthetic failure detail: '+execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(probe,'utf16le').toString('base64')],{encoding:'utf8',windowsHide:true,timeout:15000,env:{...process.env,DOTS_TEST_LAUNCHER:launcher}}).trim());}
-      catch(probeError){console.error('Launcher synthetic diagnostic failed: '+String(probeError));}
-    }
-    throw error;
-  }
-}
-function fixture(inspectUnicode=false){
-  const base=mkdtempSync(join(tmpdir(),"dots stable 中文"+(inspectUnicode?'ع😀':'')+" O'Brien $literal ")),root=join(base,'app'),payload=join(root,'payload','0.2.0-alpha.24'),dir=join(base,'data'),appdata=join(base,'appdata'),home=join(base,'home');
+function fixture(inspectUnicode=false,sourceBinary=binary,basePrefix?:string){
+  const base=mkdtempSync(join(tmpdir(),basePrefix??("dots stable 中文"+(inspectUnicode?'ع😀':'')+" O'Brien $literal "))),root=join(base,'app'),payload=join(root,'payload','0.2.0-alpha.24'),dir=join(base,'data'),appdata=join(base,'appdata'),home=join(base,'home');
   mkdirSync(join(payload,'dist'),{recursive:true});mkdirSync(join(payload,'skills','codex-dots-bridge'),{recursive:true});mkdirSync(home,{recursive:true});
   writeFileSync(join(payload,'dist','main.js'),'synthetic never executed');writeFileSync(join(payload,'package.json'),JSON.stringify({name:'codex-dots-bridge',version:'0.2.0-alpha.24'}));writeFileSync(join(payload,'skills','codex-dots-bridge','SKILL.md'),'old skill');
-  const launcher=join(root,'CodexDotsBridge.Launcher.exe');copyFileSync(binary,launcher);
+  const launcher=join(root,'CodexDotsBridge.Launcher.exe');copyFileSync(sourceBinary,launcher);
   const config=initProduction(dir);writeProductionConfig(dir,{...config,installation:{root:payload,node_path:process.execPath}});
   const state={owner:'codex-dots-bridge-setup',schema:1,install_directory:root,installer_app_id:'CodexDotsBridgeSetup',version:'0.2.0-alpha.24',payload_root:payload,data_dir:dir,codex_home:home,app_data:appdata,codex_command:process.execPath,launcher_sha256:hash(launcher)};
   writeFileSync(join(root,'installation-state.json'),JSON.stringify(state));
@@ -78,6 +57,47 @@ test('native toggle creates one stable visible-target link and repeated enable h
     setTrayAutostart(f.dir,false);assert.equal(existsSync(f.path),false);assert.equal(readTrayAutostart(f.dir),'disabled');
   }finally{f.close();}
 });
+
+test('Unicode startup targets work with a verified Windows-1252 process code page',{skip:!enabled||Number(release().split('.')[2])<22000},()=>{
+  // Locale manifests are supported on Windows 11+. Only the generated test
+  // executable changes code page; the user's locale and production manifest do not.
+  const western=mkdtempSync(join(tmpdir(),'dots launcher windows1252 '));
+  try {
+    const sourcePath=join(western,'Program.cs'),manifest=join(western,'app.manifest'),exe=join(western,'CodexDotsBridge.Launcher.exe');
+    let source=readFileSync(resolve('windows/launcher/Program.cs'),'utf8');
+    assert.ok(source.includes('static readonly JavaScriptSerializer Json')&&source.includes('if (args.Length == 1 && args[0] == "--version")'));
+    source=source.replace('static readonly JavaScriptSerializer Json','[DllImport("kernel32.dll", EntryPoint="GetACP")] static extern uint TestActiveCodePage();\n        static readonly JavaScriptSerializer Json').replace('if (args.Length == 1 && args[0] == "--version")','if (args.Length == 1 && args[0] == "--test-active-codepage") { WriteReceipt(new { acp = TestActiveCodePage() }); return 0; }\n                if (args.Length == 1 && args[0] == "--version")');
+    writeFileSync(sourcePath,source);
+    writeFileSync(manifest,'<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1" xmlns:asmv3="urn:schemas-microsoft-com:asm.v3"><assemblyIdentity type="win32" name="LauncherCodePageTest" version="1.0.0.0"/><asmv3:application><asmv3:windowsSettings><activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">en-US</activeCodePage></asmv3:windowsSettings></asmv3:application></assembly>');
+    execFileSync(join(process.env.WINDIR!,'Microsoft.NET','Framework64','v4.0.30319','csc.exe'),['/nologo','/target:winexe','/platform:x64','/optimize+','/langversion:5','/codepage:65001','/out:'+exe,'/win32manifest:'+manifest,'/reference:System.Web.Extensions.dll',sourcePath],{windowsHide:true,stdio:'pipe'});
+    assert.equal(JSON.parse(execFileSync(exe,['--test-active-codepage'],{encoding:'utf8',windowsHide:true})).acp,1252);
+    const f=fixture(true,exe);try {
+      setTrayAutostart(f.dir,true);const actual=inspectStartupLink(f.launcher);
+      assert.equal(actual.owned,true);assert.equal(actual.path,f.path);
+      const bytes=readFileSync(f.path),mtime=statSync(f.path).mtimeMs;
+      setTrayAutostart(f.dir,true);assert.deepEqual(readFileSync(f.path),bytes);assert.equal(statSync(f.path).mtimeMs,mtime);
+      assert.deepEqual(readdirSync(f.root).filter(name=>/^\.startup-.*\.lnk$/.test(name)),[]);
+      setTrayAutostart(f.dir,false);assert.equal(existsSync(f.path),false);
+    }finally{f.close();}
+  }finally{rmSync(western,{recursive:true,force:true});}
+});
+
+test('existing WScript shortcuts are inspected without saving and modified arguments remain foreign',{skip:!enabled},()=>{
+  const f=fixture(false,binary,'dots stable ascii ');
+  try {
+    mkdirSync(dirname(f.path),{recursive:true});
+    const save=String.raw`$ErrorActionPreference='Stop';$r=$env:DOTS_TEST_LINK_REQUEST|ConvertFrom-Json;$shell=$null;$link=$null;try{$shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($r.path);$link.TargetPath=$r.target;$link.WorkingDirectory=$r.directory;$link.Arguments=$r.arguments;$link.Save()}finally{if($link){[Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)|Out-Null};if($shell){[Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)|Out-Null}}`;
+    const create=(args:string)=>execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-EncodedCommand',Buffer.from(save,'utf16le').toString('base64')],{windowsHide:true,stdio:'pipe',env:{...process.env,DOTS_TEST_LINK_REQUEST:JSON.stringify({path:f.path,target:f.launcher,directory:f.root,arguments:args})}});
+    create('--autostart');const bytes=readFileSync(f.path),mtime=statSync(f.path).mtimeMs;
+    assert.equal(inspectStartupLink(f.launcher).owned,true);
+    assert.equal(JSON.parse(execFileSync(f.launcher,['--startup','enable'],{encoding:'utf8',windowsHide:true})).owned,true);
+    assert.deepEqual(readFileSync(f.path),bytes);assert.equal(statSync(f.path).mtimeMs,mtime);
+    create('--autostart --user-change');const changed=readFileSync(f.path);
+    assert.equal(inspectStartupLink(f.launcher).owned,false);
+    assert.throws(()=>execFileSync(f.launcher,['--startup','enable'],{windowsHide:true,stdio:'pipe'}),error=>{assert.match(String((error as {stdout:Buffer}).stdout),/foreign_autostart_collision/);return true;});
+    assert.deepEqual(readFileSync(f.path),changed);
+  }finally{f.close();}
+});
 test('pending transaction and mismatched runtime fail before launch and leave a bounded native diagnostic',{skip:!enabled},()=>{
   const f=fixture();try{
     writeFileSync(join(f.root,'.setup-transaction.json'),'uncommitted transaction sentinel');
@@ -91,7 +111,7 @@ test('pending transaction and mismatched runtime fail before launch and leave a 
 test('foreign link and user-modified native registration are preserved',{skip:!enabled},()=>{
   const f=fixture();try{
     mkdirSync(join(f.path,'..'),{recursive:true});writeFileSync(f.path,'foreign shortcut');const original=readFileSync(f.manifestPath,'utf8');
-    assert.equal(readTrayAutostart(f.dir),'unknown');assert.throws(()=>setTrayAutostart(f.dir,true));assert.equal(readFileSync(f.path,'utf8'),'foreign shortcut');assert.equal(readFileSync(f.manifestPath,'utf8'),original);
+    assert.equal(readTrayAutostart(f.dir),'unknown');assert.equal(inspectStartupLink(f.launcher).owned,false);assert.throws(()=>setTrayAutostart(f.dir,true),/foreign_autostart_collision/);assert.equal(readFileSync(f.path,'utf8'),'foreign shortcut');assert.equal(readFileSync(f.manifestPath,'utf8'),original);
   }finally{f.close();}
 });
 test('cross-payload owned MCP/Skill upgrade retains exact stable link; a failed skill copy restores old MCP and files',{skip:!enabled},()=>{

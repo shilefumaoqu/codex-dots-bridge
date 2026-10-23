@@ -200,7 +200,19 @@ test('hidden supervisor owns one bridge, rejects duplicate and stops without tas
   const root=mkdtempSync(join(tmpdir(),'dots supervisor ')),dir=join(root,'data'),entry=join(root,'synthetic main.mjs');initProduction(dir);
   const diagnosticHelper=join(root,'launch-background-diagnostic.ps1');
   let helper=readFileSync(resolve('scripts/launch-background.ps1'),'utf8');
-  for(const [statement,stage] of [["$ErrorActionPreference='Stop'",'script_started'],['$compilationTemp=Set-DotsUserCompilationTemp','compilation_temp'],['$startup=New-DotsProcessStartup $environment','process_startup'],['$result=Invoke-DotsProcessCreate $command (Split-Path -Parent $exe) $startup','process_create'],['$created=Get-DotsCreatedProcess ([uint32]$result.ProcessId)','process_query'],['$owner=Get-DotsCreatedOwner $created','owner_query']]) {
+  for(const [statement,stage] of [
+    ["$ErrorActionPreference='Stop'",'script_started'],
+    ["try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch { }",'output_encoding'],
+    ["try { [Console]::InputEncoding=[Text.UTF8Encoding]::new($false) } catch { }",'input_encoding'],
+    ["Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1')) -Global -ErrorAction Stop",'utility_import'],
+    ['$text=[Console]::In.ReadToEnd()','stdin_read'],
+    ['$request=$text|ConvertFrom-Json','request_json'],
+    ['$compilationTemp=Set-DotsUserCompilationTemp','compilation_temp'],
+    ['$startup=New-DotsProcessStartup $environment','process_startup'],
+    ['$result=Invoke-DotsProcessCreate $command (Split-Path -Parent $exe) $startup','process_create'],
+    ['$created=Get-DotsCreatedProcess ([uint32]$result.ProcessId)','process_query'],
+    ['$owner=Get-DotsCreatedOwner $created','owner_query'],
+  ]) {
     assert.ok(helper.includes(statement));helper=helper.replace(statement,`[Console]::Error.WriteLine('fixture_before:${stage}');${statement};[Console]::Error.WriteLine('fixture_after:${stage}')`);
   }
   writeFileSync(diagnosticHelper,helper);

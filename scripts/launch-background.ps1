@@ -17,6 +17,9 @@ $ErrorActionPreference='Stop'
 $ProgressPreference='SilentlyContinue'
 try { [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false) } catch { }
 try { [Console]::InputEncoding=[Text.UTF8Encoding]::new($false) } catch { }
+# Isolated children must resolve JSON commands from this host's built-in module,
+# without scanning inherited or machine-wide module paths on first use.
+Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1')) -Global -ErrorAction Stop
 
 function Set-DotsUserCompilationTemp {
   try {

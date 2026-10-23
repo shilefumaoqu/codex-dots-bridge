@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
 using System.Web.Script.Serialization;
 using Microsoft.Win32;
 
@@ -18,6 +19,32 @@ namespace CodexDotsBridge.Launcher
 {
     internal static class Program
     {
+        [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+        class ShellLink { }
+        // Match IShellLinkW's native vtable; WScript.Shell's TargetPath setter
+        // rejects Unicode targets outside the process ANSI code page.
+        [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+        interface IShellLinkW
+        {
+            void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, IntPtr findData, uint flags);
+            void GetIDList(out IntPtr list);
+            void SetIDList(IntPtr list);
+            void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int count);
+            void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string text);
+            void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count);
+            void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string path);
+            void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int count);
+            void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string text);
+            void GetHotkey(out ushort hotkey);
+            void SetHotkey(ushort hotkey);
+            void GetShowCmd(out int command);
+            void SetShowCmd(int command);
+            void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, out int index);
+            void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int index);
+            void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+            void Resolve(IntPtr window, uint flags);
+            void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+        }
         static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 1048576 };
         static readonly string Root = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
         static readonly string Self = Path.Combine(Root, "CodexDotsBridge.Launcher.exe");
@@ -99,20 +126,33 @@ namespace CodexDotsBridge.Launcher
             }
             catch { return "unknown"; }
         }
-        static object Call(object instance, string name, BindingFlags operation, params object[] args) { return instance.GetType().InvokeMember(name, operation, null, instance, args); }
         static void Release(object instance) { if (instance != null && Marshal.IsComObject(instance)) Marshal.FinalReleaseComObject(instance); }
         static bool Owned(string path)
         {
-            object shell = null, shortcut = null;
+            object shortcut = new ShellLink();
             try
             {
-                shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
-                shortcut = Call(shell, "CreateShortcut", BindingFlags.InvokeMethod, path);
-                return Same(Convert.ToString(Call(shortcut, "TargetPath", BindingFlags.GetProperty)), Self)
-                    && Convert.ToString(Call(shortcut, "Arguments", BindingFlags.GetProperty)) == "--autostart"
-                    && Same(Convert.ToString(Call(shortcut, "WorkingDirectory", BindingFlags.GetProperty)), Root);
+                ((IPersistFile)shortcut).Load(path, 0); // STGM_READ: ownership inspection never saves.
+                IShellLinkW link = (IShellLinkW)shortcut;
+                StringBuilder target = new StringBuilder(32768), arguments = new StringBuilder(32768), directory = new StringBuilder(32768);
+                link.GetPath(target, target.Capacity, IntPtr.Zero, 4); // SLGP_RAWPATH, never Resolve.
+                link.GetArguments(arguments, arguments.Capacity); link.GetWorkingDirectory(directory, directory.Capacity);
+                return Same(target.ToString(), Self) && arguments.ToString() == "--autostart" && Same(directory.ToString(), Root);
             }
-            finally { Release(shortcut); Release(shell); }
+            catch (COMException) { return false; } // Unreadable/malformed links are never owned.
+            finally { Release(shortcut); }
+        }
+        static void CreateStartupShortcut(string path)
+        {
+            object shortcut = new ShellLink();
+            try
+            {
+                IShellLinkW link = (IShellLinkW)shortcut;
+                link.SetPath(Self); link.SetArguments("--autostart"); link.SetWorkingDirectory(Root);
+                link.SetDescription("Codex Dots Bridge 登录启动入口");
+                ((IPersistFile)shortcut).Save(path, true);
+            }
+            finally { Release(shortcut); }
         }
         static object Inspect(string path)
         {
@@ -151,17 +191,9 @@ namespace CodexDotsBridge.Launcher
             string temporary = Path.Combine(Root, ".startup-" + Guid.NewGuid().ToString("N") + ".lnk");
             string intentPath = Path.Combine(Root, ".startup-intent.json"), intentText = null;
             bool intentCreated = false;
-            object shell = null, shortcut = null;
             try
             {
-                shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell"));
-                shortcut = Call(shell, "CreateShortcut", BindingFlags.InvokeMethod, temporary);
-                Call(shortcut, "TargetPath", BindingFlags.SetProperty, Self);
-                Call(shortcut, "Arguments", BindingFlags.SetProperty, "--autostart");
-                Call(shortcut, "WorkingDirectory", BindingFlags.SetProperty, Root);
-                Call(shortcut, "Description", BindingFlags.SetProperty, "Codex Dots Bridge 登录启动入口");
-                Call(shortcut, "Save", BindingFlags.InvokeMethod);
-                Release(shortcut); shortcut = null;
+                CreateStartupShortcut(temporary);
                 Require(Owned(temporary), "autostart_readback_failed");
                 Safe(intentPath);
                 intentText = Json.Serialize(new { schema = 1, owner = "codex-dots-bridge-startup-intent", path = path, content = Convert.ToBase64String(File.ReadAllBytes(temporary)) });
@@ -176,7 +208,6 @@ namespace CodexDotsBridge.Launcher
             }
             finally
             {
-                Release(shortcut); Release(shell);
                 if (File.Exists(temporary)) File.Delete(temporary);
                 // A rejected move never activated the entry. Remove only our exact unused intent.
                 if (intentCreated && !File.Exists(path) && File.Exists(intentPath) && File.ReadAllText(intentPath, Encoding.UTF8) == intentText) File.Delete(intentPath);

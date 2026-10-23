@@ -59,6 +59,8 @@ $ErrorActionPreference='Stop';$ProgressPreference='SilentlyContinue'
 $path=[Environment]::GetEnvironmentVariable('CODEX_DOTS_STARTUP_PATH')
 $temp=[Environment]::GetEnvironmentVariable('CODEX_DOTS_STARTUP_TEMP')
 $text=[Console]::In.ReadToEnd()
+# Resolve JSON commands without first-use discovery across external module paths.
+Import-Module -Name ([IO.Path]::Combine($PSHOME,'Modules','Microsoft.PowerShell.Utility','Microsoft.PowerShell.Utility.psd1')) -Global -ErrorAction Stop
 $user=[Security.Principal.WindowsIdentity]::GetCurrent().User
 $system=[Security.Principal.SecurityIdentifier]::new('S-1-5-18')
 $allowed=@($user.Value,$system.Value)
