@@ -7,6 +7,7 @@ param(
   [string]$InstallerAppId=('CodexDotsBridgeSetup.Test.'+[Guid]::NewGuid().ToString())
 )
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'shell-link-fixture.ps1')
 if($InstallerAppId -notmatch '^CodexDotsBridgeSetup\.Test\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'){throw 'Distinct strict GUID AppId required.'}
 $testInstance=$Matches[1]
 $repo=[IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
@@ -148,11 +149,8 @@ try {
     Assert ((Bridge @('status','--tray')).autostart -eq $choice) 'Projection lost autostart state.'
     Assert ((Test-Path -LiteralPath $startup) -eq ($choice -eq 'enabled')) 'Startup existence differs from choice.'
     if($choice -eq 'enabled'){
-      $shell=New-Object -ComObject WScript.Shell;$link=$null
-      try{
-        $link=$shell.CreateShortcut($startup)
-        Assert ($link.TargetPath -ceq (Join-Path $app 'CodexDotsBridge.Launcher.exe') -and $link.Arguments -ceq '--autostart' -and $link.WorkingDirectory -ceq $app) 'Enabled entry does not point to the fixed Launcher with exact autostart arguments and working directory.'
-      }finally{if($link){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)};[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)}
+      $link=Read-TestShellLink $startup
+      Assert ($link.TargetPath -ceq (Join-Path $app 'CodexDotsBridge.Launcher.exe') -and $link.Arguments -ceq '--autostart' -and $link.WorkingDirectory -ceq $app) 'Enabled entry does not point to the fixed Launcher with exact autostart arguments and working directory.'
     }
     Assert-Stable $before
   }

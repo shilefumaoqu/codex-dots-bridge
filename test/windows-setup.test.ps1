@@ -11,6 +11,7 @@ param(
   [Parameter(Mandatory=$true)][string]$TestDirectory
 )
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'shell-link-fixture.ps1')
 if($ExpectOfficialTunnelMigration -and $ExpectPatchedTunnelMigration){throw 'Choose one Tunnel migration expectation.'}
 if($InstallerAppId -notmatch '^CodexDotsBridgeSetup\.Test\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$') { throw 'Real installer tests require a distinct strict-GUID test AppId.' }
 $testInstance=$Matches[1]
@@ -115,19 +116,12 @@ function Assert-TrayShortcut {
   $current=Read-State
   $path=Join-Path $startup 'Microsoft\Windows\Start Menu\Programs\Codex Dots Bridge\Codex Dots Bridge.lnk'
   Assert-Condition (Test-Path -LiteralPath $path -PathType Leaf) 'Main tray shortcut is missing.'
-  $shell=New-Object -ComObject WScript.Shell
-  $shortcut=$null
-  try {
-    $shortcut=$shell.CreateShortcut($path)
-    Assert-Condition ($shortcut.TargetPath -ieq (Join-Path $current.payload_root 'CodexDotsBridge.Tray.exe')) 'Main shortcut does not directly target the selected tray EXE.'
-    $quotedData=$current.data_dir -replace '(\\+)$','$1$1'
-    Assert-Condition ($shortcut.Arguments -ceq ('--show --data-dir "'+$quotedData+'"')) 'Main shortcut lost the resolved Unicode/custom data directory.'
-    Assert-Condition ($shortcut.WorkingDirectory -ieq $current.payload_root) 'Main shortcut working directory is not the selected payload.'
-    Assert-Condition ($shortcut.Arguments -notmatch 'PowerShell|ExecutionPolicy|setup-lifecycle') 'Main shortcut retained a PowerShell intermediary.'
-  } finally {
-    if($shortcut) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) | Out-Null }
-    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null
-  }
+  $shortcut=Read-TestShellLink $path
+  Assert-Condition ($shortcut.TargetPath -ieq (Join-Path $current.payload_root 'CodexDotsBridge.Tray.exe')) 'Main shortcut does not directly target the selected tray EXE.'
+  $quotedData=$current.data_dir -replace '(\\+)$','$1$1'
+  Assert-Condition ($shortcut.Arguments -ceq ('--show --data-dir "'+$quotedData+'"')) 'Main shortcut lost the resolved Unicode/custom data directory.'
+  Assert-Condition ($shortcut.WorkingDirectory -ieq $current.payload_root) 'Main shortcut working directory is not the selected payload.'
+  Assert-Condition ($shortcut.Arguments -notmatch 'PowerShell|ExecutionPolicy|setup-lifecycle') 'Main shortcut retained a PowerShell intermediary.'
 }
 try {
   Assert-Condition (-not (Find-TestUninstallKey)) 'Test uninstall key already exists; refusing to replace it.'

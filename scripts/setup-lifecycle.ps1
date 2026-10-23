@@ -646,15 +646,47 @@ function Restore-TrayShortcut($Transaction) {
   $actual=if($exists){[Convert]::ToBase64String([IO.File]::ReadAllBytes($path))}else{''}
   if($exists -and $Transaction.old_shortcut_exists -and $actual -ceq $Transaction.old_shortcut_bytes) { return }
   if($exists) {
-    $shell=$null;$shortcut=$null
-    try {
-      $shell=New-Object -ComObject WScript.Shell;$shortcut=$shell.CreateShortcut($path)
-      $expectedArguments='--show --data-dir "'+($Transaction.data_dir -replace '(\\+)$','$1$1')+'"'
-      if($shortcut.TargetPath -ine (Join-Path $Transaction.new_root 'CodexDotsBridge.Tray.exe') -or $shortcut.Arguments -cne $expectedArguments -or $shortcut.WorkingDirectory -ine $Transaction.new_root) { throw 'shortcut_changed_during_install' }
-    } finally {
-      if($shortcut) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) | Out-Null }
-      if($shell) { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell) | Out-Null }
+    if(-not ('CodexDotsBridge.SetupShortcut' -as [type])) {
+      # WScript uses the ANSI code page for link paths and string properties.
+      # Read Unicode fields directly, without resolving or saving the link.
+      Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+namespace CodexDotsBridge {
+  public static class SetupShortcut {
+    [ComImport, Guid("00021401-0000-0000-C000-000000000046")] class ShellLink { }
+    [ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid("000214F9-0000-0000-C000-000000000046")]
+    interface IShellLinkW {
+      void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count, IntPtr findData, uint flags);
+      void GetIDList(out IntPtr list);
+      void SetIDList(IntPtr list);
+      void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int count);
+      void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string text);
+      void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int count);
+      void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string path);
+      void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int count);
     }
+    public static string[] Read(string path) {
+      object value = new ShellLink();
+      try {
+        ((IPersistFile)value).Load(path, 0); // STGM_READ
+        IShellLinkW link = (IShellLinkW)value;
+        StringBuilder target = new StringBuilder(32768), arguments = new StringBuilder(32768), directory = new StringBuilder(32768);
+        link.GetPath(target, target.Capacity, IntPtr.Zero, 4); // SLGP_RAWPATH, no Resolve
+        link.GetArguments(arguments, arguments.Capacity);
+        link.GetWorkingDirectory(directory, directory.Capacity);
+        return new string[] { target.ToString(), arguments.ToString(), directory.ToString() };
+      } finally { Marshal.FinalReleaseComObject(value); }
+    }
+  }
+}
+'@
+    }
+    $shortcut=[CodexDotsBridge.SetupShortcut]::Read($path)
+    $expectedArguments='--show --data-dir "'+($Transaction.data_dir -replace '(\\+)$','$1$1')+'"'
+    if($shortcut[0] -ine (Join-Path $Transaction.new_root 'CodexDotsBridge.Tray.exe') -or $shortcut[1] -cne $expectedArguments -or $shortcut[2] -ine $Transaction.new_root) { throw 'shortcut_changed_during_install' }
     if([Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) -cne $actual) { throw 'shortcut_changed_during_install' }
   }
   if($Transaction.old_shortcut_exists) {

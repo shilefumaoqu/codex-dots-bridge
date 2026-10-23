@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param([string]$TestDirectory)
 $ErrorActionPreference='Stop'
+. (Join-Path $PSScriptRoot 'shell-link-fixture.ps1')
 $projectRoot=Split-Path -Parent $PSScriptRoot
 if(-not $TestDirectory) { $TestDirectory=Join-Path $projectRoot 'artifacts\private\lifecycle-guards' }
 $work=Join-Path ([IO.Path]::GetFullPath($TestDirectory)) ([Guid]::NewGuid().ToString('N'))
@@ -333,26 +334,28 @@ try{Select-TunnelClientForUpgrade $tunnelSettings|Out-Null;throw 'Unsafe manifes
 $results.Add([pscustomobject]@{name='unsafe_tunnel_manifest_path_rejected';passed=$true})
 # Exercise the actual rollback with real Shell links in a custom Unicode group.
 # Prior bytes are intentionally opaque: restoring them must never execute them.
-function Shortcut-RollbackCase([string]$Name,[bool]$OldExists,[bool]$NewExists,[bool]$Modified=$false) {
+
+function Shortcut-RollbackCase([string]$Name,[bool]$OldExists,[bool]$NewExists,[bool]$Modified=$false,[bool]$PreviousRestored=$false) {
   $InstallDirectory=Join-Path $work ('shortcut rollback '+$Name)
-  $group=Join-Path $InstallDirectory "custom 中文 group O'Brien `$literal"
+  $group=Join-Path $InstallDirectory "custom 中文 😀 group O'Brien `$literal"
   New-Item -ItemType Directory -Path $group -Force | Out-Null
   $transactionPath=Join-Path $InstallDirectory '.setup-transaction.json'
   $statePath=Join-Path $InstallDirectory 'installation-state.json'
   $path=Join-Path $group 'Codex Dots Bridge.lnk'
   $oldBytes=[Text.Encoding]::UTF8.GetBytes('opaque previous shortcut; never execute')
-  $settings=[pscustomobject]@{shortcut_path=$path;old_shortcut_exists=$OldExists;old_shortcut_bytes=$(if($OldExists){[Convert]::ToBase64String($oldBytes)}else{''});new_root=(Join-Path $InstallDirectory 'payload\0.2.0-alpha.20');old_root=(Join-Path $InstallDirectory 'payload\0.2.0-alpha.19');data_dir=(Join-Path $work 'custom 中文 data');was_running=$false;was_tray_running=$false;registration_changed=$false;app_data=(Join-Path $InstallDirectory 'isolated AppData')}
+  $settings=[pscustomobject]@{shortcut_path=$path;old_shortcut_exists=$OldExists;old_shortcut_bytes=$(if($OldExists){[Convert]::ToBase64String($oldBytes)}else{''});new_root=(Join-Path $InstallDirectory 'payload\0.2.0-alpha.20');old_root=(Join-Path $InstallDirectory 'payload\0.2.0-alpha.19');data_dir=(Join-Path $work 'custom 中文 😀 data');was_running=$false;was_tray_running=$false;registration_changed=$false;app_data=(Join-Path $InstallDirectory 'isolated AppData')}
   if($NewExists) {
-    $shell=New-Object -ComObject WScript.Shell;$link=$shell.CreateShortcut($path)
-    try {
-      $link.TargetPath=Join-Path $settings.new_root 'CodexDotsBridge.Tray.exe'
-      $link.Arguments='--show --data-dir "'+$settings.data_dir+'"'
-      $link.WorkingDirectory=$settings.new_root
-      if($Modified) { $link.Arguments='user modified arguments' }
-      $link.Save()
-    } finally { [Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)|Out-Null;[Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)|Out-Null }
+    $arguments=if($Modified){'user modified arguments'}else{'--show --data-dir "'+$settings.data_dir+'"'}
+    [SetupShortcutFixture]::Write($path,(Join-Path $settings.new_root 'CodexDotsBridge.Tray.exe'),$arguments,$settings.new_root)
   }
+  if($PreviousRestored) { [IO.File]::WriteAllBytes($path,$oldBytes) }
   $newBytes=if($NewExists){[IO.File]::ReadAllBytes($path)}else{$null}
+  if($NewExists) {
+    $modifiedAt=[IO.File]::GetLastWriteTimeUtc($path)
+    $details=Read-TestShellLink $path
+    if($details.TargetPath -cne (Join-Path $settings.new_root 'CodexDotsBridge.Tray.exe') -or $details.Arguments -cne $arguments -or $details.WorkingDirectory -cne $settings.new_root) { throw 'Unicode shortcut fixture lost target, arguments or working directory.' }
+    if([Convert]::ToBase64String([IO.File]::ReadAllBytes($path)) -cne [Convert]::ToBase64String($newBytes) -or [IO.File]::GetLastWriteTimeUtc($path) -ne $modifiedAt) { throw 'Unicode shortcut inspection saved the link.' }
+  }
   Write-Json $statePath ([pscustomobject]@{version='0.2.0-alpha.19'})
   Write-Json $transactionPath $settings
   if($Modified) {
@@ -372,4 +375,5 @@ Shortcut-RollbackCase 'cross_version_failure_removes_new_link_when_previously_ab
 Shortcut-RollbackCase 'missing_new_shortcut_restores_previous_bytes' $true $false
 Shortcut-RollbackCase 'missing_new_shortcut_and_no_previous_remain_absent' $false $false
 Shortcut-RollbackCase 'modified_new_shortcut_is_preserved_with_pending_transaction' $true $true $true
+Shortcut-RollbackCase 'unchanged_previous_shortcut_bytes_bypass_parser' $true $false $false $true
 [pscustomobject]@{checks=$results;test_directory=$work;native_cli='synthetic_fixture_only';registration='synthetic_adapters_only';service='not_started';registry='not_modified'} | ConvertTo-Json -Depth 5
