@@ -106,11 +106,17 @@ Linux x64、Node 24.19.0、AMD EPYC 9V74 80-Core Processor（环境提供 5 个�
 
 本轮接口及迁移调整后重新执行 Linux 全量回归，共 549 项：498 通过、0 失败、51 项按平台或既有条件跳过。TypeScript 构建及公开源码与 Git 历史检查通过（447 个历史 blob）。这些检查不包括 C#、PowerShell、Inno 真机执行。
 
-Windows CI 已接入打包后的托盘 HTTP 和刷新生命周期测试；新增入口尚待 Windows runner 实际运行。候选 PR 和 CI 产物不等同于完成本机部署或正式发布。
+Windows CI 已接入打包后的托盘 HTTP 和刷新生命周期测试。候选 PR 和 CI 产物不等同于完成本机部署或正式发布。
 
 首轮 Windows CI（提交 `30fd453`，run `40172871552`）执行 549 项：545 通过、3 失败、1 跳过，因此未进入打包和安装器阶段。失败集中在本机自动加载后的发送与等待。后续修正包括文件身份的精确整数保存（NTFS 文件 ID 可能超出 JavaScript 安全整数范围）和截止时间前提前唤醒的重试边界；修正后的 Windows 结果须单独核对，不能将 Linux 通过视为这些失败已关闭。
 
 第二轮 Windows CI（提交 `d720a83`，run `40174051334`）的 Node 用例为 551 项：550 通过、0 失败、1 跳过，上述 3 项已复验通过。随后 PowerShell 5 安装回退 fixture 发现旧事务无迁移时仍访问不需要的激活标记目录；修正为仅有迁移 ID 时检查该目录。安装相关后续步骤仍须重跑，整条 CI 尚未通过。
+
+后续 `c901575`（run `40174718143`）及 `1d40f1f`（run `40176685903`）整条 Windows CI 通过：551 项 Node 用例中 550 通过、0 失败、1 跳过，PowerShell 保护、打包、托盘 HTTP/刷新和隔离 Setup 新装/重装/卸载通过。两次安装回执均为 `upgraded=false`、`fromVersion=null`，不能证明跨版升级。`1d40f1f` 只为刷新 fixture 加入回执同步，确保测试在旧回执交给 UI 前变更 generation；生产代码与 `c901575` 相同。
+
+独立 Windows 本机使用已校验摘要的 `c901575` CI 成品：HTTP 60 项断言和刷新全部 11 项检查通过；原旧 EXE 配原 fixture 再次出现 `create-generation` 超时，加日志诊断未捕获原因，仍未闭环。alpha.30 旧基线安装返回 `tray_background_launch_unconfirmed`，未进入候选升级；alpha.32 候选 Prepare 返回 `task_state_unavailable`，没有提交升级。代表性对照确认 Windows PowerShell 5.1 向 `node -e` 传递旧库检查脚本时丢失 SQL 字符串的双引号，同一脚本以文件执行可读取数据库且活动计数为零。候选修正为从标准输入读取脚本，并增加执行真实 PS5/Node/SQLite 的回归，覆盖历史 uncertain、各类活动工作和坏库拒绝；修正后的 Windows CI 与真实升级仍须重新验证。
+
+上述失败后身份、凭据、任务/结果、历史 uncertain 和读取快照均保留。独立成品迁移/回退 fixture 验证了维护拒绝业务、开放前无写入可回退、新写入及开放后拒绝旧库恢复；这不能替代 Setup 跨版安装通过。生产仍未升级，正式 Release 未发布。
 
 ## 仍须完成的真实验收
 

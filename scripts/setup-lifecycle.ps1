@@ -193,7 +193,9 @@ if(existsSync(p)) {
 console.log(JSON.stringify({supervisor:'unknown',service:'unknown',tasks:counts,maintenance_activity:activity}));
 '@
     try {
-      $text=@(& (Runtime-Node $Root) --input-type=module -e $probe 2>$null)
+      # PS5 reparses native command arguments and strips the SQL string quotes
+      # in -e source. Stdin preserves the script without another quoting layer.
+      $text=@($probe | & (Runtime-Node $Root) --input-type=module - 2>$null)
       if($LASTEXITCODE -ne 0){throw 'task_state_unavailable'}
       $observed=($text -join "`n")|ConvertFrom-Json
       if($status) { $status|Add-Member -NotePropertyName maintenance_activity -NotePropertyValue $observed.maintenance_activity -Force;return $status }
