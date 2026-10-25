@@ -132,8 +132,10 @@ function Invoke-TrayCommand([string]$Executable,[string[]]$Arguments) {
   } finally { $process.Dispose() }
 }
 function Start-Tray([string]$Root,[string]$Directory,[switch]$Show) {
+  $script:trayStartObservation=[ordered]@{stage='validate_binary';observed_at=[DateTime]::UtcNow.ToString('o');helper=$null}
   $exe=Tray-Path $Root
   if(-not $exe) { return }
+  $script:trayStartObservation.stage='check_running'
   if(Tray-Running $Root $Directory) {
     if($Show -and (Invoke-TrayCommand $exe @('--show','--data-dir',$Directory)) -ne 0) { throw 'tray_show_unconfirmed' }
     return
@@ -141,9 +143,13 @@ function Start-Tray([string]$Root,[string]$Directory,[switch]$Show) {
   $mode=if($Show){'--show'}else{'--background'}
   # The runner owns this helper, including rollback to an older payload that has
   # no helper. Inno extracts it beside the temporary runner before Prepare.
+  $script:trayStartObservation.stage='launch_helper'
   $receipt=@(& (Join-Path $PSScriptRoot 'launch-background.ps1') -TrayExecutable $exe -DataDir $Directory -TrayMode $mode)
-  if($LASTEXITCODE -ne 0) { throw 'tray_background_launch_unconfirmed' }
-  try { $launch=($receipt -join "`n") | ConvertFrom-Json; if(-not $launch.pid) { throw 'invalid_receipt' } } catch { throw 'tray_background_launch_unconfirmed' }
+  $launchExit=$LASTEXITCODE
+  try { $launch=($receipt -join "`n") | ConvertFrom-Json } catch { throw 'tray_background_launch_unconfirmed' }
+  if($launch.diagnostic){$script:trayStartObservation.helper=$launch.diagnostic}
+  if($launchExit -ne 0 -or -not $launch.pid) { throw 'tray_background_launch_unconfirmed' }
+  $script:trayStartObservation.stage='wait_running'
   for($attempt=0;$attempt -lt 30;$attempt++) {
     Start-Sleep -Milliseconds 100
     if(Tray-Running $Root $Directory) { return }
@@ -1116,7 +1122,14 @@ try {
       try { Invoke-Bridge $transaction.new_root @('run','--data-dir',$transaction.data_dir) | Out-Null; $connection='started_requires_real_acceptance' } catch { $connection='pending_connection_diagnostics' }
     }
     $state.connection=$connection;Write-Json $statePath $state
-    try { Start-Tray $transaction.new_root $transaction.data_dir } catch { $state.tray='pending_tray_diagnostics';Write-Json $statePath $state }
+    try { Start-Tray $transaction.new_root $transaction.data_dir } catch {
+      $state.tray='pending_tray_diagnostics'
+      # Persist the actual failed branch without exception text, paths or keys.
+      $code=$_.Exception.Message
+      if($code -notin @('tray_binary_identity_mismatch','tray_status_unavailable','tray_control_timeout','tray_show_unconfirmed','tray_background_launch_unconfirmed','tray_start_unconfirmed')){$code='tray_start_failed'}
+      $state.tray_diagnostic=[ordered]@{code=$code;observation=$script:trayStartObservation}
+      Write-Json $statePath $state
+    }
     [IO.File]::WriteAllText($resultPath,$connection,[Text.UTF8Encoding]::new($false))
     if($transaction.storage_migration_id) { $activationMarker.phase='committed';Write-Json (Join-Path $InstallDirectory '.setup-activation.json') $activationMarker }
   } elseif($Action -eq 'Rollback') {

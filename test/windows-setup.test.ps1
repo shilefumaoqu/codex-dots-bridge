@@ -134,6 +134,21 @@ function Assert-OwnedStartup {
   }
   return $path
 }
+function Assert-InstalledTray {
+  $current=Read-State
+  $exe=Join-Path $current.payload_root 'CodexDotsBridge.Tray.exe'
+  if(-not (Test-Path -LiteralPath $exe -PathType Leaf)){return}
+  Assert-Condition ($current.tray -ne 'pending_tray_diagnostics') ('Installed tray launch is unconfirmed: '+($current.tray_diagnostic|ConvertTo-Json -Depth 8 -Compress))
+  $info=[Diagnostics.ProcessStartInfo]::new()
+  $info.FileName=$exe;$info.UseShellExecute=$false;$info.CreateNoWindow=$true
+  $info.Arguments='--running --data-dir "'+($current.data_dir -replace '(\\+)$','$1$1')+'"'
+  $probe=[Diagnostics.Process]::Start($info)
+  try {
+    Assert-Condition ($probe.WaitForExit(12000)) 'Installed tray status check timed out.'
+    Assert-Condition ($probe.ExitCode -eq 0) 'Setup exited successfully without a live tray for its exact data directory.'
+  } finally {$probe.Dispose()}
+  $checks.Add('installed_tray_running_without_manual_launch')
+}
 function Assert-TrayShortcut {
   if(-not $ExpectDirectTrayShortcut) { return }
   $current=Read-State
@@ -198,6 +213,7 @@ try {
   $installed=$true
   $state=Read-State
   Assert-TrayShortcut
+  Assert-InstalledTray
   # Inno evaluates file Check callbacks repeatedly: copying the manifest must not skip later directories.
   & (Join-Path $state.payload_root 'scripts\check-package.ps1') -PackageRoot $state.payload_root | Out-Null
   $checks.Add('complete_installed_payload_after_manifest_copy')
@@ -268,6 +284,7 @@ import Database from 'better-sqlite3';const db=new Database(process.argv[1]);db.
   Add-Content -LiteralPath $configToml -Encoding UTF8 -Value "`n[mcp_servers.synthetic_unrelated]`ncommand = 'preserve-command'`nargs = ['literal space']"
   Run-Executable $SetupExecutable (Installer-Arguments)
   Assert-TrayShortcut
+  Assert-InstalledTray
   $checks.Add('same_version_reinstall_and_owned_startup')
   # A native test-only CLI forwards exact argv to the real CLI, failing just the first add.
   # This reaches Commit after the old owned registration is removed; rollback's add succeeds.
@@ -433,6 +450,7 @@ public static class OneAddFailure {
   }
   $after=Read-State
   Assert-TrayShortcut
+  Assert-InstalledTray
   $config=Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
   if($legacyOfficialClient) {
     $afterManifest=Get-Content -LiteralPath (Join-Path $after.payload_root 'release-manifest.json') -Raw -Encoding UTF8|ConvertFrom-Json
