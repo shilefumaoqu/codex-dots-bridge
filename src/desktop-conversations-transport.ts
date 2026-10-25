@@ -1,7 +1,7 @@
 import type net from 'node:net';
 import { setImmediate as yieldImmediate } from 'node:timers/promises';
 import { replyBindingSchema, type DesktopReplyBinding, type DesktopReplyInput, type DesktopReplyResult } from './desktop-reply.js';
-import { closeSync, fstatSync, lstatSync, openSync, readSync, statSync, type Stats } from 'node:fs';
+import { closeSync, fstatSync, lstatSync, openSync, readSync, statSync, type BigIntStats } from 'node:fs';
 import { dirname } from 'node:path';
 import { runDesktopMessageIpc, type DesktopIpcDiagnostic, type DesktopTimingStage, type DesktopIdleSnapshot, type DesktopBusySnapshot } from './desktop-echo-ipc.js';
 import { resolveConversationPath } from './desktop-conversation-path.js';
@@ -71,6 +71,11 @@ export async function runReply(input: DesktopReplyInput): Promise<DesktopReplyRe
     noSymlinks(binding.path); fd = openSync(binding.path, 'r');
     const validate = () => {
       noSymlinks(binding.path);
+      if (binding.version === 2) {
+        const path = statSync(binding.path, {bigint:true}), opened = fstatSync(fd!, {bigint:true});
+        for (const state of [path, opened]) if (!state.isFile() || state.dev.toString() !== binding.device || state.ino.toString() !== binding.inode || state.birthtimeNs.toString() !== binding.birthtime_ns || state.size < BigInt(binding.offset)) throw failure('log_changed');
+        return logSize(opened);
+      }
       const path = statSync(binding.path), opened = fstatSync(fd!);
       for (const state of [path, opened]) if (!state.isFile() || state.dev !== binding.device || state.ino !== binding.inode || state.birthtimeMs !== binding.birthtime_ms || state.size < binding.offset) throw failure('log_changed');
       return opened.size;
@@ -111,12 +116,17 @@ export async function runReply(input: DesktopReplyInput): Promise<DesktopReplyRe
   } catch (error) { return {status:'unavailable',reason:reason(error)}; }
   finally { if (fd !== undefined) closeSync(fd); }
 }
+function logSize(state: BigIntStats): number {
+  if (state.size < 0n || state.size > BigInt(Number.MAX_SAFE_INTEGER)) throw failure('log_invalid');
+  return Number(state.size);
+}
 /** Fixed handle bound to the exact native or explicitly configured path. */
 class ConversationLog {
-  private fd: number; private original: Stats; private offset: number; private maxSize: number; private bytes = Buffer.alloc(0);
+  private fd: number; private original: BigIntStats; private offset: number; private maxSize: number; private bytes = Buffer.alloc(0);
   constructor(private path: string, threadId: string) {
-    noSymlinks(path); this.fd = openSync(path, 'r'); this.original = fstatSync(this.fd); this.offset = this.maxSize = this.original.size;
+    noSymlinks(path); this.fd = openSync(path, 'r');
     try {
+      this.original = fstatSync(this.fd, {bigint:true}); this.offset = this.maxSize = logSize(this.original);
       if (!this.original.isFile() || !this.offset) throw failure('log_unavailable');
       const first = Buffer.alloc(Math.min(65536, this.offset)); const count = readSync(this.fd, first, 0, first.length, 0); const newline = first.subarray(0, count).indexOf(10);
       if (newline < 0) throw failure('log_binding_invalid'); const meta = parse(first.subarray(0, newline));
@@ -125,9 +135,9 @@ class ConversationLog {
     } catch (error) { closeSync(this.fd); throw error; }
   }
   validate() {
-    noSymlinks(this.path); const state = statSync(this.path), opened = fstatSync(this.fd);
-    if (state.dev !== this.original.dev || state.ino !== this.original.ino || state.birthtimeMs !== this.original.birthtimeMs || opened.dev !== state.dev || opened.ino !== state.ino || state.size < this.maxSize || opened.size < this.maxSize) throw failure('log_changed');
-    this.maxSize = Math.max(this.maxSize, state.size, opened.size); return opened.size;
+    noSymlinks(this.path); const state = statSync(this.path, {bigint:true}), opened = fstatSync(this.fd, {bigint:true});
+    if (state.dev !== this.original.dev || state.ino !== this.original.ino || state.birthtimeNs !== this.original.birthtimeNs || opened.dev !== state.dev || opened.ino !== state.ino || opened.birthtimeNs !== state.birthtimeNs || state.size < this.maxSize || opened.size < this.maxSize) throw failure('log_changed');
+    const size = logSize(opened); this.maxSize = Math.max(this.maxSize, logSize(state), size); return size;
   }
   captureEof() {
     const size = this.validate(), tail = Buffer.alloc(1);
@@ -135,7 +145,7 @@ class ConversationLog {
     this.offset = size; this.bytes = Buffer.alloc(0); return Date.now();
   }
   binding(threadId: string, sentAt: number): DesktopReplyBinding {
-    return {version:1,path:this.path,thread_id:threadId,device:this.original.dev,inode:this.original.ino,birthtime_ms:this.original.birthtimeMs,offset:this.offset,sent_at_ms:sentAt};
+    return {version:2,path:this.path,thread_id:threadId,device:this.original.dev.toString(),inode:this.original.ino.toString(),birthtime_ns:this.original.birthtimeNs.toString(),offset:this.offset,sent_at_ms:sentAt};
   }
   close() { closeSync(this.fd); this.bytes = Buffer.alloc(0); }
   async reply(turnId: string, sentAt: number, input: ConversationTransportInput, pollMs: number): Promise<string> {
@@ -191,8 +201,15 @@ export async function runSend(input: ConversationSendInput, testing?: Conversati
       // owned during that request needs a new discovery, not another navigation.
       while (ipc.status === 'skipped_unknown' && ipc.reason === 'native_owner_unavailable' && !sent && !preflightError) {
         await measure('owner_lookup', () => new Promise<void>(resolve => {
-          const done = () => { clearTimeout(timer); input.signal.removeEventListener('abort', done); resolve(); };
-          const timer = setTimeout(done, Math.max(1, Math.min(250, input.deadline - Date.now())));
+          const wakeAt = Math.min(Date.now() + 250, input.deadline);
+          let timer: NodeJS.Timeout;
+          const done = () => {
+            // Windows timers may wake just before the wall-clock deadline.
+            // Finish the pause before opening another owner lookup with no budget.
+            if (!input.signal.aborted && Date.now() < wakeAt) { timer = setTimeout(done, Math.max(1, wakeAt - Date.now())); return; }
+            clearTimeout(timer); input.signal.removeEventListener('abort', done); resolve();
+          };
+          timer = setTimeout(done, Math.max(1, wakeAt - Date.now()));
           input.signal.addEventListener('abort', done, { once: true });
           if (input.signal.aborted) done();
         }));

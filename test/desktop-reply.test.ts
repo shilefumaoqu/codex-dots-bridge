@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runReply } from '../src/desktop-conversations-transport.js';
 import { DesktopConversationsService, type DesktopConversationSendInput, type DesktopConversationsTransport } from '../src/desktop-conversations.js';
-import type { DesktopReplyBinding, DesktopReplyResult } from '../src/desktop-reply.js';
+import { replyBindingSchema, type DesktopReplyBinding, type DesktopReplyResult } from '../src/desktop-reply.js';
 
 const noRead: DesktopConversationsTransport['runRead'] = async () => assert.fail('unexpected source read');
 const noSend: DesktopConversationsTransport['runSend'] = async () => assert.fail('recovery must never send');
@@ -20,12 +20,39 @@ async function until(predicate:()=>boolean): Promise<void> {
 function fixture() {
   const root=mkdtempSync(join(tmpdir(),'reply-recovery-')),thread=randomUUID(),turn=randomUUID(),request=randomUUID(),path=join(root,'rollout.jsonl');
   writeFileSync(path,JSON.stringify({type:'session_meta',payload:{id:thread}})+'\n');
-  const stat=statSync(path),now=Date.now();
-  const binding: DesktopReplyBinding={version:1,path,thread_id:thread,device:stat.dev,inode:stat.ino,birthtime_ms:stat.birthtimeMs,offset:stat.size,sent_at_ms:now};
+  const stat=statSync(path,{bigint:true}),now=Date.now();
+  const binding: DesktopReplyBinding={version:2,path,thread_id:thread,device:stat.dev.toString(),inode:stat.ino.toString(),birthtime_ns:stat.birthtimeNs.toString(),offset:Number(stat.size),sent_at_ms:now};
   const db=new Database(':memory:'),config={enabled:true,targets:[{thread_id:thread,rollout_path:path}]};
   const accept=(input:DesktopConversationSendInput)=>{input.onReplyBinding?.(binding);input.beforeSend();input.onAccepted(turn);};
   return {root,thread,turn,request,path,binding,db,config,now,accept,cleanup(){db.close();rmSync(root,{recursive:true,force:true});}};
 }
+
+test('durable bindings preserve adjacent 64-bit file IDs without accepting rounded legacy evidence',()=>{
+  const f=fixture();
+  try {
+    const first=replyBindingSchema.parse({...f.binding,inode:'18446744073709551614'});
+    const second=replyBindingSchema.parse({...f.binding,inode:'18446744073709551615'});
+    const restored=JSON.parse(JSON.stringify([first,second]));
+    assert.notEqual(restored[0].inode,restored[1].inode);
+    assert.equal(restored[1].inode,'18446744073709551615');
+    const legacy={version:1,path:f.path,thread_id:f.thread,device:1,inode:Number(second.inode),birthtime_ms:1,offset:f.binding.offset,sent_at_ms:f.now};
+    assert.equal(replyBindingSchema.safeParse(legacy).success,false);
+  }finally{f.cleanup();}
+});
+
+test('exact legacy file bindings remain readable and changed new-format identities are refused',async()=>{
+  const f=fixture(),controller=new AbortController();
+  try {
+    appendFileSync(f.path,turnComplete(f.turn,f.now));
+    const stat=statSync(f.path);
+    const legacy={version:1 as const,path:f.path,thread_id:f.thread,device:stat.dev,inode:stat.ino,birthtime_ms:stat.birthtimeMs,offset:f.binding.offset,sent_at_ms:f.now};
+    const input={turnId:f.turn,signal:controller.signal,deadline:Date.now()+1000};
+    const result=await runReply({...input,binding:legacy});
+    assert.equal(result.status,Number.isSafeInteger(stat.dev)&&Number.isSafeInteger(stat.ino)?'completed':'unavailable');
+    const changed=await runReply({...input,binding:{...f.binding,inode:(BigInt(f.binding.inode)+1n).toString()} as DesktopReplyBinding});
+    assert.deepEqual(changed,{status:'unavailable',reason:'log_changed'});
+  }finally{f.cleanup();}
+});
 
 test('read-only recovery advances complete log lines, retains partial UTF-8 and matches only the accepted turn',async()=>{
   const f=fixture(),controller=new AbortController();

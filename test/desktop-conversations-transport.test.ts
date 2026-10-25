@@ -81,11 +81,11 @@ test('legacy new reads require official local mode and never open IPC or logs', 
 });
 
 test('send persists source identity and original EOF before the only frame, then accepts the exact turn',async()=>fixture(async f=>{
-  const order:string[]=[],before=statSync(f.rolloutPath);let binding:DesktopReplyBinding|undefined;
+  const order:string[]=[],before=statSync(f.rolloutPath,{bigint:true});let binding:DesktopReplyBinding|undefined;
   f.onStart(()=>f.append(f.complete()));
   const result=await f.send({onReplyBinding:(value:DesktopReplyBinding)=>{order.push('binding');binding=value;},beforeSend:()=>{order.push('intent');f.persist();},onAccepted:()=>{order.push('ack');}});
   assert.equal(result.status,'completed');assert.deepEqual(order,['binding','intent','ack']);
-  assert.equal(binding?.offset,before.size);assert.equal(binding?.inode,before.ino);assert.equal(binding?.path,f.rolloutPath);assert.equal(binding?.thread_id,f.threadId);
+  assert.equal(binding?.offset,Number(before.size));assert.equal(binding?.inode,before.ino.toString());assert.equal(binding?.path,f.rolloutPath);assert.equal(binding?.thread_id,f.threadId);
   assert.deepEqual(await runReply({binding:binding!,turnId:f.turnId,signal:f.controller.signal,deadline:Date.now()+1000}),{status:'completed',turn_id:f.turnId,reply:'普通回复🌟'});
   assert.equal(f.socket.frames.filter(frame=>frame.method==='thread-follower-start-turn').length,1);
 }));
@@ -228,9 +228,12 @@ test('autoload readiness preserves the service request and persisted acceptance 
   try {
     const args = { request_id: f.requestId, thread_id: f.threadId, text: 'same persisted request' };
     service.send(args); const result = await service.get({ request_id: f.requestId, wait_seconds: 2 });
-    assert.equal(result.status, 'completed'); assert.equal(result.request_id, f.requestId); assert.equal(result.reply, '普通回复🌟');
+    assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.request_id, f.requestId); assert.equal(result.reply, '普通回复🌟');
     const stored = JSON.parse((db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id = ?').get(f.requestId) as { data: string }).data);
     assert.equal(stored.accepted_turn_id, f.turnId); assert.equal(stored.sent, true);
+    const identity = statSync(f.nativePath, {bigint:true});
+    assert.equal(stored.reply_binding.version, 2); assert.equal(stored.reply_binding.inode, identity.ino.toString());
+    assert.equal(stored.reply_binding.device, identity.dev.toString()); assert.equal(stored.reply_binding.birthtime_ns, identity.birthtimeNs.toString());
     assert.equal(service.send(args).status, 'completed'); assert.equal(executions, 1); assert.equal(connects, 3); assert.equal(navigations, 1); assert.equal(f.before(), 1);
     assert.equal(f.socket.frames.filter(frame => frame.method === 'thread-follower-start-turn').length, 1);
   } finally { await service.close(); db.close(); }
@@ -251,7 +254,7 @@ test('warm loading consumes pre-send time but durable ACK opens a fresh real log
   try {
     const args = { request_id: f.requestId, thread_id: f.threadId, text: 'slow warm, fresh reply' };
     service.send(args); const result = await service.get({ request_id: f.requestId, wait_seconds: 2 });
-    assert.equal(result.status, 'completed'); assert.equal(result.reply, '普通回复🌟'); assert.equal(ackSaves, 1);
+    assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.reply, '普通回复🌟'); assert.equal(ackSaves, 1);
     assert.equal(result.timing.stages_ms?.busy_wait, undefined);
     for (const stage of ['owner_lookup', 'autoload', 'send_ack', 'reply_wait'] as const) assert(Number.isFinite(result.timing.stages_ms?.[stage]));
     assert(result.timing.stages_ms!.autoload! >= 500); assert(result.timing.stages_ms!.reply_wait! >= 50);
