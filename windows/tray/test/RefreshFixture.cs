@@ -68,10 +68,19 @@ internal static class RefreshHarness
     static Task Refresh(bool manual = false) { return (Task)Call("RefreshState", manual); }
     // The UI coordination fixture injects a transport; production polling uses
     // StatusClient exclusively. Fake CLI status remains a fixture convenience.
-    static Task<T> ReadFixture<T>()
+    static TaskCompletionSource<bool> generationReceiptGate;
+    static int generationReceiptHeld;
+    static async Task<T> ReadFixture<T>()
     {
+        TaskCompletionSource<bool> gate = generationReceiptGate;
         object cli = Get("cli");
-        return (Task<T>)cli.GetType().GetMethod("Run").Invoke(cli, new object[] { "status --tray", 5500, true });
+        T receipt = await ((Task<T>)cli.GetType().GetMethod("Run").Invoke(cli, new object[] { "status --tray", 5500, true })).ConfigureAwait(false);
+        if (gate != null)
+        {
+            Interlocked.Increment(ref generationReceiptHeld);
+            await gate.Task.ConfigureAwait(false);
+        }
+        return receipt;
     }
     static Dictionary<string, object> Config(string control = "start", int delay = 200, string auto = "disabled", int inflight = 0)
     {
@@ -184,10 +193,16 @@ internal static class RefreshHarness
             Assert(dialogSeen && Count("run:--stop") == 0 && !(bool)Get("commandBusy") && ((Button)Get("control")).Enabled, "fresh_inflight_cancel_failed");
             checks.Add("fresh query raises real WinForms in-flight stop confirmation; Cancel sends no stop and restores controls"); Close();
 
-            Create("generation", Config("start")); Write(Config("stop", 300)); poll = Refresh();
-            PumpUntil(delegate { return Count("status") == 1; }); // Receipt has sampled the old fixture before invalidation.
+            Create("generation", Config("start")); Write(Config("stop", 0));
+            generationReceiptHeld = 0; generationReceiptGate = new TaskCompletionSource<bool>(); poll = Refresh();
+            // A calls.log entry alone does not prove the receipt is still in flight:
+            // DoEvents can process its completion before this test regains control.
+            // Hold the sampled receipt until after invalidation, independent of UI speed.
+            PumpUntil(delegate { return Interlocked.CompareExchange(ref generationReceiptHeld, 0, 0) == 1; });
+            Assert(Count("status") == 1 && (bool)Get("checking") && !poll.IsCompleted, "old_generation_receipt_not_held");
             Set("generation", (int)Get("generation") + 1); Set("state", snapshotType.GetMethod("Unknown").Invoke(null, new object[] { Get("state"), "resume_recheck" }));
-            Write(Config("start", 300)); PumpUntil(delegate { Assert(State("Control") != "stop", "old_generation_applied"); return Count("status") == 2; }); Wait(poll);
+            Write(Config("start", 0)); TaskCompletionSource<bool> releaseReceipt = generationReceiptGate; generationReceiptGate = null; releaseReceipt.SetResult(true);
+            PumpUntil(delegate { Assert(State("Control") != "stop", "old_generation_applied"); return Count("status") == 2; }); Wait(poll);
             Assert(State("Control") == "start" && Count("status") == 2, "generation_followup_failed");
             checks.Add("old-generation ready receipt discarded; one fresh follow-up applied"); Close();
 
