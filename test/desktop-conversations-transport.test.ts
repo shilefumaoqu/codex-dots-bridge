@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type net from 'node:net';
 import Database from 'better-sqlite3';
-import { runRead, runSend } from '../src/desktop-conversations-transport.js';
+import { runRead, runReply, runSend } from '../src/desktop-conversations-transport.js';
+import type { DesktopReplyBinding } from '../src/desktop-reply.js';
 import { DesktopConversationsService } from '../src/desktop-conversations.js';
 import { readerFixture } from './desktop-conversation-reader-fixture.js';
 import { fixedEchoPrompt, runDesktopEchoIpc } from '../src/desktop-echo-ipc.js';
@@ -78,6 +79,21 @@ test('legacy new reads require official local mode and never open IPC or logs', 
     assert.equal(f.socket.frames.length, 0); assert.equal(f.before(), 0);
   }, mode);
 });
+
+test('send persists source identity and original EOF before the only frame, then accepts the exact turn',async()=>fixture(async f=>{
+  const order:string[]=[],before=statSync(f.rolloutPath);let binding:DesktopReplyBinding|undefined;
+  f.onStart(()=>f.append(f.complete()));
+  const result=await f.send({onReplyBinding:(value:DesktopReplyBinding)=>{order.push('binding');binding=value;},beforeSend:()=>{order.push('intent');f.persist();},onAccepted:()=>{order.push('ack');}});
+  assert.equal(result.status,'completed');assert.deepEqual(order,['binding','intent','ack']);
+  assert.equal(binding?.offset,before.size);assert.equal(binding?.inode,before.ino);assert.equal(binding?.path,f.rolloutPath);assert.equal(binding?.thread_id,f.threadId);
+  assert.deepEqual(await runReply({binding:binding!,turnId:f.turnId,signal:f.controller.signal,deadline:Date.now()+1000}),{status:'completed',turn_id:f.turnId,reply:'普通回复🌟'});
+  assert.equal(f.socket.frames.filter(frame=>frame.method==='thread-follower-start-turn').length,1);
+}));
+
+test('source-binding persistence failure prevents the native send frame',async()=>fixture(async f=>{
+  const result=await f.send({onReplyBinding:()=>{throw new Error('private storage error');}});
+  assert.equal(result.status,'skipped_unknown');assert.equal(f.before(),0);assert.equal(f.socket.frames.filter(frame=>frame.method==='thread-follower-start-turn').length,0);
+}));
 
 test('saved legacy read receipt retains idle evidence, chunks and identity after reopen', async () => fixture(async f => {
   (Object.values(f.history.turnHistory.history.entitiesByKey)[0] as any).items[0].content[0].text = '原文🌟'.repeat(15000);

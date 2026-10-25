@@ -66,6 +66,13 @@ internal static class RefreshHarness
     }
     static void Wait(Task task) { PumpUntil(delegate { return task.IsCompleted; }); task.GetAwaiter().GetResult(); }
     static Task Refresh(bool manual = false) { return (Task)Call("RefreshState", manual); }
+    // The UI coordination fixture injects a transport; production polling uses
+    // StatusClient exclusively. Fake CLI status remains a fixture convenience.
+    static Task<T> ReadFixture<T>()
+    {
+        object cli = Get("cli");
+        return (Task<T>)cli.GetType().GetMethod("Run").Invoke(cli, new object[] { "status --tray", 5500, true });
+    }
     static Dictionary<string, object> Config(string control = "start", int delay = 200, string auto = "disabled", int inflight = 0)
     {
         return new Dictionary<string, object> { {"version", version}, {"control", control}, {"state", control == "start" ? "stopped" : "ready"}, {"autostart", auto}, {"inflight", inflight}, {"delay", delay}, {"commandDelay", 120}, {"invalid", false} };
@@ -91,6 +98,10 @@ internal static class RefreshHarness
         data = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data-" + name); Directory.CreateDirectory(data); Write(config);
         object options = Activator.CreateInstance(optionsType); optionsType.GetField("DataDir").SetValue(options, data);
         form = Activator.CreateInstance(formType, BindingFlags.Public | BindingFlags.Instance, null, new object[] {options, null, null}, null);
+        Type resultType = assembly.GetType("CodexDotsBridge.Tray.CommandResult");
+        Type readerType = typeof(Func<>).MakeGenericType(typeof(Task<>).MakeGenericType(resultType));
+        MethodInfo reader = typeof(RefreshHarness).GetMethod("ReadFixture", BindingFlags.NonPublic | BindingFlags.Static).MakeGenericMethod(resultType);
+        Set("statusReader", Delegate.CreateDelegate(readerType, reader));
         IntPtr handle = ((Form)form).Handle;
         // Do not Initialize: the harness does not create a NotifyIcon, poll timer, or named waits.
         if (initialScale.HasValue) { Call("ScalePresentation", initialScale.Value); AssertLayout("initial_" + initialScale.Value); }

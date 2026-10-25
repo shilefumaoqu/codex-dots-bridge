@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { createAutostartEntry, readInstall, safePath } from './maintenance.js';
 import { protectProductionDirectory, readProductionConfig } from './runtime.js';
 import { ProbeError } from './store.js';
-import { inspectStartupLink, prepareStartupLink, verifyAutostart } from './startup-link.js';
+import { inspectStartupLink, inspectStartupLinkAsync, prepareStartupLink, verifyAutostart, type LinkInspection } from './startup-link.js';
 
 export type AutostartState='enabled'|'disabled'|'unknown';
 function startupPath() {
@@ -25,21 +25,30 @@ function ownedSettings(dir:string) {
   if(config.installation&&(resolve(config.installation.root)!==root||resolve(config.installation.node_path)!==resolve(manifest.mcp.command)))throw new ProbeError('installation_binding_mismatch');
   return manifest;
 }
-function inspect(dir:string) {
-  const manifest=ownedSettings(dir);
+function inspectionResult(manifest:ReturnType<typeof ownedSettings>,link?:LinkInspection) {
   if(manifest.autostart_launcher&&(manifest.autostart===undefined||manifest.autostart.kind==='startup-link')) {
-    const link=inspectStartupLink(manifest.autostart_launcher);
+    if(!link)throw new ProbeError('invalid_startup_link_receipt');
     if(link.exists&&(!manifest.autostart||!link.owned||manifest.autostart.content!==link.content))throw new ProbeError('foreign_autostart_collision');
     const state:AutostartState=link.exists?(link.windows==='enabled'?'enabled':link.windows==='disabled'?'disabled':'unknown'):'disabled';
     return {manifest,path:link.path,content:link.content??undefined,state};
   }
   const path=startupPath(),content=fileText(path);
   if(content!==undefined&&(!manifest.autostart||manifest.autostart.path!==path||manifest.autostart.content!==content))throw new ProbeError('foreign_autostart_collision');
-  const windows=manifest.autostart_launcher?inspectStartupLink(manifest.autostart_launcher).legacy_windows:'enabled';
+  const windows=link?.legacy_windows??'enabled';
   return {manifest,path,content,state:content===undefined?'disabled' as const:windows==='enabled'?'enabled' as const:windows==='disabled'?'disabled' as const:'unknown' as const};
+}
+function inspect(dir:string) {
+  const manifest=ownedSettings(dir);
+  return inspectionResult(manifest,manifest.autostart_launcher?inspectStartupLink(manifest.autostart_launcher):undefined);
 }
 export function readTrayAutostart(dir:string):AutostartState {
   try{return inspect(dir).state;}catch{return 'unknown';}
+}
+export async function readTrayAutostartAsync(dir:string):Promise<AutostartState> {
+  try {
+    const manifest=ownedSettings(dir);
+    return inspectionResult(manifest,manifest.autostart_launcher?await inspectStartupLinkAsync(manifest.autostart_launcher):undefined).state;
+  }catch{return 'unknown';}
 }
 // A dedicated Startup lock coordinates tray clients without changing running-service locks.
 // Existing/stale locks fail closed; a tray never removes another process's lock.

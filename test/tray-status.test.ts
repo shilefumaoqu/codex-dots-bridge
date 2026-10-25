@@ -26,8 +26,75 @@ test('tray projection requires authenticated diagnostics and strips all private 
     const status=await getTrayStatus(f.dir,version,{call:async(dir,name,payload,options)=>{args={dir,name,payload,options};return {...ready,endpoint:'PRIVATE_ENDPOINT',tasks:[{task_id:'PRIVATE_TASK',input:'PRIVATE_BODY'}],error:'PRIVATE_ERROR',key:'PRIVATE_KEY'};}});
     assert.equal(status.state,'ready');assert.equal(status.tone,'green');assert.equal(status.control,'stop');assert.equal(status.inflight_count,6);
     assert.equal(status.service_version,version);assert.deepEqual(status.task_counts,ready.task_counts);
+    assert.equal(status.instance_id,f.config.instance_id);
     assert.deepEqual(args,{dir:f.dir,name:'dots_status',payload:{},options:{timeoutMs:2500}});
     assert.equal(JSON.stringify(status).includes('PRIVATE'),false);
+  }finally{f.close();}
+});
+test('long-lived tray providers bound Startup inspection caching and invalidate settings changes',async()=>{
+  const f=fixture();try {
+    let time=100000,reads=0;
+    const readAutostart=()=>{reads++;return reads===1?'disabled' as const:'enabled' as const;};
+    const options={call:async()=>ready,now:()=>time,autostartCacheMs:30000,readAutostart};
+    const first=await getTrayStatus(f.dir,version,options);
+    assert.equal(first.autostart,'disabled');assert.equal(reads,1);
+    time+=15000;
+    const cached=await getTrayStatus(f.dir,version,options);
+    assert.equal(cached.autostart,'disabled');assert.equal(reads,1);
+    assert.equal(cached.autostart_checked_at,first.autostart_checked_at);assert.notEqual(cached.checked_at,first.checked_at);
+    writeFileSync(join(f.dir,'installation.json'),'{}');
+    assert.equal((await getTrayStatus(f.dir,version,options)).autostart,'enabled');assert.equal(reads,2);
+    time+=30000;await getTrayStatus(f.dir,version,options);assert.equal(reads,3);
+    await getTrayStatus(f.dir,version,{...options,autostartCacheMs:0});assert.equal(reads,4);
+    time=1;await getTrayStatus(f.dir,version,options);assert.equal(reads,5,'a clock rollback does not reuse future evidence');
+  }finally{f.close();}
+});
+test('service autostart refresh is asynchronous, shared and explicitly stale until verified',async()=>{
+  const f=fixture();try {
+    let time=100000,reads=0;
+    const resolutions:Array<(state:'enabled'|'disabled'|'unknown')=>void>=[];
+    const readAutostart=()=>{reads++;return new Promise<'enabled'|'disabled'|'unknown'>(resolve=>resolutions.push(resolve));};
+    const options={call:async()=>ready,now:()=>time,autostartCacheMs:30000,readAutostart};
+    const first=await getTrayStatus(f.dir,version,options);
+    assert.equal(first.state,'ready');assert.equal(first.autostart,'unknown');assert.equal(first.autostart_checked_at,null);
+    assert.equal(first.autostart_stale,true);assert.equal(first.autostart_refreshing,true);
+    for(let i=0;i<5;i++)await getTrayStatus(f.dir,version,options);
+    assert.equal(reads,1,'concurrent polling shares one helper');
+    resolutions.shift()!('enabled');await new Promise(resolve=>setImmediate(resolve));
+    const verified=await getTrayStatus(f.dir,version,options);
+    assert.equal(verified.autostart,'enabled');assert.equal(verified.autostart_stale,false);assert.equal(verified.autostart_refreshing,false);
+    assert.equal(verified.autostart_checked_at,new Date(time).toISOString());
+    time+=30001;
+    const stale=await getTrayStatus(f.dir,version,options);
+    assert.equal(stale.autostart,'unknown');assert.equal(stale.autostart_stale,true);assert.equal(stale.autostart_refreshing,true);
+    assert.equal(stale.autostart_checked_at,verified.autostart_checked_at);assert.equal(reads,2);
+    writeFileSync(join(f.dir,'installation.json'),'{}');
+    const changed=await getTrayStatus(f.dir,version,options);
+    assert.equal(changed.autostart_checked_at,null);assert.equal(reads,2,'settings change does not overlap a running helper');
+    resolutions.shift()!('enabled');await new Promise(resolve=>setImmediate(resolve));
+    const retry=await getTrayStatus(f.dir,version,options);
+    assert.equal(retry.autostart,'unknown');assert.equal(reads,3,'old binding result is discarded');
+    resolutions.shift()!('disabled');await new Promise(resolve=>setImmediate(resolve));
+    assert.equal((await getTrayStatus(f.dir,version,options)).autostart,'disabled');
+  }finally{f.close();}
+});
+test('failed asynchronous autostart inspection remains unknown and is rate limited',async()=>{
+  const f=fixture();try {
+    let reads=0;const options={call:async()=>ready,autostartCacheMs:30000,readAutostart:async()=>{reads++;throw Error('PRIVATE_HELPER_FAILURE');}};
+    await getTrayStatus(f.dir,version,options);await new Promise(resolve=>setImmediate(resolve));
+    const result=await getTrayStatus(f.dir,version,options);
+    assert.equal(result.autostart,'unknown');assert.equal(result.autostart_stale,false);assert.equal(result.autostart_refreshing,false);assert.equal(reads,1);assert(!JSON.stringify(result).includes('PRIVATE_HELPER_FAILURE'));
+  }finally{f.close();}
+});
+test('tray shares waiting evidence without accepting arbitrary text or treating business activity as completion',async()=>{
+  const f=fixture();try {
+    const now=Date.now(),last=new Date(now-1000).toISOString();
+    for(const waiting_reason of ['execution_slot_occupied','awaiting_delivery','awaiting_pickup','pickup_delayed','pickup_stalled']) {
+      const status=await getTrayStatus(f.dir,version,{now:()=>now,call:async()=>({...ready,waiting_reason,last_business_at:last})});
+      assert.equal(status.waiting_reason,waiting_reason);assert.equal(status.last_business_at,last);assert.equal(status.state,'ready');assert.equal(status.inflight_count,6);
+    }
+    const untrusted=await getTrayStatus(f.dir,version,{now:()=>now,call:async()=>({...ready,waiting_reason:'PRIVATE_BODY',last_business_at:new Date(now+1).toISOString()})});
+    assert.equal(untrusted.waiting_reason,null);assert.equal(untrusted.last_business_at,null);assert.equal(JSON.stringify(untrusted).includes('PRIVATE'),false);
   }finally{f.close();}
 });
 test('tray treats mismatch, missing diagnostics, timeout and identity ambiguity conservatively',async()=>{

@@ -14,7 +14,7 @@ const taskErrors = new Set([
   'cancellation_not_pending','result_not_found','result_not_read','acceptance_conflict','resolution_not_required','cancellation_pending','deadline_expired','invalid_resolution','another_subscription_active',
   'delivery_attempt_changed','delivery_task_not_running','delivery_input_not_acknowledged','invalid_dispatch_context','dispatch_record_invalid','dispatch_clock_invalid',
   'dispatch_submission_conflict','delivery_window_request_conflict','delivery_window_expired','delivery_window_too_long','dispatch_message_conflict','delivery_window_input_mismatch','delivery_window_interrupted',
-  'invalid_parameters','unclassified_tool_error',
+  'invalid_parameters','arguments_too_large','invalid_response_mode','chat_text_reply_required','unclassified_tool_error',
 ]);
 export type TaskToolOutcome = { outcome: 'returned' } | { outcome: 'error'; error_code: string };
 export type TaskToolFinish = (outcome: TaskToolOutcome) => void;

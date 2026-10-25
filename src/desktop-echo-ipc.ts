@@ -112,8 +112,14 @@ async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boo
       // Router discovery itself can wait ten seconds. Allow its terminal reply
       // a bounded margin; initialization and start ACK retain their own budgets.
       const requestBudgetMs = method === 'thread-owner-discovery' ? 12000 : method === 'thread-follower-start-turn' ? 15000 : 2000;
-      const timeoutMs = Math.max(1, Math.min(requestBudgetMs, input.deadline - Date.now()));
-      const timer = setTimeout(() => { pending.delete(requestId); reject(failure('request_timeout', method)); }, timeoutMs);
+      const remainingMs = input.deadline - Date.now(), deadlineLimited = remainingMs <= requestBudgetMs;
+      const timeoutMs = Math.max(1, Math.min(requestBudgetMs, remainingMs));
+      const timer = setTimeout(() => {
+        // Timers can fire just before the wall-clock deadline. A deadline-
+        // limited phase still represents cancellation, not a router failure.
+        if (deadlineLimited) { abort(); return; }
+        pending.delete(requestId); reject(failure('request_timeout', method));
+      }, timeoutMs);
       pending.set(requestId, { method, resolve, reject, timer });
       try { write({ type: 'request', requestId, sourceClientId: clientId ?? 'initializing-client', ...(targetClientId ? { targetClientId } : {}), version, method, timeoutMs, params }); }
       catch (error) { pending.delete(requestId); clearTimeout(timer); reject(error); }
@@ -172,7 +178,8 @@ async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boo
     socket = testing ? testing.connect() : net.createConnection(DESKTOP_PIPE); socket.on('data', receive);
     socket.on('error', () => rejectAll(failure('unreachable'))); socket.on('close', () => rejectAll(failure('transport_closed')));
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { cleanup(); reject(failure('unreachable')); }, Math.max(1, Math.min(2000, input.deadline - Date.now())));
+      const remainingMs = input.deadline - Date.now(), deadlineLimited = remainingMs <= 2000;
+      const timer = setTimeout(() => { cleanup(); if (deadlineLimited) abort(); reject(failure(deadlineLimited ? 'aborted' : 'unreachable')); }, Math.max(1, Math.min(2000, remainingMs)));
       const cleanup = () => { clearTimeout(timer); socket?.off('connect', connect); socket?.off('error', error); socket?.off('close', closed); };
       const connect = () => { cleanup(); resolve(); }, error = () => { cleanup(); reject(failure('unreachable')); }, closed = () => { cleanup(); reject(failure('transport_closed')); };
       socket!.once('connect', connect); socket!.once('error', error); socket!.once('close', closed);
@@ -187,7 +194,8 @@ async function runDesktopIpc(input: DesktopIpcInput, text: string, readOnly: boo
     if (input.afterTurn && ownerHash !== input.afterTurn.ownerHash) return { status: 'skipped_unknown', reason: 'next_turn_owner_changed' };
     stageReason = 'ipc_snapshot_unavailable';
     await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { snapshot = undefined; reject(failure('snapshot_timeout')); }, Math.max(1, Math.min(2000, input.deadline - Date.now())));
+      const remainingMs = input.deadline - Date.now(), deadlineLimited = remainingMs <= 2000;
+      const timer = setTimeout(() => { if (deadlineLimited) { abort(); return; } snapshot = undefined; reject(failure('snapshot_timeout')); }, Math.max(1, Math.min(2000, remainingMs)));
       snapshot = { resolve: () => { clearTimeout(timer); snapshot = undefined; resolve(); }, reject: error => { clearTimeout(timer); snapshot = undefined; reject(error); } };
       try { followed = true; following(true); } catch (error) { snapshot.reject(error as Error); }
     });

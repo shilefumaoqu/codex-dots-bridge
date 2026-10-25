@@ -7,18 +7,18 @@
 <p align="center">把任务交给你的 Dot，在 Codex 中跟进过程并取回结果。</p>
 
 <p align="center">
-  <a href="README.en.md">English</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">v0.2.0-alpha.32</a> · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.en.md">English</a> · 0.3.0-alpha.1 源码候选（未发布） · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.32/Codex-Dots-Bridge-0.2.0-alpha.32-Setup.exe"><strong>下载 Windows 安装程序</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.32/Codex-Dots-Bridge-0.2.0-alpha.32-Setup.exe"><strong>下载已发布的 alpha.32 Windows 安装程序</strong></a>
 </p>
 
 <p align="center">
   <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">Windows ZIP、SHA256 校验文件与完整发布说明</a>
 </p>
 
-> **当前发布：0.2.0-alpha.32（实验性预发布）**。在 alpha.31 基线上修复 Windows PowerShell 内置模块加载、Unicode 快捷方式和安装回滚身份校验，并修复发布检查与安装验收的 CI 兼容问题；保留连接拒绝恢复、结果诊断、托盘、完整历史与增量接续功能。配套 Tunnel 为本地修补版，并非官方原版。ChatGPT→Dot 连续聊天仍未通过，原自然 Events 后续也有零领取样本；请先阅读 [本版验收与限制](ACCEPTANCE.md)。程序就绪不等于消息往返成功。
+> **当前源码：0.3.0-alpha.1，未发布、未部署的存储升级候选。** 上方下载仍指向已发布的 0.2.0-alpha.32；它不包含本候选改动。本候选增加接纳保护、准确回合后台取回、compact 回执、索引化任务存储、共享读取预算和托盘轻量查询。迁移后的数据库不能由 alpha.32 打开，须按[迁移与验收说明](ACCEPTANCE.md)操作。Events HTTP 200 后零领取仍是独立阻塞项，程序就绪不等于消息往返成功。
 
 Codex Dots Bridge 是连接 Codex 与你已有 Dot 的协作插件。派出一项文本任务后，可以沿同一任务查看进度、回答澄清、补充要求并取回结果。
 
@@ -79,13 +79,11 @@ Codex Dots Bridge 是连接 Codex 与你已有 Dot 的协作插件。派出一�
 - **读取示例：**“读取这条 Codex 对话链接里的持久历史，总结已确认的要求。”
 - **发送示例：**“请把 `17 × 19` 发给这条 Codex 对话，并取回它本次回合的回复。”
 
-历史分页取回不保证原始模型上下文完整，也不包含无法从已保存记录恢复的压缩前内容。发送遇到忙碌时，Bridge 会说明状态并由你选择是否等待下一回合；当前回合追加不支持。离线、未知或等待条件失效时不会自动补发。
+历史分页取回不保证原始模型上下文完整，也不包含无法从已保存记录恢复的压缩前内容。已有发送在途时，新请求在落库前被拒绝；取得准确忙碌回合和 owner 后才提供下一回合选项，当前回合追加不支持。确认发送后，快速等待未取得回复会按原请求最多后台只读取回 24 小时；证据不足时保持未知，不补发。后台取回不会向其他聊天自动发送消息。
 
 ## 当前状态与实验边界
 
-alpha.30 的启动辅助环境和回执修复已有定向测试、专门审查、成品及本机升级记录。alpha.21 的 Windows 安装、升级与恢复检查为历史验收；正向合成任务完成并取回，一条用户发起的本机对话发送往返也取得真实回复。自动 Events 及时领取、忙碌/离线等异常分支、真实重启恢复及长期运行仍未完整验收。曾出现的宿主工具目录拒绝尚无根因结论；后续成功样本不代表问题已解决。
-
-[alpha.21 历史 Windows CI 结果](https://github.com/shilefumaoqu/codex-dots-bridge/actions/runs/38419703662)：38 项中 35 项通过，3 项历史 Git 测试失败；相同源码在本机 38/38 通过，环境差异原因未确认，后续 CI 构建步骤已跳过。另有 149 份源码与 286 个历史 Git blob 的公开内容隐私扫描未发现问题；该扫描结果不代表 CI 全部通过。
+本候选在隔离临时数据库上验证逻辑、迁移和合成性能；Windows 成品、跨版本安装、每条真实链路至少 30 次往返和 72 小时稳定性仍待独立验收。简单聊天只保证一条文本的可靠往返，不承诺原生会话上下文连续。领取延迟只展示观察结果，不把事件接收当作任务完成。历史版本证据保留在[变更日志](CHANGELOG.md)，不能替代本候选验收。
 
 当前按单用户、单台 Windows 电脑和一个现有 Dot 设计，并发默认 1。alpha 版本面向愿意按文档配置和反馈的试用者，不承诺适用于所有账号、设备策略或长时间无人值守场景。
 

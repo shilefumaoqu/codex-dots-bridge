@@ -15,13 +15,13 @@ export const unsubscribeParams = subscribeParams.omit({ttlMs:true,cursor:true}).
 export const subscriptionResult = z.object({id:z.string(),refreshBefore:z.string().datetime(),cursor:z.null(),truncated:z.literal(false)});
 export function eventCatalog(queue:'p0'|'tasks') {
   return {events:[{name:'task.available',
-    description:queue==='p0'?'A harmless P0 probe is ready. Read get_task.':'A Codex Dots Bridge task is ready or resumed. Read the current task before claiming.',
+    description:queue==='p0'?'A harmless P0 probe is ready. Read get_task.':'A Codex Dots Bridge task is ready or resumed. Compact claim_task returns current work input and server rules; checkpoint before acting.',
     delivery:['webhook'], inputSchema:z.toJSONSchema(z.object({queue:z.literal(queue)}).strict()),
     payloadSchema:{type:'object',properties:{task_id:{type:'string'},queue:{const:queue}},required:['task_id','queue'],additionalProperties:false},
   }]};
 }
 export const catalog=eventCatalog('p0');
-type EventStore = Pick<ProbeStore,'now'|'sweep'|'subscriptions'|'saveSubscription'|'unsubscribe'|'pending'|'isDeliveryPending'|'deliveryResult'>;
+type EventStore = Pick<ProbeStore,'now'|'sweep'|'subscriptions'|'saveSubscription'|'unsubscribe'|'pending'|'isDeliveryPending'|'deliveryResult'> & Partial<Pick<ProbeStore,'audit'>>;
 type Sender = typeof postSigned;
 export class ProbeEvents {
   private busy=false;
@@ -79,15 +79,27 @@ export class ProbeEvents {
         if(!this.store.isDeliveryPending(item.id)) continue;
         const sub=this.store.subscriptions().find(s=>s.id===item.subscription_id);
         if (!sub || !sub.active || sub.expires_at<=this.store.now()) { this.store.deliveryResult(item,410); continue; }
+        const started=performance.now();
+        const trace=(stage:'attempt'|'response'|'transport_failure'|'superseded',status?:number)=>{
+          if(this.queue!=='tasks')return;
+          try {
+            const taskId=(JSON.parse(item.payload) as {data:{task_id:string}}).data.task_id;
+            this.store.audit?.('event_transport',taskId,{event_id:item.event_id,subscription_id:sub.id,generation:sub.generation,attempt:item.attempts+1,stage,
+              ...(stage==='attempt'?{}:{duration_ms:Math.max(0,performance.now()-started)}),...(status===undefined?{}:{status})});
+          }catch{/* Diagnostic failure never changes transmission or replays an event. */}
+        };
+        trace('attempt');
         try {
           const response=await this.send(sub.url,sub.secret,sub.id,item.event_id,JSON.parse(item.payload),
             (sub.rotation_until??0)>this.store.now()?sub.previous_secret:undefined);
           // A refresh or stop/re-subscribe may complete while this request is in flight.
           // Its response belongs to the old generation; retry pending work with current credentials.
-          if(this.store.subscriptions().find(s=>s.id===sub.id)?.generation!==sub.generation) continue;
+          if(this.store.subscriptions().find(s=>s.id===sub.id)?.generation!==sub.generation) {trace('superseded',response.status);continue;}
+          trace('response',response.status);
           this.store.deliveryResult(item,response.status);
           if (response.status===410) this.store.unsubscribe(sub.id,sub.generation);
         } catch {
+          trace('transport_failure');
           if(this.store.subscriptions().find(s=>s.id===sub.id)?.generation===sub.generation) this.store.deliveryResult(item,0);
         }
       }

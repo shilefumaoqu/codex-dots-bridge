@@ -174,7 +174,7 @@ test('async conversation errors are safe and the forward claim/checkpoint/comple
       ['codex_conversation_status', { request_id, wait_seconds: 0 }],
     ] as const) {
       const response = (await rpc('tools/call', { name, arguments: args })).body;
-      assert.equal(response.result.isError, true); assert.deepEqual(JSON.parse(response.result.content[0].text), { error: 'bridge_operation_failed' });
+      assert.equal(response.result.isError, true); assert.deepEqual(JSON.parse(response.result.content[0].text), { error: 'bridge_operation_failed', category:'internal', retryable:false });
       assert.ok(!JSON.stringify(response).includes('PRIVATE_')); assert.ok(!JSON.stringify(response).includes('secret'));
     }
     const submitted = await control('dots_submit', { idempotency_key: randomUUID(), title: 'synthetic untouched forward path', input: { text: 'synthetic' } });
@@ -219,7 +219,7 @@ test('recognized conversation errors preserve their safe code without exposing a
       ['codex_conversation_status', { request_id, wait_seconds: 0 }],
     ] as const) {
       const body = (await rpc('tools/call', { name, arguments: args })).body;
-      assert.equal(body.result.isError, true); assert.deepEqual(JSON.parse(body.result.content[0].text), { error: 'thread_not_allowed' });
+      assert.equal(body.result.isError, true); assert.deepEqual(JSON.parse(body.result.content[0].text), { error: 'thread_not_allowed', category:'state', retryable:false });
       assert.ok(!JSON.stringify(body).includes('PRIVATE_')); assert.ok(!JSON.stringify(body).includes('secret'));
     }
   });

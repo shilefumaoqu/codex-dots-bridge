@@ -1,6 +1,6 @@
 {
   "name": "codex-dots-bridge",
-  "version": "0.2.0-alpha.32",
+  "version": "0.3.0-alpha.1",
   "private": true,
   "description": "A Windows local bridge from Codex to an existing Dot using official MCP, Tunnel and Events.",
   "license": "MIT",
@@ -14,7 +14,8 @@
     "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
     "probe": "node --import tsx src/cli.ts",
     "bridge": "node --import tsx src/main.ts",
-    "check:release": "node scripts/check-release.mjs"
+    "check:release": "node scripts/check-release.mjs",
+    "benchmark": "node --import tsx scripts/benchmark.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/node": "2.1.1",

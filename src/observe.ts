@@ -1,3 +1,4 @@
+import { readStoredTask } from './task-persistence.js';
 import { z } from 'zod';
 import type Database from 'better-sqlite3';
 import type { StoredTask, TaskResult, TaskStatus } from './task-store.js';
@@ -67,13 +68,14 @@ export function observeDatabase(db: Database.Database, request: unknown, instanc
   const params = observeSchema.parse(request);
   if (!z.string().uuid().safeParse(instanceId).success) throw new ProbeError('observer_identity_unconfigured');
   return db.transaction(() => {
-    const maximum = (db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM task_evidence').get() as { id: number }).id;
+    const hasCursor=!!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_cursor'").get();
+    const maximum = hasCursor?(db.prepare('SELECT highwater FROM task_cursor WHERE singleton=1').get() as {highwater:number}).highwater:(db.prepare('SELECT COALESCE(MAX(id),0) AS id FROM task_evidence').get() as { id: number }).id;
     if (!Number.isSafeInteger(maximum)) throw new ProbeError('observer_sequence_exhausted');
     const response: ObserveResponse = { protocol_version: 1, instance_id: instanceId, observed_at: new Date(now()).toISOString(),
       complete: true, cursor: maximum, has_more: false, tasks: [], events: [] };
     const readTask = (id: string): StoredTask | undefined => {
       const row = db.prepare('SELECT data FROM tasks WHERE id=?').get(id) as { data: string } | undefined;
-      return row ? JSON.parse(row.data) as StoredTask : undefined;
+      return row ? readStoredTask(db,row.data) : undefined;
     };
     const projections = new Map<string, ObservedTask>();
     const project = (task: StoredTask): ObservedTask => {
@@ -111,7 +113,7 @@ export function observeDatabase(db: Database.Database, request: unknown, instanc
       const rows = db.prepare('SELECT data FROM tasks WHERE id>? ORDER BY id LIMIT ?').all(params.after_task_id ?? '', size + 1) as { data: string }[];
       response.cursor = watermark;
       response.has_more = rows.length > size;
-      response.tasks = rows.slice(0, size).map(row => project(JSON.parse(row.data) as StoredTask));
+      response.tasks = rows.slice(0, size).map(row => project(readStoredTask(db,row.data)));
       if (response.has_more) response.next_task_id = response.tasks.at(-1)!.task_id;
     } else {
       if (params.cursor > maximum) throw new ProbeError('invalid_observer_cursor');
@@ -141,7 +143,7 @@ export function observeDatabase(db: Database.Database, request: unknown, instanc
           event.error = { code: task.error.code, message: task.error.message };
         return event;
       });
-      response.cursor = response.events.at(-1)?.sequence ?? params.cursor;
+      response.cursor = response.has_more ? response.events.at(-1)!.sequence : maximum;
     }
     return response;
   })();

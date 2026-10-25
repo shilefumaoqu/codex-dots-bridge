@@ -101,6 +101,7 @@ test('snapshot pages share a baseline and changes bridge interleaved writes, inc
       page = f.observe({ mode: 'snapshot', limit: 2, after_task_id: page.next_task_id, watermark: baseline });
       assert.equal(page.cursor, baseline); seen.push(...page.tasks);
     }
+    f.store.message({task_id:late.task_id,message_key:'interleaved-message',text:'Additional committed change for pagination'});
     const change = f.observe({ mode: 'changes', cursor: baseline, limit: 1 });
     assert.equal(change.has_more, true); assert.equal(change.events.length, 1); assert.equal(change.events[0]?.task_id, late.task_id);
     const tail = f.observe({ mode: 'changes', cursor: change.cursor });

@@ -142,6 +142,21 @@ function Test-InstallerRuntimeReady { return $script:fixtureStatus.supervisor -e
 function Start-InstallerSupervisor([string]$Root,[string]$Directory) {Invoke-Bridge $Root @('run','--supervisor','--data-dir',$Directory)|Out-Null}
 function Invoke-Bridge([string]$Root,[string[]]$BridgeArgs) {
   if($BridgeArgs[0] -eq 'status') { return $script:fixtureStatus }
+  if($BridgeArgs[0] -eq 'migrate-storage') {
+    if((Test-Path -LiteralPath (Join-Path $DataDir 'service.lock')) -or (Test-Path -LiteralPath (Join-Path $DataDir 'supervisor.lock'))) { throw 'migration_started_with_runtime_lock' }
+    $config=Read-Json (Join-Path $DataDir 'config.json');$config.schema_version=2
+    $id=[Guid]::NewGuid().ToString('D');$config|Add-Member -NotePropertyName storage -NotePropertyValue ([pscustomobject]@{database_version=2;migration_id=$id;phase='maintenance'})
+    Write-Json (Join-Path $DataDir 'config.json') $config
+    return [pscustomobject]@{migration_id=$id;phase='maintenance'}
+  }
+  if($BridgeArgs[0] -eq 'activate-storage') {
+    if((Read-Json $statePath).version -cne $NewVersion) { throw 'storage_activated_before_install_commit' }
+    $config=Read-Json (Join-Path $DataDir 'config.json')
+    if($config.storage.phase -cne 'maintenance') { throw 'missing_storage_maintenance_gate' }
+    $config.storage.phase='ready';Write-Json (Join-Path $DataDir 'config.json') $config
+    if($script:failActivation) { throw 'synthetic_activation_response_lost' }
+    return [pscustomobject]@{phase='ready'}
+  }
   if($BridgeArgs -contains '--stop') {
     $script:stopCalls++
     if($script:releaseLocks) {
@@ -161,7 +176,7 @@ function Setup-Registration([string]$Root,$Settings) {
   if($script:failNewRegistration -and $Root -cne $script:fixtureOldRoot) { throw 'synthetic_registration_restore_failed' }
   Write-Json (Join-Path $DataDir 'installation.json') ([pscustomobject]@{codex_command=$originalCli;mcp=[pscustomobject]@{args=@((Join-Path $Root 'dist\main.js'))}})
 }
-function Lifecycle-LockCase([string]$Name,[string]$Stage,[string]$LockName,[bool]$Running=$false,[bool]$FailNewRegistration=$false,[bool]$FailPartialUninstall=$false) {
+function Lifecycle-LockCase([string]$Name,[string]$Stage,[string]$LockName,[bool]$Running=$false,[bool]$FailNewRegistration=$false,[bool]$FailPartialUninstall=$false,[bool]$FailActivation=$false) {
   $InstallDirectory=Join-Path $work $Name;$DataDir=Join-Path $work ($Name+' data')
   $CodexHome=Join-Path $work ($Name+' home');$CodexCommand=$originalCli;$AppDataDirectory=Join-Path $work ($Name+' AppData')
   $InstallerIdentity='CodexDotsBridgeSetup';$NewVersion='0.2.0-alpha.9';$Autostart=$false
@@ -173,11 +188,12 @@ function Lifecycle-LockCase([string]$Name,[string]$Stage,[string]$LockName,[bool
   $manifestText='{"synthetic":"package identity"}'
   $sha=[Security.Cryptography.SHA256]::Create();try { $PackageFingerprint=([BitConverter]::ToString($sha.ComputeHash([Text.UTF8Encoding]::new($false).GetBytes($manifestText)))).Replace('-','').ToLowerInvariant() } finally { $sha.Dispose() }
   Write-Json $statePath ([pscustomobject]@{owner='codex-dots-bridge-setup';schema=1;installer_app_id=$InstallerIdentity;version='0.2.0-alpha.8';payload_root=$script:fixtureOldRoot;data_dir=$DataDir;codex_home=$CodexHome;app_data=$AppDataDirectory;codex_command=$originalCli})
-  Write-Json (Join-Path $DataDir 'config.json') ([pscustomobject]@{owner='codex-dots-bridge';synthetic_retained='keep'})
+  Write-Json (Join-Path $DataDir 'config.json') ([pscustomobject]@{owner='codex-dots-bridge';schema_version=1;synthetic_retained='keep'})
   Setup-Registration $script:fixtureOldRoot $null
   $fixtureStateText=[IO.File]::ReadAllText($statePath);$fixtureConfigText=[IO.File]::ReadAllText((Join-Path $DataDir 'config.json'));$fixtureManifestText=[IO.File]::ReadAllText((Join-Path $DataDir 'installation.json'))
   $script:registrationChanges=0;$script:stopCalls=0;$script:releaseLocks=$Stage -eq 'normal';$script:failNewRegistration=$FailNewRegistration;$script:failPartialUninstall=$FailPartialUninstall
-  $script:fixtureStatus=[pscustomobject]@{supervisor=$(if($Running){'running'}else{'stopped'});service=$(if($Running){'running'}elseif($LockName -eq 'service.lock' -and $Stage -eq 'initial'){'stale_lock'}else{'stopped'});tasks=[pscustomobject]@{}}
+  $script:failActivation=$FailActivation
+  $script:fixtureStatus=[pscustomobject]@{supervisor=$(if($Running){'running'}else{'stopped'});service=$(if($Running){'running'}elseif($LockName -eq 'service.lock' -and $Stage -eq 'initial'){'stale_lock'}else{'stopped'});tasks=[pscustomobject]@{};maintenance_activity=[pscustomobject]@{total=0}}
   $lockText='synthetic unknown lock retained verbatim'
   if($Stage -ne 'commit' -and $LockName) { [IO.File]::WriteAllText((Join-Path $DataDir $LockName),$lockText) }
   if($Stage -eq 'normal' -and $Running) { [IO.File]::WriteAllText((Join-Path $DataDir 'supervisor.lock'),$lockText) }
@@ -193,6 +209,10 @@ function Lifecycle-LockCase([string]$Name,[string]$Stage,[string]$LockName,[bool
     if($Stage -eq 'commit') { [IO.File]::WriteAllText((Join-Path $DataDir $LockName),$lockText) }
     $Action='Commit';$validatedDirectory=$false;$ownsTransaction=$false;$code=''
     . $lifecycleBody | Out-Null
+  }
+  if($FailActivation) {
+    if($code -cne 'storage_activation_requires_recovery' -or $script:registrationChanges -ne 2 -or -not (Test-Path -LiteralPath $transactionPath) -or (Read-Json (Join-Path $DataDir 'config.json')).storage.phase -cne 'ready' -or (Read-Json (Join-Path $InstallDirectory '.setup-activation.json')).phase -cne 'intent') { throw 'Uncertain activation rolled back or discarded recovery evidence.' }
+    $results.Add([pscustomobject]@{name=$Name;passed=$true;runtime='synthetic_activation_response_loss'});return
   }
   if($Stage -eq 'normal' -and -not $FailNewRegistration -and -not $FailPartialUninstall) {
     if($code -or $script:registrationChanges -ne 2 -or (Read-Json $statePath).version -cne $NewVersion) { throw ('Normal upgrade failed: '+$Name) }
@@ -219,6 +239,7 @@ Lifecycle-LockCase 'normal_running_upgrade_releases_locks' 'normal' 'service.loc
 Lifecycle-LockCase "shortcut 中文 O'Brien `$literal" 'normal' ''
 Lifecycle-LockCase 'new_registration_failure_still_rolls_back' 'normal' '' $false $true
 Lifecycle-LockCase 'partial_uninstall_failure_still_rolls_back' 'normal' '' $false $false $true
+Lifecycle-LockCase 'activation_response_loss_retains_compatible_payload_and_recovery_evidence' 'normal' '' $false $false $false $true
 
 # A failed UI launch can occur after the new backend has started. Exercise
 # rollback with live-lock fixtures so uninstall cannot silently skip that stop.

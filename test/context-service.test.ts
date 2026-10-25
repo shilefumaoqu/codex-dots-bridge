@@ -4,7 +4,9 @@ import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
-import { ContextService } from '../src/context-service.js';
+import { ContextService, migrateContextStorage } from '../src/context-service.js';
+import { historyReadScheduler } from '../src/read-scheduler.js';
+import { DesktopConversationsService } from '../src/desktop-conversations.js';
 import type { ContextReadInput, ContextReadBatch } from '../src/context-reader.js';
 import type { ContextGetResult, ContextState } from '../src/context-contract.js';
 
@@ -70,13 +72,14 @@ test('restart marks unfinished jobs reconciliation_required',async()=>{
     const restarted=new ContextService(f.db,f.config,{reader:f.reader});try{assert.equal((await restarted.get({request_id:request,thread_id:f.thread})).status,'reconciliation_required');}finally{await restarted.close();}
   }finally{await f.cleanup();}
 });
-test('forget persists epoch tombstone and late reader cannot resurrect body',async()=>{
+for(const normalizedStorage of [false,true]) test(`forget persists epoch tombstone and late reader cannot resurrect body (normalized=${normalizedStorage})`,async()=>{
   let release!:(value:ContextReadBatch)=>void;let input!:ContextReadInput;
-  const f=fixture(i=>{input=i;return new Promise(resolve=>{release=resolve;});});try{
+  const f=fixture(i=>{input=i;return new Promise(resolve=>{release=resolve;});},{normalizedStorage});try{
     const request=randomUUID(),pending=await f.get(request,{wait_seconds:0});
     const forgotten=f.service.forget({operation_id:randomUUID(),thread_id:f.thread,expected_epoch:0,expected_revision:0});assert.equal(forgotten.epoch,1);
     release(f.batch(input,'SECRET_LATE_BODY'));await new Promise(resolve=>setImmediate(resolve));assert.equal((await f.get(request)).status,'forgotten');
     const content=JSON.stringify(f.db.prepare('SELECT data FROM context_jobs').all());assert(!content.includes('SECRET_LATE_BODY'));
+    if(normalizedStorage)assert.equal((f.db.prepare('SELECT count(*) AS n FROM context_receipt_pages').get() as {n:number}).n,0);
     assert.equal((await f.get(randomUUID(),{mode:'view'})).epoch,1);assert.equal(pending.epoch,0);
   }finally{await f.cleanup();}
 });
@@ -146,8 +149,8 @@ test('later continuation cannot erase earlier missing-content gap',async()=>{
   let f:ReturnType<typeof fixture>;f=fixture(async input=>{const batch=f.batch(input,input.continuation?'last':'first');if(!input.continuation){batch.coverage.historyComplete=false;batch.gaps.push({code:'attachment_unavailable'});batch.continuation={version:1,sourceIdentity:batch.sourceIdentity,index:batch.watermark.index,indexComplete:true,pendingTurnIds:[f.turn],startedAt:batch.observation.startedAt};}return batch;});
   try{const first=await f.get();f.update(first,empty(),{processed_refs:first.coverage!.fetched_refs});const final=await f.get(randomUUID(),{continuation_token:first.continuation_token});assert(final.coverage!.gaps.includes('attachment_unavailable'));assert.equal(f.update(final,empty(),{processed_refs:final.coverage!.fetched_refs}).coverage!.continuous,false);}finally{await f.cleanup();}
 });
-test('bounded receipt retention expires bodies without refreshing fixed request',async()=>{
-  const f=fixture();try{const id=randomUUID();await f.get(id);for(let n=0;n<17;n++)await f.get();assert.equal((f.db.prepare('SELECT COUNT(*) AS n FROM context_receipts').get() as {n:number}).n,16);const expired=await f.get(id);assert.equal(expired.status,'reconciliation_required');assert.equal(expired.reason,'context_package_expired');assert.equal(expired.evidence,undefined);assert.equal(f.reads(),18);}finally{await f.cleanup();}
+test('completed business receipts remain retrievable beyond the former cache retention limit',async()=>{
+  const f=fixture();try{const id=randomUUID(), first=await f.get(id);for(let n=0;n<17;n++)await f.get();assert.equal((f.db.prepare('SELECT COUNT(*) AS n FROM context_receipts').get() as {n:number}).n,18);assert.deepEqual(await f.get(id),first);assert.equal(f.reads(),18);}finally{await f.cleanup();}
 });
 test('known compaction and image exclusions retain limited reusable coverage and reduce later reads',async()=>{
   let f:ReturnType<typeof fixture>,coldItems=0,warmItems=0;f=fixture(async input=>{
@@ -219,3 +222,83 @@ test('review regression: complete stable source rebuild resolves obsolete basis 
 
 
 
+
+test('normalized delivery stores body once and never rewrites immutable pages or receipt metadata',async()=>{
+  let f:ReturnType<typeof fixture>;f=fixture(async input=>f.batch(input,'X'.repeat(11000)+'🌟',2),{pageChars:4096,normalizedStorage:true});
+  try{
+    const id=randomUUID();let result=await f.get(id);assert(result.delivery_cursor);
+    const metadata=f.db.prepare('SELECT data FROM context_receipts WHERE id=?').get(result.read_receipt_id) as {data:string};
+    assert(!metadata.data.includes('X'.repeat(100)));
+    const pages=f.db.prepare('SELECT page,data FROM context_receipt_pages WHERE receipt_id=? ORDER BY page').all(result.read_receipt_id);
+    const immutable=JSON.stringify(pages);let received=result.evidence!.map(item=>item.text).join('');
+    while(result.delivery_cursor){result=await f.get(id,{delivery_cursor:result.delivery_cursor});received+=result.evidence!.map(item=>item.text).join('');}
+    assert.equal(received,('X'.repeat(11000)+'🌟0')+('X'.repeat(11000)+'🌟1'));
+    assert.equal(result.coverage!.delivery_complete,true);assert.equal(result.coverage!.delivered_refs.length,2);
+    assert.equal((f.db.prepare('SELECT data FROM context_receipts WHERE id=?').get(result.read_receipt_id) as {data:string}).data,metadata.data);
+    assert.equal(JSON.stringify(f.db.prepare('SELECT page,data FROM context_receipt_pages WHERE receipt_id=? ORDER BY page').all(result.read_receipt_id)),immutable);
+    assert.equal(f.update(result,empty(),{processed_refs:result.coverage!.fetched_refs}).coverage!.continuous,true);
+    assert.equal((f.db.prepare('SELECT processed FROM context_receipt_progress WHERE receipt_id=?').get(result.read_receipt_id) as {processed:number}).processed,1);
+    f.service.forget({operation_id:randomUUID(),thread_id:f.thread,expected_epoch:0,expected_revision:1});
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM context_receipt_pages').get() as {n:number}).n,0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM context_receipt_progress').get() as {n:number}).n,0);
+  }finally{await f.cleanup();}
+});
+
+test('explicit context migration preserves old cursor, partial delivery, fixed identity and processed state',async()=>{
+  let f:ReturnType<typeof fixture>;f=fixture(async input=>f.batch(input,'Y'.repeat(11000)),{pageChars:4096});
+  try{
+    const id=randomUUID(),first=await f.get(id);assert(first.delivery_cursor);await f.service.close();
+    f.db.transaction(()=>migrateContextStorage(f.db))();migrateContextStorage(f.db);
+    const restarted=new ContextService(f.db,f.config,{reader:f.reader,normalizedStorage:true,pageChars:4096});
+    try{
+      assert.deepEqual(await restarted.get({request_id:id,thread_id:f.thread}),first);
+      let result=first;
+      while(result.delivery_cursor)result=await restarted.get({request_id:id,thread_id:f.thread,delivery_cursor:result.delivery_cursor});
+      assert.equal(result.coverage!.delivery_complete,true);assert.equal(f.reads(),1);
+      const saved=restarted.update({operation_id:randomUUID(),thread_id:f.thread,expected_epoch:0,expected_revision:0,read_receipt_id:result.read_receipt_id,state:empty(),processed_refs:result.coverage!.fetched_refs});
+      assert.equal(saved.coverage!.continuous,true);
+    }finally{await restarted.close();}
+  }finally{await f.cleanup();}
+});
+
+test('context capacity rejects before persistence and queued cancellation never runs source',async()=>{
+  const releases:Array<()=>void>=[];let f:ReturnType<typeof fixture>;
+  f=fixture(async input=>{await new Promise<void>(resolve=>releases.push(resolve));return f.batch(input);});
+  try{
+    for(let i=0;i<18;i++)await f.get(randomUUID(),{wait_seconds:0});
+    assert.equal(f.reads(),2);assert.equal(historyReadScheduler(f.db).status.queued,16);
+    const rejected=randomUUID();await assert.rejects(f.get(rejected,{wait_seconds:0}),/history_read_capacity/);
+    assert.equal(f.db.prepare('SELECT 1 FROM context_jobs WHERE id=?').get(rejected),undefined);
+    const closing=f.service.close();releases.forEach(release=>release());await closing;
+    assert.equal(f.reads(),2);assert.equal(historyReadScheduler(f.db).status.active,0);
+    assert.equal(historyReadScheduler(f.db).status.queued,0);
+  }finally{await f.cleanup();}
+});
+
+test('full history and context share two source slots and sixteen queued admissions',async()=>{
+  let active=0,peak=0,started=0;
+  const block=async(signal:AbortSignal)=>{
+    started++;active++;peak=Math.max(peak,active);
+    try{await new Promise<void>((_,reject)=>{if(signal.aborted)reject(Error('closed'));else signal.addEventListener('abort',()=>reject(Error('closed')),{once:true});});}
+    finally{active--;}
+  };
+  const f=fixture(async input=>{await block(input.signal);return f.batch(input);});
+  const desktop=new DesktopConversationsService(f.db,f.config,{transport:{runRead:async input=>{await block(input.signal);return {status:'completed',context_json:'{}',source_complete:false};},runSend:async()=>assert.fail('read admission must never send')}});
+  try{
+    await f.get(randomUUID(),{wait_seconds:0});
+    desktop.read({request_id:randomUUID(),thread_id:f.thread});
+    for(let i=0;i<16;i++) {
+      if(i%2===0)await f.get(randomUUID(),{wait_seconds:0});
+      else desktop.read({request_id:randomUUID(),thread_id:f.thread});
+    }
+    await new Promise(resolve=>setImmediate(resolve));
+    assert.equal(started,2);assert.equal(peak,2);assert.deepEqual(historyReadScheduler(f.db).status,{active:2,queued:16,capacity:18});
+    const contextRejected=randomUUID(),desktopRejected=randomUUID();
+    await assert.rejects(f.get(contextRejected,{wait_seconds:0}),/history_read_capacity/);
+    assert.throws(()=>desktop.read({request_id:desktopRejected,thread_id:f.thread}),/history_read_capacity/);
+    assert.equal(f.db.prepare('SELECT 1 FROM context_jobs WHERE id=?').get(contextRejected),undefined);
+    assert.equal(f.db.prepare('SELECT 1 FROM desktop_conversation_requests WHERE request_id=?').get(desktopRejected),undefined);
+    await Promise.all([f.service.close(),desktop.close()]);
+    assert.equal(started,2);assert.equal(active,0);assert.deepEqual(historyReadScheduler(f.db).status,{active:0,queued:0,capacity:18});
+  }finally{await desktop.close();await f.cleanup();}
+});

@@ -112,7 +112,7 @@ test('wrong credentials and unknown parameters cannot call context methods; queu
       arguments: {task_id: task.task_id, claim_key: 'synthetic-claim'}})).body);
     assert.equal(claimed.status, 'running');
     const got = unpack((await f.rpc('tools/call', {name: 'get_task', arguments: {task_id: task.task_id}})).body);
-    assert.equal(got.worker_rules.rules_version, 'v7');
+    assert.equal(got.worker_rules.rules_version, 'v8');
     assert.ok(got.worker_rules.instructions.includes('codex_get_context'));
     assert.equal(called, 0);
   });

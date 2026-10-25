@@ -198,7 +198,7 @@ test('outbox and task transaction rollback together, delivery retry CAS and pend
     assert.equal((f.store.db.prepare('SELECT attempts,status FROM task_deliveries WHERE id=?').get(first.id) as {attempts:number;status:string}).status,'pending');
     f.advance(2001);const retry=f.store.pending()[0]!;assert.equal(retry.attempts,1);f.store.deliveryResult(retry,200);assert.equal(f.store.pending().length,0);
     const kinds=(f.store.evidence() as {kind:string}[]).map(x=>x.kind);assert.ok(kinds.includes('event_receipt'));assert.ok(!kinds.includes('claimed'));assert.equal(f.store.get(a.task_id).result_read_at,undefined);
-    submit(f.store,'stop');f.store.unsubscribe('s',0);assert.ok(f.store.pending().length>0);f.store.unsubscribe('s',1);assert.equal(f.store.pending().length,0);
+    f.store.cancel({task_id:a.task_id,request_key:'release-head'});submit(f.store,'stop');f.store.unsubscribe('s',0);assert.ok(f.store.pending().length>0);f.store.unsubscribe('s',1);assert.equal(f.store.pending().length,0);
   } finally {f.close();}
 });
 

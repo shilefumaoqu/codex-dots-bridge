@@ -6,6 +6,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -64,7 +65,8 @@ namespace CodexDotsBridge.Tray
     {
         public string InstalledVersion, ServiceVersion, State = "unknown", Tone = "amber", Title = "正在检查", Reason = "正在读取当前连接状态。";
         public string Service = "未检查", Cloud = "未检查", Dot = "未检查", Control = "disabled", Autostart = "unknown", Error;
-        public DateTimeOffset? CheckedAt;
+        public DateTimeOffset? CheckedAt, LastBusinessAt, AutostartCheckedAt;
+        public string WaitingReason;
         public int? Inflight;
         public Dictionary<string, int> Counts = new Dictionary<string, int>();
         static readonly string[] CountKeys = { "queued", "running", "waiting_input", "cancel_requested", "reconciliation_required", "completed", "failed", "cancelled", "expired" };
@@ -105,6 +107,29 @@ namespace CodexDotsBridge.Tray
             if (!DateTimeOffset.TryParse(at, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed)) throw new FormatException("invalid_checked_at");
             if (Math.Abs((DateTimeOffset.UtcNow - parsed).TotalSeconds) > 45) throw new FormatException("stale_projection");
             s.CheckedAt = parsed;
+            if (d.TryGetValue("autostart_checked_at", out value) && value != null)
+            {
+                if (!(value is string) || !DateTimeOffset.TryParse((string)value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed)) throw new FormatException("invalid_autostart_time");
+                s.AutostartCheckedAt = parsed;
+                if (Math.Abs((DateTimeOffset.UtcNow - parsed).TotalSeconds) > 45) s.Autostart = "unknown";
+            }
+            if (d.TryGetValue("last_business_at", out value) && value != null)
+            {
+                if (!(value is string) || !DateTimeOffset.TryParse((string)value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed) || parsed > DateTimeOffset.UtcNow.AddSeconds(5)) throw new FormatException("invalid_business_time");
+                s.LastBusinessAt = parsed;
+            }
+            if (d.TryGetValue("waiting_reason", out value) && value != null)
+            {
+                switch (value as string)
+                {
+                    case "execution_slot_occupied": s.WaitingReason = "执行槽占用，任务排队中"; break;
+                    case "awaiting_delivery": s.WaitingReason = "正在等待事件投递"; break;
+                    case "awaiting_pickup": s.WaitingReason = "事件已接收，正在等待 Dot 领取"; break;
+                    case "pickup_delayed": s.WaitingReason = "Dot 领取延迟"; break;
+                    case "pickup_stalled": s.WaitingReason = "Dot 尚未领取，请检查连接或路由"; break;
+                    default: throw new FormatException("invalid_waiting_reason");
+                }
+            }
             if (!d.TryGetValue("error", out value)) throw new FormatException("invalid_projection");
             if (value != null) { string code = value as string; if (code == null || !Regex.IsMatch(code, @"\A[a-zA-Z0-9_:-]{1,100}\z")) throw new FormatException("invalid_error"); s.Error = code; }
             if (!d.TryGetValue("task_counts", out value)) throw new FormatException("invalid_projection");
@@ -116,6 +141,13 @@ namespace CodexDotsBridge.Tray
             return s;
         }
         public Snapshot ForPreview() { CheckedAt = DateTimeOffset.UtcNow; return this; }
+        public string DisplayReason()
+        {
+            string text = Reason;
+            if (WaitingReason != null) text += "\n" + WaitingReason;
+            if (LastBusinessAt.HasValue) text += "\n最近业务事件 " + LastBusinessAt.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") + "（不代表当前任务完成）";
+            return text;
+        }
         public static Snapshot Unknown(Snapshot last, string error)
         {
             Snapshot s = new Snapshot(); s.Title = "状态未知"; s.Reason = error == "status_timeout" ? "检查超时，请刷新后重试。" : "未取得可靠状态，请刷新后重试。"; s.Error = error;
@@ -135,14 +167,240 @@ namespace CodexDotsBridge.Tray
             b.AppendLine("托盘版本: " + (trayVersion ?? "未取得")); b.AppendLine("安装版本: " + (InstalledVersion ?? "未取得")); b.AppendLine("后台版本: " + (ServiceVersion ?? "未取得"));
             b.AppendLine("状态: " + (effectiveTitle ?? Title)); b.AppendLine("本机服务: " + Service); b.AppendLine("云端连接: " + Cloud); b.AppendLine("Dot 订阅: " + Dot);
             b.AppendLine("登录自启: " + Autostart); b.AppendLine("检查时间: " + (CheckedAt.HasValue ? CheckedAt.Value.ToString("o") : "未取得"));
+            b.AppendLine("自启检查时间: " + (AutostartCheckedAt.HasValue ? AutostartCheckedAt.Value.ToString("o") : "未取得"));
             b.AppendLine("错误码: " + (Error ?? "无")); b.AppendLine("在途任务数: " + (Inflight.HasValue ? Inflight.Value.ToString(CultureInfo.InvariantCulture) : "未取得"));
             b.AppendLine("状态说明: " + Reason);
+            if (WaitingReason != null) b.AppendLine("任务等待: " + WaitingReason);
+            b.AppendLine("最近业务事件: " + (LastBusinessAt.HasValue ? LastBusinessAt.Value.ToString("o") : "未取得"));
             foreach (string key in CountKeys) if (Counts.ContainsKey(key)) b.AppendLine("任务 " + key + ": " + Counts[key].ToString(CultureInfo.InvariantCulture));
             b.Append("连接状态不证明任务或消息已成功。" ); return b.ToString();
         }
     }
 
     internal sealed class CommandResult { public string Output, Error; public bool TimedOut; public int ExitCode; }
+    // Polling has no CLI or child-process path. Lifecycle commands continue to use
+    // Cli below. The endpoint, credential, instance and observation are all bound
+    // to the same local installation before a response can reach the UI.
+    internal sealed class StatusClient
+    {
+        const int Limit = 131072, Timeout = 3000;
+        readonly string root, dataDir;
+        sealed class Local
+        {
+            public Dictionary<string, object> Config, Hint, Lock, ServiceLock;
+            public string ConfigText, HintText, LockText, ServiceText, Instance, Endpoint;
+        }
+        public StatusClient(string root, string dataDir) { this.root = Options.NormalizePath(root); this.dataDir = Options.NormalizePath(dataDir); }
+        static string Text(Dictionary<string, object> value, string key) { object item; return value != null && value.TryGetValue(key, out item) ? item as string : null; }
+        static Dictionary<string, object> Object(Dictionary<string, object> value, string key) { object item; return value != null && value.TryGetValue(key, out item) ? item as Dictionary<string, object> : null; }
+        static bool True(Dictionary<string, object> value, string key) { object item; return value != null && value.TryGetValue(key, out item) && item is bool && (bool)item; }
+        static int Pid(Dictionary<string, object> value, string key)
+        {
+            object item; if (value == null || !value.TryGetValue(key, out item) || (!(item is int) && !(item is long))) return 0;
+            long n = Convert.ToInt64(item, CultureInfo.InvariantCulture); return n > 0 && n <= Int32.MaxValue ? (int)n : 0;
+        }
+        static bool SamePath(string left, string right) { return left != null && right != null && String.Equals(Options.NormalizePath(left), Options.NormalizePath(right), StringComparison.OrdinalIgnoreCase); }
+        static void Safe(string path)
+        {
+            for (string current = Path.GetFullPath(path); !String.IsNullOrEmpty(current); current = Path.GetDirectoryName(current))
+            {
+                try { if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new FormatException("unsafe_local_state"); }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+            }
+        }
+        static byte[] Bounded(Stream stream)
+        {
+            using (MemoryStream output = new MemoryStream())
+            {
+                byte[] buffer = new byte[4096]; int count;
+                while ((count = stream.Read(buffer, 0, Math.Min(buffer.Length, Limit + 1 - (int)output.Length))) > 0)
+                { output.Write(buffer, 0, count); if (output.Length > Limit) throw new FormatException("projection_too_large"); }
+                return output.ToArray();
+            }
+        }
+        static byte[] FileBytes(string path)
+        {
+            Safe(path);
+            try { using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) return Bounded(stream); }
+            catch (FileNotFoundException) { return null; }
+            catch (DirectoryNotFoundException) { return null; }
+        }
+        static string FileText(string path) { byte[] bytes = FileBytes(path); return bytes == null ? null : new UTF8Encoding(false, true).GetString(bytes).TrimStart('\uFEFF'); }
+        static Dictionary<string, object> Json(string text)
+        {
+            if (text == null) return null;
+            JavaScriptSerializer serializer = new JavaScriptSerializer(); serializer.MaxJsonLength = Limit;
+            Dictionary<string, object> value = serializer.Deserialize<Dictionary<string, object>>(text);
+            if (value == null) throw new FormatException("invalid_local_state"); return value;
+        }
+        static Uri Endpoint(string text)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(text, UriKind.Absolute, out uri) || uri.Scheme != "http" || uri.Host != "127.0.0.1" || uri.Port < 1 || uri.IsDefaultPort ||
+                uri.AbsolutePath != "/" || uri.Query.Length != 0 || uri.Fragment.Length != 0 || uri.UserInfo.Length != 0 ||
+                !Regex.IsMatch(text, @"\Ahttp://127\.0\.0\.1:[0-9]+/\z")) throw new FormatException("invalid_local_endpoint");
+            return new Uri(uri, "control/tray_status");
+        }
+        Local ReadLocal()
+        {
+            Local state = new Local(); state.ConfigText = FileText(Path.Combine(dataDir, "config.json")); state.Config = Json(state.ConfigText);
+            Guid instance; string id = Text(state.Config, "instance_id");
+            if (Text(state.Config, "owner") != "codex-dots-bridge" || !Guid.TryParseExact(id, "D", out instance) ||
+                (Pid(state.Config, "schema_version") != 1 && Pid(state.Config, "schema_version") != 2)) throw new FormatException("invalid_local_config");
+            state.Instance = instance.ToString("D"); state.Endpoint = Text(state.Config, "endpoint"); if (state.Endpoint != null) Endpoint(state.Endpoint);
+            Dictionary<string, object> installation = Object(state.Config, "installation");
+            if (installation != null && !SamePath(Text(installation, "root"), root)) throw new FormatException("installation_binding_mismatch");
+            state.HintText = FileText(Path.Combine(dataDir, "supervisor-state.json")); state.Hint = Json(state.HintText);
+            state.LockText = FileText(Path.Combine(dataDir, "supervisor.lock")); state.Lock = Json(state.LockText);
+            state.ServiceText = FileText(Path.Combine(dataDir, "service.lock")); state.ServiceLock = Json(state.ServiceText);
+            if (state.Hint != null && (String.IsNullOrEmpty(Text(state.Hint, "owner")) || Pid(state.Hint, "pid") == 0)) throw new FormatException("invalid_local_state");
+            if (state.Lock != null && (state.Hint == null || Text(state.Lock, "owner") != Text(state.Hint, "owner") || Pid(state.Lock, "pid") != Pid(state.Hint, "pid"))) throw new FormatException("supervisor_ownership_mismatch");
+            if (state.ServiceLock != null && (String.IsNullOrEmpty(Text(state.ServiceLock, "owner")) || Pid(state.ServiceLock, "pid") == 0)) throw new FormatException("service_identity_unverified");
+            return state;
+        }
+        static int Presence(int pid)
+        {
+            if (pid < 1) return -1;
+            try { using (Process process = Process.GetProcessById(pid)) return process.HasExited ? 0 : 1; }
+            catch (ArgumentException) { return 0; }
+            catch { return -1; }
+        }
+        static bool AllGone(Local state)
+        {
+            if (state.Lock == null || Text(state.Hint, "phase") != "running" || True(state.Hint, "cleanup_complete") || Pid(state.Hint, "bridge_pid") == 0) return false;
+            if (state.ServiceLock != null && (Pid(state.ServiceLock, "pid") != Pid(state.Hint, "bridge_pid") || Text(state.ServiceLock, "owner") == Text(state.Hint, "owner"))) return false;
+            foreach (string key in new string[] { "pid", "bridge_pid", "guardian_pid", "tunnel_pid" })
+                if (state.Hint.ContainsKey(key) && Presence(Pid(state.Hint, key)) != 0) return false;
+            return true;
+        }
+        bool LauncherOwned(string launcher)
+        {
+            string payload = Path.GetDirectoryName(root), install = Path.GetDirectoryName(payload);
+            if (Path.GetFileName(payload) != "payload" || !SamePath(launcher, Path.Combine(install, "CodexDotsBridge.Launcher.exe"))) return false;
+            Safe(launcher); if (!File.Exists(launcher) || new FileInfo(launcher).Length > 32 * 1024 * 1024) return false;
+            Dictionary<string, object> state = Json(FileText(Path.Combine(install, "installation-state.json")));
+            if (Text(state, "owner") != "codex-dots-bridge-setup" || Pid(state, "schema") != 1 || !SamePath(Text(state, "install_directory"), install) || !SamePath(Text(state, "payload_root"), root) || !SamePath(Text(state, "data_dir"), dataDir)) return false;
+            using (SHA256 hash = SHA256.Create())
+            using (FileStream stream = File.OpenRead(launcher))
+                return Text(state, "launcher_sha256") == BitConverter.ToString(hash.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+        }
+        string Autostart(Local state)
+        {
+            try
+            {
+                Dictionary<string, object> manifest = Json(FileText(Path.Combine(dataDir, "installation.json")));
+                if (Text(manifest, "owner") != "codex-dots-bridge" || Text(manifest, "instance_id") != state.Instance) return "unknown";
+                Dictionary<string, object> mcp = Object(manifest, "mcp"); object argsValue;
+                if (mcp == null || Text(mcp, "name") != "codex-dots-bridge" || !mcp.TryGetValue("args", out argsValue)) return "unknown";
+                System.Collections.IList args = argsValue as System.Collections.IList; if (args == null || args.Count != 4 || (string)args[1] != "stdio" || (string)args[2] != "--data-dir" || !SamePath(args[3] as string, dataDir) || !SamePath(args[0] as string, Path.Combine(root, "dist", "main.js"))) return "unknown";
+                Dictionary<string, object> entry = Object(manifest, "autostart");
+                string launcher = Text(manifest, "autostart_launcher"), kind = Text(entry, "kind");
+                if (launcher != null && !LauncherOwned(launcher)) return "unknown";
+                bool link = launcher != null && (entry == null || kind == "startup-link");
+                string name = link ? "CodexDotsBridge.lnk" : "CodexDotsBridge.vbs";
+                string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), name);
+                byte[] bytes = FileBytes(path); if (bytes == null) return "disabled";
+                if (entry == null || !SamePath(Text(entry, "path"), path) || Text(entry, "content") != (link ? Convert.ToBase64String(bytes) : new UTF8Encoding(false, true).GetString(bytes))) return "unknown";
+                if (link && !SamePath(Text(entry, "launcher"), launcher)) return "unknown";
+                if (launcher == null) return "enabled";
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder", false))
+                {
+                    object value = key == null ? null : key.GetValue(name); if (value == null) return "enabled";
+                    byte[] approval = value as byte[]; if (approval == null || approval.Length < 12) return "unknown";
+                    return approval[0] == 2 || approval[0] == 6 ? "enabled" : approval[0] == 3 || approval[0] == 7 ? "disabled" : "unknown";
+                }
+            }
+            catch { return "unknown"; }
+        }
+        CommandResult Offline(Local local, string error, bool processGone)
+        {
+            string state = "unknown", tone = "amber", title = "状态未知", reason = "暂时无法核验当前服务状态", control = "disabled", service = "待确认";
+            if (True(local.Hint, "cleanup_complete") && local.Lock == null && local.ServiceLock == null)
+            {
+                bool failed = Text(local.Hint, "error") != null || Text(local.Hint, "phase") == "failed";
+                state = failed ? "failed" : "stopped"; tone = failed ? "red" : "gray"; title = failed ? "后台故障" : "后台已停止";
+                reason = failed ? "后台报告故障，需要检查" : "后台已停止，可随时启动"; control = "start"; service = "已停止"; error = failed ? "supervisor_failed" : null;
+                if (Text(local.Hint, "error") == "bridge_start_failed" || Text(local.Hint, "error") == "supervisor_spawn_failed") { title = "启动失败"; reason = "后台启动未成功，请检查连接设置"; }
+            }
+            else if (local.Hint == null && local.Lock == null && local.ServiceLock == null && local.Endpoint == null)
+            {
+                bool setup = Object(local.Config, "tunnel") == null; state = setup ? "setup" : "stopped"; tone = setup ? "amber" : "gray";
+                title = setup ? "等待连接设置" : "后台已停止"; reason = setup ? "请完成连接配置" : "后台已停止，可随时启动"; control = "start"; service = "已停止"; error = null;
+            }
+            else if (processGone && AllGone(local))
+            {
+                state = "failed"; tone = "red"; title = "后台连接中断"; reason = "记录的后台进程均已退出，可启动恢复；启动时会重新核验安全条件";
+                control = "start"; service = "连接已中断"; error = "background_connection_lost";
+            }
+            else if (local.Lock != null && Text(local.Hint, "phase") == "starting") { state = "starting"; title = "正在启动"; reason = "服务正在启动，请稍候"; service = "正在启动"; }
+            else if (local.Lock != null && Text(local.Hint, "phase") == "stopping")
+            {
+                string stopPath = Path.Combine(dataDir, "supervisor.stop");
+                Dictionary<string, object> stop = Json(FileText(stopPath));
+                bool old = stop != null && (DateTime.UtcNow - File.GetLastWriteTimeUtc(stopPath)).TotalSeconds > 35;
+                state = old ? "stop_unconfirmed" : "stopping"; title = old ? "停止尚未确认" : "正在停止";
+                reason = old ? "停止请求已发出，清理结果尚未确认" : "正在等待服务完成清理"; service = "正在停止";
+            }
+            else if (local.Lock != null && Text(local.Hint, "phase") == "failed")
+            {
+                state = "failed"; tone = "red"; title = "后台故障"; reason = "后台报告故障，需要检查"; service = "后台故障";
+                if (Text(local.Hint, "error") == "bridge_start_failed" || Text(local.Hint, "error") == "supervisor_spawn_failed") { title = "启动失败"; reason = "后台启动未成功，请检查连接设置"; }
+            }
+            string now = DateTimeOffset.UtcNow.ToString("o");
+            return new CommandResult { Output = new JavaScriptSerializer().Serialize(new { schema = 1, instance_id = local.Instance, installed_version = Program.Version,
+                service_version = (string)null, state = state, tone = tone, title = title, reason = reason, control = control, service = service, cloud = "未检查", dot = "未检查",
+                autostart = Autostart(local), autostart_checked_at = now, checked_at = now, task_counts = new Dictionary<string, int>(), inflight_count = (int?)null, error = error }) };
+        }
+        public Task<CommandResult> Read()
+        {
+            return Task.Run(delegate
+            {
+                try
+                {
+                    Local local = ReadLocal(); int presence = local.ServiceLock == null ? 0 : Presence(Pid(local.ServiceLock, "pid"));
+                    if (local.Endpoint == null || presence != 1) return Offline(local, presence < 0 ? "service_identity_unverified" : "service_not_running", presence == 0);
+                    string token = FileText(Path.Combine(dataDir, "caller.key")); token = token == null ? null : token.Trim();
+                    if (token == null || !Regex.IsMatch(token, @"\A[a-f0-9]{64}\z")) return new CommandResult { Error = "invalid_local_credential", ExitCode = -1 };
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(Endpoint(local.Endpoint));
+                    request.Proxy = null; request.AllowAutoRedirect = false; request.Method = "POST"; request.ContentType = "application/json";
+                    request.Headers[HttpRequestHeader.Authorization] = "Bearer " + token; request.Timeout = Timeout; request.ReadWriteTimeout = Timeout;
+                    request.ContentLength = 2; request.ServicePoint.Expect100Continue = false;
+                    // Abort is an overall deadline, including a server that drips body bytes.
+                    using (System.Threading.Timer deadline = new System.Threading.Timer(delegate { request.Abort(); }, null, Timeout, System.Threading.Timeout.Infinite))
+                    {
+                        try
+                        {
+                            using (Stream body = request.GetRequestStream()) body.Write(new byte[] { 123, 125 }, 0, 2);
+                            string json;
+                            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                            {
+                                if (response.StatusCode != HttpStatusCode.OK || response.ContentLength > Limit) return new CommandResult { Error = "invalid_projection", ExitCode = -1 };
+                                using (Stream stream = response.GetResponseStream()) json = new UTF8Encoding(false, true).GetString(Bounded(stream));
+                            }
+                            Dictionary<string, object> projection = Json(json); Guid instance;
+                            if (!Guid.TryParseExact(Text(projection, "instance_id"), "D", out instance) || instance.ToString("D") != local.Instance) return new CommandResult { Error = "service_identity_unverified", ExitCode = -1 };
+                            Snapshot snapshot = Snapshot.Parse(json); // Includes the observation-time check.
+                            if (snapshot.InstalledVersion == null) return new CommandResult { Error = "service_version_unavailable", ExitCode = -1 };
+                            Local current = ReadLocal();
+                            if (current.ConfigText != local.ConfigText || current.LockText != local.LockText || current.ServiceText != local.ServiceText ||
+                                Text(current.Hint, "owner") != Text(local.Hint, "owner") || Pid(current.Hint, "pid") != Pid(local.Hint, "pid")) return new CommandResult { Error = "local_identity_changed", ExitCode = -1 };
+                            return new CommandResult { Output = json };
+                        }
+                        catch (WebException error)
+                        {
+                            if (error.Response != null) error.Response.Dispose();
+                            bool timeout = error.Status == WebExceptionStatus.Timeout || error.Status == WebExceptionStatus.RequestCanceled;
+                            // Re-read hints so a completed stop can safely expose Start. Never
+                            // convert reachability alone (or a live PID) to readiness.
+                            return Offline(ReadLocal(), timeout ? "status_timeout" : "local_service_unreachable", false);
+                        }
+                    }
+                }
+                catch { return new CommandResult { Error = "invalid_local_projection", ExitCode = -1 }; }
+            });
+        }
+    }
     internal sealed class Cli
     {
         public readonly string Root, DataDir;
@@ -281,6 +539,7 @@ namespace CodexDotsBridge.Tray
     {
         public event EventHandler Exiting;
         readonly Options options; readonly Cli cli; readonly EventWaitHandle showEvent, exitEvent;
+        Func<Task<CommandResult>> statusReader;
         RegisteredWaitHandle showWait, exitWait;
         readonly System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer();
         readonly NotifyIcon tray = new NotifyIcon(); readonly ContextMenuStrip menu = new ContextMenuStrip();
@@ -309,6 +568,7 @@ namespace CodexDotsBridge.Tray
         public BridgeForm(Options o, EventWaitHandle show, EventWaitHandle exit)
         {
             options = o; showEvent = show; exitEvent = exit; cli = new Cli(AppDomain.CurrentDomain.BaseDirectory, o.DataDir);
+            statusReader = new StatusClient(cli.Root, o.DataDir).Read;
             Text = "Codex Dots Bridge"; Name = "CodexDotsBridgeStatus"; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None; MaximizeBox = false; MinimizeBox = false; AutoScaleMode = AutoScaleMode.None;
             AutoSize = false; Font = new Font("Microsoft YaHei UI", 10F); ClientSize = new Size(420, 480); MinimumSize = new Size(420, 0);
@@ -496,7 +756,7 @@ namespace CodexDotsBridge.Tray
                 do
                 {
                     int checkGeneration = generation; lastCheck = DateTime.UtcNow;
-                    CommandResult result = await cli.Run("status --tray", 5500, true);
+                    CommandResult result = await statusReader();
                     if (shuttingDown) return;
                     if (generation != checkGeneration) queuedRefresh = true;
                     else
@@ -573,11 +833,11 @@ namespace CodexDotsBridge.Tray
         void Render()
         {
             string title = EffectiveTitle, tone = EffectiveTone;
-            bool layoutChanged = layoutDirty || heading.Text != title || reason.Text != (actionNote ?? state.Reason) || service.Text != state.Service || cloud.Text != state.Cloud || dot.Text != state.Dot;
+            bool layoutChanged = layoutDirty || heading.Text != title || reason.Text != (actionNote ?? state.DisplayReason()) || service.Text != state.Service || cloud.Text != state.Cloud || dot.Text != state.Dot;
             heading.Text = title; heading.ForeColor = ForeColor;
             Color statusColor = ToneColor(tone);
             if (statusBadge.Tone != tone || statusBadge.StatusColor != statusColor) { statusBadge.Tone = tone; statusBadge.StatusColor = statusColor; statusBadge.Invalidate(); }
-            reason.Text = actionNote ?? state.Reason; reason.Visible = reason.Text.Length > 0;
+            reason.Text = actionNote ?? state.DisplayReason(); reason.Visible = reason.Text.Length > 0;
             service.Text = state.Service; cloud.Text = state.Cloud; dot.Text = state.Dot;
             string button = state.Control == "start" ? "启动后台" : "停止后台";
             if (pendingControl == "start") button = "正在启动"; else if (pendingControl == "stop") button = "正在停止";
