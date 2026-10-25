@@ -55,7 +55,16 @@ internal static class RefreshHarness
     static void Set(string name, object value) { formType.GetField(name, BindingFlags.NonPublic | BindingFlags.Instance).SetValue(form, value); }
     static object Call(string name, params object[] args) { return formType.GetMethod(name, BindingFlags.NonPublic | BindingFlags.Instance).Invoke(form, args); }
     static void Assert(bool condition, string note) { assertions++; if (!condition) throw new Exception(note); }
-    static string[] Calls() { string p = Path.Combine(data, "calls.log"); return File.Exists(p) ? File.ReadAllLines(p) : new string[0]; }
+    static string[] Calls()
+    {
+        string p = Path.Combine(data, "calls.log"); if (!File.Exists(p)) return new string[0];
+        var lines = new List<string>();
+        // The child appends while the harness polls. ReadAllLines denies a
+        // concurrent writer on Windows and can make that child exit before logging.
+        using (var reader = new StreamReader(new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)))
+        { string line; while ((line = reader.ReadLine()) != null) lines.Add(line); }
+        return lines.ToArray();
+    }
     static int Count(string command) { int n = 0; foreach (string s in Calls()) if (s == command) n++; return n; }
     static string State(string field) { object s = Get("state"); return (string)snapshotType.GetField(field).GetValue(s); }
     static void PumpUntil(Func<bool> condition, int timeout = 12000)
@@ -153,7 +162,13 @@ internal static class RefreshHarness
             }
             checks.Add("initial 100/125/150/200 percent and runtime DPI/theme changes immediately fit preferred height, buttons and footer without text changes"); Close();
 
-            Create("steady", Config()); int[] changed = Changes();
+            Create("steady", Config());
+            // Hold the same writer sharing mode as AppendAllText. Polling must
+            // remain readable while an append owns the file, without retries.
+            using (var writer = new FileStream(Path.Combine(data, "calls.log"), FileMode.Open, FileAccess.Write, FileShare.Read))
+                Assert(Count("status") == 0, "log_poll_conflicts_with_writer");
+            checks.Add("log polling permits overlapping fixture writes");
+            int[] changed = Changes();
             for (int cycle = 0; cycle < 3; cycle++)
             {
                 Task read = Refresh(); Assert(((Button)Get("control")).Enabled && ((Button)Get("refresh")).Enabled && ((ToolStripMenuItem)Get("autoItem")).Enabled, "poll_disabled_buttons");
