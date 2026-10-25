@@ -883,10 +883,12 @@ function Rollback-Transaction($Transaction) {
     if($Transaction.stable_startup){Set-TransactionProperty $Transaction 'rollback_errors' @($errors);Write-Json $transactionPath $Transaction}
     throw $errors[0]
   }
-  $activationPath=Join-Path $InstallDirectory '.setup-activation.json'
-  if($Transaction.storage_migration_id -and (Test-Path -LiteralPath $activationPath)) {
-    $activation=Read-Json $activationPath
-    if($activation.owner -ceq 'codex-dots-bridge-storage-activation' -and $activation.migration_id -ceq $Transaction.storage_migration_id -and (Read-Json (Join-Path $Transaction.data_dir 'config.json')).schema_version -eq 1) { Remove-Item -LiteralPath $activationPath }
+  if($Transaction.storage_migration_id) {
+    $activationPath=Join-Path $InstallDirectory '.setup-activation.json'
+    if(Test-Path -LiteralPath $activationPath) {
+      $activation=Read-Json $activationPath
+      if($activation.owner -ceq 'codex-dots-bridge-storage-activation' -and $activation.migration_id -ceq $Transaction.storage_migration_id -and (Read-Json (Join-Path $Transaction.data_dir 'config.json')).schema_version -eq 1) { Remove-Item -LiteralPath $activationPath }
+    }
   }
   Remove-Item -LiteralPath $transactionPath -ErrorAction SilentlyContinue
 }
