@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, toNamespacedPath } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { ContextService, migrateContextStorage } from '../src/context-service.js';
 import { historyReadScheduler } from '../src/read-scheduler.js';
@@ -101,6 +101,28 @@ test('source identity changes remove trusted basis refs',async()=>{
   let changed=false;let f:ReturnType<typeof fixture>;f=fixture(async input=>{const batch=f.batch(input);if(changed){batch.sourceIdentity.identityHash=digest('new_source');batch.invalidated=true;}return batch;});try{
     const first=await f.get();f.update(first,empty(),{processed_refs:first.coverage!.fetched_refs});changed=true;const next=await f.get();assert.equal(next.basis_valid,false);assert.equal(next.status,'ready');assert.equal(next.state,null);assert.equal(f.update(next,empty(),{processed_refs:next.coverage!.fetched_refs}).coverage!.continuous,true);
   }finally{await f.cleanup();}
+});
+test('Windows App Server extended drive paths keep context identity and receipt binding', {skip:process.platform!=='win32'},async()=>{
+  let f:ReturnType<typeof fixture>;f=fixture(async input=>{
+    const batch=f.batch(input);batch.sourceIdentity.rolloutPath=toNamespacedPath(batch.sourceIdentity.rolloutPath!);return batch;
+  });
+  try {
+    const request=randomUUID(),result=await f.get(request);assert.equal(result.status,'ready');assert(result.read_receipt_id);
+    const receipt=JSON.parse((f.db.prepare('SELECT data FROM context_receipts WHERE id=?').get(result.read_receipt_id) as {data:string}).data);
+    // Normalize only for containment checks; historical identity bytes and fixed receipts remain unchanged.
+    assert.equal(receipt.identity.rolloutPath,toNamespacedPath(join(f.home,'sessions',`rollout-${f.thread}.jsonl`)));
+    const updated=f.update(result,empty(),{processed_refs:result.coverage!.fetched_refs});assert.equal(updated.revision,1);
+    assert.deepEqual(await f.get(request),result);assert.equal(f.reads(),1);
+  } finally {await f.cleanup();}
+});
+test('context source paths reject malformed namespaces and paths outside the authorized home',async()=>{
+  for(const invalid of [(home:string)=>join(home,'sessions','bad\0.jsonl'),(home:string)=>join(home,'outside.jsonl'),
+    (home:string)=>join(home,'sessions-extra','a.jsonl'),()=>String.raw`\\?\UNC\host\share\a.jsonl`,
+    ()=>String.raw`\\.\pipe\codex-ipc`,()=>String.raw`\\?\GLOBALROOT\Device\a.jsonl`,()=>String.raw`C:\home\sessions\a.jsonl:private`]) {
+    let f:ReturnType<typeof fixture>;f=fixture(async input=>{const batch=f.batch(input);batch.sourceIdentity.rolloutPath=invalid(f.home);return batch;});
+    try {const result=await f.get();assert.equal(result.status,'failed');assert.equal(result.reason,'source_identity_invalid');assert.equal(result.read_receipt_id,undefined);}
+    finally {await f.cleanup();}
+  }
 });
 test('timeout yields explicit partial and no arbitrary error content',async()=>{
   const f=fixture(()=>new Promise(()=>{}),{timeoutMs:10});try{const result=await f.get();assert.equal(result.status,'partial');assert.equal(result.reason,'read_timeout');}finally{await f.cleanup();}

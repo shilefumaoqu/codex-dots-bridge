@@ -9,6 +9,7 @@ import { ContextError, contextGetSchema, contextUpdateSchema, contextForgetSchem
 export { ContextError as ContextServiceError } from './context-contract.js';
 import { readContextBatch, type ContextReadInput, type ContextReadBatch, type ContextWatermark, type ContextReadContinuation } from './context-reader.js';
 import { historyReadScheduler, type ReadReservation } from './read-scheduler.js';
+import { normalizeConversationPath } from './desktop-conversation-path.js';
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 function canonical(value: unknown): string {
@@ -240,7 +241,12 @@ export class ContextService {
     // The adapter's stable item hashes bind every external reference to the observed content version.
     const identity=batch.sourceIdentity;
     if (!identity || identity.threadId!==job.request.thread_id || resolve(identity.codexHome)!==this.home || !/^[a-f0-9]{64}$/.test(identity.identityHash)) fail('source_identity_invalid');
-    const pathname=identity.rolloutPath;
+    let pathname:string|undefined;
+    if(identity.rolloutPath!==undefined) {
+      // App Server can return \\?\C:\ paths for the same local drive. Keep the
+      // original source identity, but compare canonical local paths for confinement.
+      try {pathname=normalizeConversationPath(identity.rolloutPath);} catch {fail('source_identity_invalid');}
+    }
     if (pathname!==undefined && (typeof pathname!=='string' || !['sessions','archived_sessions'].some(folder=>{
       const rel=relative(resolve(this.home!,folder),resolve(pathname));return !!rel&&!isAbsolute(rel)&&rel!=='..'&&!rel.startsWith('..'+sep);
     }))) fail('source_identity_invalid');
