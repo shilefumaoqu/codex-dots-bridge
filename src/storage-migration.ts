@@ -94,8 +94,17 @@ function databaseDigest(db:Database.Database) {
   for(const entry of entries) {
     hash.update(JSON.stringify(entry)+'\n');
     const order=/WITHOUT\s+ROWID/i.test(entry.sql)?(db.pragma(`table_info(${quote(entry.name)})`) as {name:string}[]).map(row=>quote(row.name)).join(','):'rowid';
-    for(const row of db.prepare(`SELECT * FROM ${quote(entry.name)} ORDER BY ${order}`).safeIntegers().iterate())
-      hash.update(JSON.stringify(row,(_key,value)=>typeof value==='bigint'?{$integer:value.toString()}:value)+'\n');
+    for(const row of db.prepare(`SELECT * FROM ${quote(entry.name)} ORDER BY ${order}`).safeIntegers().iterate()) {
+      // SQLite rows contain only scalar values and Buffers. Encode each column
+      // in the original property order, preserving the v1 digest bytes without
+      // invoking the BigInt replacer for every byte in Buffer.toJSON().data.
+      hash.update('{');let separator='';
+      for(const [key,value] of Object.entries(row as Record<string,unknown>)) {
+        hash.update(separator+JSON.stringify(key)+':');separator=',';
+        hash.update(JSON.stringify(typeof value==='bigint'?{$integer:value.toString()}:value));
+      }
+      hash.update('}\n');
+    }
   }
   return hash.digest('hex');
 }

@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Database from 'better-sqlite3';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +17,20 @@ function fixture() {
   db.prepare('INSERT INTO tasks VALUES(?,?)').run('existing-result',JSON.stringify({status:'completed',result:{id:'stable-result',text:'历史正文'}}));
   db.close();
   return {root,dir,backupDirectory:join(root,'backup'),close:()=>rmSync(root,{recursive:true,force:true})};
+}
+
+// Frozen v1 encoding: existing migration journals and rollback baselines use
+// this exact format, including Buffer.toJSON() and the 64-bit integer marker.
+function legacyMigrationDigest(db:Database.Database) {
+  const hash=createHash('sha256'),quote=(name:string)=>'"'+name.replaceAll('"','""')+'"';
+  const tables=db.prepare("SELECT name,sql FROM sqlite_master WHERE type='table' AND name!='bridge_storage_metadata' AND name NOT LIKE 'sqlite_stat%' ORDER BY name").all() as {name:string;sql:string}[];
+  for(const table of tables) {
+    hash.update(JSON.stringify(table)+'\n');
+    const order=/WITHOUT\s+ROWID/i.test(table.sql)?(db.pragma(`table_info(${quote(table.name)})`) as {name:string}[]).map(column=>quote(column.name)).join(','):'rowid';
+    for(const row of db.prepare(`SELECT * FROM ${quote(table.name)} ORDER BY ${order}`).safeIntegers().iterate())
+      hash.update(JSON.stringify(row,(_key,value)=>typeof value==='bigint'?{$integer:value.toString()}:value)+'\n');
+  }
+  return hash.digest('hex');
 }
 
 test('maintenance preflight accounts for all accepted work without advancing state',()=>{
@@ -85,6 +100,47 @@ test('preactivation rollback restores only the verified untouched snapshot',asyn
     const db=new Database(join(f.dir,'tasks.sqlite'));
     try {assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name='migrated'").get(),undefined);assert.equal((db.prepare('SELECT COUNT(*) AS n FROM tasks').get() as {n:number}).n,1);}finally{db.close();}
   }finally{f.close();}
+});
+
+test('migration retains legacy binary digest bytes and rejects modified blob contents',async()=>{
+  for(const tamper of [false,true]) {
+    const f=fixture(),body=Buffer.from(Array.from({length:65536},(_,i)=>i&255));
+    const db=new Database(join(f.dir,'tasks.sqlite'));let sourceDigest:string;
+    try {
+      db.exec('CREATE TABLE "legacy bodies"(text TEXT,"0" INTEGER,signed INTEGER,fraction REAL,empty TEXT,body BLOB,absent TEXT);CREATE TABLE "without rowid"(id TEXT PRIMARY KEY,body BLOB) WITHOUT ROWID');
+      const insert=db.prepare('INSERT INTO "legacy bodies" VALUES(?,?,?,?,?,?,?)');
+      insert.run('中文\n𝄞"\u0000\\',0n,-9223372036854775808n,1.5,'',body,null);
+      insert.run('empty blob',1n,9223372036854775807n,-0,'',Buffer.alloc(0),null);
+      db.prepare('INSERT INTO "without rowid" VALUES(?,?)').run('stable-body',body);
+      sourceDigest=legacyMigrationDigest(db);
+    }finally{db.close();}
+    try {
+      const result=await migrateStorage(f.dir,{from:1,to:2,backupDirectory:f.backupDirectory,migrate:current=>{
+        current.exec('CREATE TABLE migrated_pages(id INTEGER PRIMARY KEY,body BLOB)');
+        current.prepare('INSERT INTO migrated_pages VALUES(?,?)').run(1,body);
+      }});
+      const journal=JSON.parse(readFileSync(join(f.dir,'storage-migration.json'),'utf8'));
+      assert.equal(journal.source_digest,sourceDigest!);
+      const current=new Database(join(f.dir,'tasks.sqlite'));
+      try {
+        const saved=current.prepare('SELECT baseline_sha256 FROM bridge_storage_metadata WHERE id=1').get() as {baseline_sha256:string};
+        assert.equal(saved.baseline_sha256,legacyMigrationDigest(current));
+        if(tamper) {
+          const changed=Buffer.from(body);changed[32768]^=1;
+          current.prepare('UPDATE migrated_pages SET body=? WHERE id=1').run(changed);
+        }
+      }finally{current.close();}
+      if(tamper) {
+        await assert.rejects(()=>rollbackStorageMigration(f.dir,result.migration_id),/rollback_new_writes_detected/);
+        assert.equal(readProductionConfig(f.dir).schema_version,2);
+      }else {
+        await rollbackStorageMigration(f.dir,result.migration_id);
+        const restored=new Database(join(f.dir,'tasks.sqlite'),{readonly:true});
+        try {assert.equal(legacyMigrationDigest(restored),sourceDigest!);}finally{restored.close();}
+        assertStorageServingAllowed(f.dir);
+      }
+    }finally{f.close();}
+  }
 });
 
 test('unexpected writes or changed backup prohibit preactivation rollback',async()=>{
