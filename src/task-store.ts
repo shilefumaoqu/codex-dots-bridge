@@ -193,6 +193,11 @@ export class TaskStore {
       try { if (signal?.aborted || changed()) done(); } catch (error) { cleanup(); reject(error); }
     });
   }
+  get resourceStatus() {
+    let callbacks = 0;
+    for (const listeners of this.waiters.values()) callbacks += listeners.size;
+    return { groups: this.waiters.size, callbacks };
+  }
   observe(request: unknown, instanceId: string) { return observeDatabase(this.db, request, instanceId, this.now); }
   audit(kind: string, taskId: string|null=null, detail: Record<string,unknown>={}) { this.diagnostics.append(kind,taskId,canonical(detail)); }
   rotateDiagnostics() {this.diagnostics.rotate();}

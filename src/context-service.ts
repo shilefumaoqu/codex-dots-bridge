@@ -73,6 +73,7 @@ export class ContextService {
   private readonly normalizedStorage: boolean;
   private readonly running = new Map<string, {promise: Promise<void>; controller: AbortController}>();
   private closed = false;
+  get resourceStatus() { return { inflight_jobs: this.running.size }; }
   constructor(private readonly db: Database.Database, config?: unknown, options: ContextServiceOptions = {}) {
     const parsed = config === undefined ? undefined : desktopConversationsConfigSchema.safeParse(config);
     if (parsed && !parsed.success) fail('invalid_config');

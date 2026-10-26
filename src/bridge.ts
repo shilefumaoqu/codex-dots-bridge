@@ -20,6 +20,7 @@ import { ContextServiceError, type ContextService } from './context-service.js';
 import { contextGetSchema, contextUpdateSchema, contextForgetSchema } from './context-contract.js';
 import { ProbeError } from './store.js';
 import { ProbeEvents, eventCatalog, subscribeParams, unsubscribeParams } from './events.js';
+import { historyReadScheduler } from './read-scheduler.js';
 import { CallbackError } from './webhook.js';
 import { readProductionConfig, readToken } from './runtime.js';
 import { notifyOwnerSchema, notifyOwner, submitNotificationReply, notificationConfigurationCurrent, type OwnerNotificationOptions } from './owner-notification.js';
@@ -464,6 +465,19 @@ export function createProductionService(store: TaskStore, events: ProbeEvents, t
   app.post<{ Params: { name: string } }>('/control/:name', async (request, reply) => {
     const name = request.params.name;
     boundedArguments(request.body);
+    if (name === 'resources') {
+      z.object({}).strict().parse(request.body);
+      if (!id.safeParse(instanceId).success) return reply.code(503).send({error:'observer_identity_unconfigured'});
+      const reads = historyReadScheduler(store.db);
+      // Live owner counters only: no database/history reads, sweeps or external probes.
+      return {schema_version:1,instance_id:instanceId,version:VERSION,observed_at:new Date(store.now()).toISOString(),
+        process_id:process.pid,shutting_down:shutdown.signal.aborted,
+        task_waiters:store.resourceStatus,
+        history_reads:{...reads.status,active_limit:reads.maxActive,queued_limit:reads.maxQueued},
+        desktop:{available:!!conversations,...(conversations?.resourceStatus??{inflight_operations:0,reply_observer_timers:0,
+          sending_targets:0,read_cache_entries:0,read_cache_estimated_bytes:0,read_cache_limit_bytes:0})},
+        context:{available:!!contexts,...(contexts?.resourceStatus??{inflight_jobs:0})}};
+    }
     if (name === 'observe') {
       try { return store.observe(request.body, instanceId ?? ''); }
       catch (error) {

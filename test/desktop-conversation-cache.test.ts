@@ -130,9 +130,11 @@ test('LRU capacity, idle expiry, oversize bypass and close reload the original p
   try {
     const a = randomUUID(), b = randomUUID(), c = randomUUID();
     const first = await f.finish(a); now++;
+    assert.equal(f.service.resourceStatus.read_cache_entries, 1);
+    assert.ok(f.service.resourceStatus.read_cache_estimated_bytes > 0);
     // Fit exactly two equal-size fixtures without tying this test to home path
     // length or future metadata additions in the persisted envelope.
-    (f.service as any).readCacheMaxBytes = (f.service as any).readCacheBytes * 2;
+    (f.service as any).readCacheMaxBytes = f.service.resourceStatus.read_cache_estimated_bytes * 2;
     const second = await f.finish(b); now++;
     assert.equal((f.service as any).readCache.size, 2);
     await f.service.get({ request_id: a }); now++;
@@ -152,8 +154,8 @@ test('LRU capacity, idle expiry, oversize bypass and close reload the original p
 test('idle entries expire without another request and close cancels expiry timer', async () => {
   const f = fixture(async input => storedRead(input.threadId, 'idle'), { readCacheIdleMs: 10 });
   try {
-    await f.finish(randomUUID()); assert.equal((f.service as any).readCache.size, 1);
-    await new Promise(resolve => setTimeout(resolve, 35)); assert.equal((f.service as any).readCache.size, 0); assert.equal((f.service as any).readCacheBytes, 0);
+    await f.finish(randomUUID()); assert.equal(f.service.resourceStatus.read_cache_entries, 1);
+    await new Promise(resolve => setTimeout(resolve, 35)); assert.equal(f.service.resourceStatus.read_cache_entries, 0); assert.equal(f.service.resourceStatus.read_cache_estimated_bytes, 0);
   } finally { await f.cleanup(); }
 });
 

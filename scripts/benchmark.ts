@@ -86,6 +86,7 @@ for (const storageVersion of storageVersions) for (const count of sizes) await s
   };
   const summary = () => (store.status as (options?:{summary:boolean})=>unknown).call(store,{summary:true});
   emit({kind:'history_queries',storage_version:storageVersion,total_tasks:count,seed_ms:round(performance.now()-seededAt),get:sample(()=>store.get(current.task_id)),
+    single_task_observation:sample(()=>store.observe({mode:'task',task_id:current.task_id},'00000000-0000-4000-8000-000000000000')),
     status_summary:sample(summary),list_recent_10:sample(()=>store.listSummaries({limit:10})),query_plans:plans,
     memory:process.memoryUsage(),...databaseBytes(store,path)});
 });
@@ -148,5 +149,6 @@ for (const storageVersion of storageVersions) for (const count of waiterCounts) 
   store.message({task_id:task.task_id,message_key:'wake',text:'wake',response_mode:'compact'});
   await Promise.all(pending);
   emit({kind:'waiters',storage_version:storageVersion,count,registration_select_executions:registrationSelects,idle_250ms_select_executions:idleSelects,
-    elapsed_ms:round(performance.now()-start),retained_waiter_groups:(store as any).waiters?.size,memory:process.memoryUsage()});
+    elapsed_ms:round(performance.now()-start),retained_waiter_groups:store.resourceStatus.groups,
+    retained_waiter_callbacks:store.resourceStatus.callbacks,memory:process.memoryUsage()});
 });

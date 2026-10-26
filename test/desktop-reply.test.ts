@@ -94,11 +94,14 @@ test('70-second and multi-minute replies use one accepted request and status coa
       const accepted=await service.get({request_id:f.request,wait_seconds:1});
       assert.equal(accepted.delivery_state,'accepted');assert.equal(accepted.reply_state,'pending');assert.equal(accepted.watch_state,'active');assert.equal(accepted.turn_id,f.turn);
       await until(()=>reads===1);
+      assert.equal(service.resourceStatus.inflight_operations,1);assert.equal(service.resourceStatus.sending_targets,1);
       await Promise.all(Array.from({length:10},()=>service.get({request_id:f.request})));
       assert.equal(service.send(args).watch_state,'active');assert.equal(reads,1);assert.equal(sends,1);
       release!({status:'completed',turn_id:f.turn,reply:'late original result'});
       const done=await service.get({request_id:f.request,wait_seconds:1});
       assert.equal(done.status,'completed');assert.equal(done.reply,'late original result');assert.equal(done.watch_state,'completed');assert.equal(sends,1);
+      assert.equal(service.resourceStatus.inflight_operations,0);assert.equal(service.resourceStatus.sending_targets,0);
+      assert.equal(service.resourceStatus.reply_observer_timers,0);
     }finally{release?.({status:'pending',next_offset:f.binding.offset});await service.close();f.cleanup();}
   }
 });

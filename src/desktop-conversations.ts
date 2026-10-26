@@ -98,6 +98,11 @@ export class DesktopConversationsService {
   private readonly inflight = new Map<string, { controller: AbortController; promise: Promise<void> }>();
   private readonly watchTimers = new Map<string, NodeJS.Timeout>();
   private readonly sending = new Map<string,string>(); private closed = false; private closing?: Promise<void>;
+  get resourceStatus() {
+    return { inflight_operations: this.inflight.size, reply_observer_timers: this.watchTimers.size,
+      sending_targets: this.sending.size, read_cache_entries: this.readCache.size,
+      read_cache_estimated_bytes: this.readCacheBytes, read_cache_limit_bytes: this.readCacheMaxBytes };
+  }
   get accessStatus(): { enabled: boolean; mode: 'local' | 'targets' | 'disabled'; read: boolean; send: boolean; target_count?: number } {
     return { enabled: this.enabled, mode: !this.enabled ? 'disabled' : this.localConfig ? 'local' : 'targets', read: this.readEnabled, send: this.sendEnabled, ...(!this.localConfig && this.enabled ? { target_count: this.targets.size } : {}) };
   }
