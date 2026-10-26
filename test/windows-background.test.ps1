@@ -15,7 +15,7 @@ try {
   $request=[pscustomobject]@{kind='supervisor';nodePath=$node;entryPath=$entry;dataDir=$work;environment=[pscustomobject]@{SystemRoot=$env:SystemRoot;PATH=$env:PATH;TEMP=$machineTemp;TMP=$machineTemp}}
   $script:createCalls=0;$script:deny=$false;$script:unavailable=$false;$script:unknown=$false;$script:ownerFailure=$false
   function New-CimInstance {param($ClassName,$Property,[switch]$ClientOnly,$ErrorAction)if($script:unavailable){throw 'probe unavailable'};$script:startup=$Property;return [pscustomobject]$Property}
-  function Get-DotsCreatedProcess {param($ProcessNumber)return [pscustomobject]@{SessionId=[Diagnostics.Process]::GetCurrentProcess().SessionId}}
+  function Get-DotsCreatedProcess {param($ProcessNumber)if($script:processMissing){return $null};return [pscustomobject]@{SessionId=([Diagnostics.Process]::GetCurrentProcess().SessionId+$(if($script:sessionMismatch){1}else{0}))}}
   function Get-DotsCreatedOwner {param($ProcessInfo)if($script:ownerFailure){throw [InvalidOperationException]::new('synthetic sensitive error text')};return @{ReturnValue=0;Sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value}}
   function Invoke-DotsProcessCreate {param($Command,$Directory,$Startup)
     $script:createCalls++;$script:createArguments=@{CommandLine=$Command;CurrentDirectory=$Directory;ProcessStartupInformation=$Startup}
@@ -24,6 +24,7 @@ try {
   }
   $r=Start-DotsBackgroundProcess $request
   Assert ($r.pid -eq 123) 'Receipt did not report PID.'
+  Assert ($script:dotsLaunchObservation.actual_session_id -eq $r.sessionId -and $script:dotsLaunchObservation.expected_session_id -eq $r.sessionId -and $script:dotsLaunchObservation.created_process_observed -eq $true -and $script:dotsLaunchObservation.owner_sid_matches -eq $true) 'Successful receipt must distinguish observed session and matching owner.'
   Assert ($script:startup.CreateFlags -eq 0x08000400 -and $script:startup.ShowWindow -eq 0) 'Incorrect Unicode/background flags.'
   Assert ($script:startup.EnvironmentVariables -cnotcontains 'CONTROL_PLANE_API_KEY=secret') 'Environment key leak.'
   Assert ($script:startup.EnvironmentVariables -ccontains ('TEMP='+$knownTemp) -and $script:startup.EnvironmentVariables -ccontains ('TMP='+$knownTemp)) 'Broker propagated stale request TEMP to supervisor/guardian.'
@@ -46,6 +47,15 @@ try {
   Assert ($observation.stage -ceq 'get_owner_sid' -and $observation.pid -eq 123 -and $observation.create_return_code -eq 0 -and $observation.exception_type -ceq 'System.InvalidOperationException') 'Owner exception lost its phase, created PID or original type.'
   Assert (($observation|ConvertTo-Json -Compress) -notmatch 'synthetic sensitive|CommandLine|environment|"Sid"|executable') 'Launch diagnostic retained sensitive values.'
   $script:ownerFailure=$false
+  foreach($missing in @($false,$true)) {
+    $script:processMissing=$missing;$script:sessionMismatch=-not $missing;$before=$script:createCalls
+    try{Start-DotsBackgroundProcess $request|Out-Null;throw 'Unexpected session success'}catch{Assert ($_.Exception.Message -ceq 'background_launch_unknown') 'Unconfirmed session must remain unknown.'}
+    Assert ($script:createCalls-$before -eq 1) 'Session refusal retried process creation.'
+    Assert ($script:dotsLaunchObservation.stage -ceq 'verify_session' -and $script:dotsLaunchObservation.created_process_observed -eq (-not $missing)) 'Missing process and mismatching session became indistinguishable.'
+    Assert (($null -eq $script:dotsLaunchObservation.actual_session_id) -eq $missing) 'Expected session was reported as actual session.'
+    Assert ($null -eq $script:dotsLaunchObservation.owner_sid_matches) 'Unobserved owner must not be reported as matching.'
+  }
+  $script:processMissing=$false;$script:sessionMismatch=$false
   $request.environment=[pscustomobject]@{CONTROL_PLANE_API_KEY='synthetic'}
   try{Start-DotsBackgroundProcess $request|Out-Null;throw 'Accepted credential environment'}catch{Assert ($_.Exception.Message -ceq 'background_launch_invalid_request') 'Did not reject extra env variable.'}
   Assert ((Quote-DotsWindowsArgument 'x\') -ceq '"x\\"') 'Trailing slash quote broken.'

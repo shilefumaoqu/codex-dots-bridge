@@ -123,10 +123,15 @@ namespace CodexDotsBridge.Tray
                 switch (value as string)
                 {
                     case "execution_slot_occupied": s.WaitingReason = "执行槽占用，任务排队中"; break;
+                    case "queued_behind_task": s.WaitingReason = "正在等待前面的任务"; break;
+                    case "route_unavailable": s.WaitingReason = "任务路由不可用，请检查连接"; break;
+                    case "event_delivery_failed": s.WaitingReason = "事件投递受阻，请检查连接"; break;
                     case "awaiting_delivery": s.WaitingReason = "正在等待事件投递"; break;
                     case "awaiting_pickup": s.WaitingReason = "事件已接收，正在等待 Dot 领取"; break;
                     case "pickup_delayed": s.WaitingReason = "Dot 领取延迟"; break;
                     case "pickup_stalled": s.WaitingReason = "Dot 尚未领取，请检查连接或路由"; break;
+                    case "execution_unverified": s.WaitingReason = "执行状态待核对，请检查原任务"; break;
+                    case "deadline_elapsed": s.WaitingReason = "任务期限已到，请核对原任务"; break;
                     default: throw new FormatException("invalid_waiting_reason");
                 }
             }

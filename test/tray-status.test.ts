@@ -31,6 +31,14 @@ test('tray projection requires authenticated diagnostics and strips all private 
     assert.equal(JSON.stringify(status).includes('PRIVATE'),false);
   }finally{f.close();}
 });
+test('tray retains task blocking reasons from the common progress projection',async()=>{
+  const f=fixture();try {
+    for(const waiting_reason of ['event_delivery_failed','route_unavailable','queued_behind_task','deadline_elapsed','execution_unverified']) {
+      const status=await getTrayStatus(f.dir,version,{call:async()=>({...ready,waiting_reason})});
+      assert.equal(status.waiting_reason,waiting_reason);assert.equal(status.state,'ready');
+    }
+  }finally{f.close();}
+});
 test('long-lived tray providers bound Startup inspection caching and invalidate settings changes',async()=>{
   const f=fixture();try {
     let time=100000,reads=0;

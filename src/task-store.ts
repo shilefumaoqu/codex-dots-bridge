@@ -12,6 +12,13 @@ import { DESKTOP_IPC_DIAGNOSTIC_CODES, DESKTOP_IPC_FAILURE_REASONS } from './des
 import { diagnosticUuid, workerDiagnosticField } from './worker-diagnostics.js';
 
 export type TaskStatus = 'queued'|'running'|'waiting_input'|'cancel_requested'|'reconciliation_required'|'completed'|'failed'|'cancelled'|'expired';
+export interface TaskProgress {
+  phase: 'waiting'|'working'|'waiting_input'|'cancel_requested'|'reconciliation_required'|'completed'|'failed'|'cancelled'|'expired';
+  waiting_reason: 'execution_slot_occupied'|'queued_behind_task'|'route_unavailable'|'event_delivery_failed'|'awaiting_delivery'|'awaiting_pickup'|'pickup_delayed'|'pickup_stalled'|'execution_unverified'|'deadline_elapsed'|null;
+  observed_at: string;
+  next_action: 'wait'|'check_connection'|'check_dot_route'|'answer_question'|'wait_for_stop'|'reconcile_original_task'|'read_result'|'inspect_failure'|'none';
+  waiting_ms?: number;
+}
 export interface Link { url: string; label?: string }
 export interface TaskInput { text: string; links?: Link[] }
 export interface TaskResult { text?: string; data?: unknown; links?: Link[] }
@@ -32,6 +39,7 @@ interface Attempt { number: number; claim_key: string; claim_token: string; star
 interface Question { question_id: string; question_key: string; question: string; options?: string[]; checkpoint?: string; requires_platform_action: boolean; action_url?: string; input_revision: number; created_at: string; answer?: { text: string; at: string; message_key: string } }
 interface ResultRecord { result_id: string; attempt?: number; input_revision: number; result: TaskResult; at: string; accepted_as_final: boolean; disposition: string; result_read_at?: string; codex_ack_at?: string; user_accepted?: boolean; user_accepted_at?: string }
 export interface StoredTask { bridge_chat_id?: string; reply_binding_key?: string; reply_subscription_id?: string; task_id: string; idempotency_key: string; title: string; input: TaskInput; logical_session_id?: string; parent_task_id?: string; parent_context?: unknown; status: TaskStatus; safe_to_retry: boolean; input_revision: number; change_sequence: number; created_at: string; updated_at: string; deadline: string; queued_order: number; attempt: number; retry_count: number; attempts: Attempt[]; messages: { message_key: string; text: string; question_id?: string; input_revision: number; at: string }[]; questions: Question[]; results: ResultRecord[]; active_question_id?: string; result_id?: string; cancel_request?: { request_key: string; reason?: string; at: string }; cancellation_ack?: { at: string; note?: string }; error?: { code: string; message: string }; reconciliation_reason?: string }
+type TaskHeader = Omit<StoredTask,'input'|'parent_context'|'attempts'|'messages'|'questions'|'results'> & {__task_storage_version:number;__lease_until?:string};
 type TaskMetadata = Pick<StoredTask,'task_id'|'title'|'status'|'input_revision'|'change_sequence'|'parent_task_id'|'logical_session_id'|'created_at'|'updated_at'|'deadline'|'active_question_id'|'result_id'|'bridge_chat_id'|'reply_subscription_id'|'reply_binding_key'|'queued_order'>;
 const metadataColumns='id AS task_id,title,status,input_revision,change_sequence,parent_task_id,logical_session_id,created_at,updated_at,deadline,active_question_id,result_id,bridge_chat_id,reply_subscription_id,reply_binding_key,queued_order';
 const LEASE_MS = 1_800_000;
@@ -74,7 +82,11 @@ export class TaskStore {
   setReplySubscriptionGuard(guard: (subscriptionId: string, bindingKey: string) => boolean) { this.replySubscriptionGuard=guard; this.transaction(()=>this.wake())(); }
   subscriptionCurrent(id: string) { return this.subscriptions().some(s=>s.id===id && s.active && s.expires_at>this.now()); }
   private workerTargetCurrent(t: Pick<TaskMetadata,'task_id'|'status'|'deadline'|'bridge_chat_id'|'reply_subscription_id'|'reply_binding_key'>) { if (t.bridge_chat_id) return this.chats.taskCurrent(t.task_id,t.bridge_chat_id,t.deadline,t.status); return !t.reply_subscription_id || (!!t.reply_binding_key && /^[a-f0-9]{64}$/.test(t.reply_binding_key) && this.subscriptionCurrent(t.reply_subscription_id) && (this.replySubscriptionGuard?.(t.reply_subscription_id,t.reply_binding_key) ?? false)); }
-  private assertWorkerTarget(id: string) { if(!this.workerTargetCurrent(this.raw(id))) throw new ProbeError('reply_subscription_unavailable'); }
+  private assertWorkerTarget(id: string) {
+    const task=this.prepare(`SELECT ${metadataColumns} FROM tasks WHERE id=?`).get(id) as TaskMetadata|undefined;
+    if(!task) throw new ProbeError('task_not_found');
+    if(!this.workerTargetCurrent(task)) throw new ProbeError('reply_subscription_unavailable');
+  }
   submitNotificationReply(args: SubmitInput, subscriptionId: string, bindingKey: string) {
     if(!/^sub_[a-f0-9]{40}$/.test(subscriptionId) || !/^[a-f0-9]{64}$/.test(bindingKey) || !this.subscriptionCurrent(subscriptionId) || !(this.replySubscriptionGuard?.(subscriptionId,bindingKey) ?? false)) throw new ProbeError('reply_subscription_unavailable');
     this.sweep(); return this.transaction(()=>{const task=this.operation('notification_reply',args.idempotency_key,{args,subscriptionId,bindingKey},()=>this.create(args,undefined,subscriptionId,bindingKey));this.assertWorkerTarget(task.task_id);return task;})();
@@ -244,7 +256,7 @@ export class TaskStore {
     for(const sub of this.subscriptions().filter(s=>s.active && s.expires_at>this.now() && (!t.reply_subscription_id || t.reply_subscription_id===s.id) && (!t.bridge_chat_id || this.chats.subscriptionId(t.bridge_chat_id)===s.id))) { this.prepare('INSERT INTO task_deliveries(event_id,subscription_id,next_at) VALUES(?,?,?)').run(eventId,sub.id,this.now()); this.audit('event_scheduled',taskId,{event_id:eventId,subscription_id:sub.id,generation:sub.generation}); }
   }
   private wake() { if(this.occupied()) return; const next=this.queueHead(); if(next) this.enqueue(next.task_id); }
-  private owned(args: OwnedInput) { this.assertWorkerTarget(args.task_id); const t=this.raw(args.task_id); const a=t.attempts.find(a=>a.claim_token===args.claim_token); if(!a) throw new ProbeError('invalid_claim_token'); return {t,a,current:a.number===t.attempt && a.status==='running' && ['running','cancel_requested'].includes(t.status)}; }
+  private owned(args: OwnedInput) { const t=this.raw(args.task_id); if(!this.workerTargetCurrent(t)) throw new ProbeError('reply_subscription_unavailable'); const a=t.attempts.find(a=>a.claim_token===args.claim_token); if(!a) throw new ProbeError('invalid_claim_token'); return {t,a,current:a.number===t.attempt && a.status==='running' && ['running','cancel_requested'].includes(t.status)}; }
   private create(args: SubmitInput,parent?: StoredTask,replySubscriptionId?: string,replyBindingKey?: string,chatId?: string) {
     required(args.idempotency_key); required(args.title); required(args.input?.text); links(args.input.links); const hours=deadlineHours(args.deadline_hours);
     if(args.safe_to_retry!==undefined && typeof args.safe_to_retry!=='boolean') throw new ProbeError('invalid_argument'); if(args.logical_session_id!==undefined) required(args.logical_session_id);
@@ -358,7 +370,35 @@ export class TaskStore {
     else if(t.status==='waiting_input') throw new ProbeError('question_id_required');
     t.input_revision++; t.messages.push({message_key:args.message_key,text:args.text,question_id:args.question_id,input_revision:t.input_revision,at:iso(this.now())}); this.changed(t,'message_saved',{revision:t.input_revision,question_id:args.question_id}); if(t.status==='queued') this.enqueue(t.task_id); return this.publicTask(t);
   }))(); }
+  /** The compact path renews only the owning attempt and appends one checkpoint. */
+  private checkpointCompact(args: CheckpointInput) {
+    const row=this.prepare('SELECT data FROM tasks WHERE id=?').get(args.task_id) as {data:string}|undefined;
+    if(!row) throw new ProbeError('task_not_found');
+    const task=JSON.parse(row.data) as TaskHeader;
+    if(task.__task_storage_version!==2) return undefined;
+    if(!this.workerTargetCurrent(task)) throw new ProbeError('reply_subscription_unavailable');
+    const part=this.prepare("SELECT position,data FROM task_components WHERE task_id=? AND kind='attempts' AND parent=0 AND json_extract(data,'$.claim_token')=? LIMIT 1").get(args.task_id,args.claim_token) as {position:number;data:string}|undefined;
+    if(!part) throw new ProbeError('invalid_claim_token');
+    const attempt=JSON.parse(part.data) as Omit<Attempt,'checkpoints'>;
+    if(attempt.number!==task.attempt || attempt.status!=='running' || !['running','cancel_requested'].includes(task.status)) throw new ProbeError('attempt_not_current');
+    if(!Number.isInteger(args.input_revision)||args.input_revision<1||args.input_revision>task.input_revision) throw new ProbeError('invalid_revision');
+    const acknowledged=args.input_revision===task.input_revision, at=iso(this.now());
+    if(acknowledged) attempt.acknowledged_revision=args.input_revision;
+    attempt.lease_until=iso(this.now()+LEASE_MS);
+    const next=this.prepare("SELECT COALESCE(MAX(position),-1)+1 AS position FROM task_components WHERE task_id=? AND kind='checkpoints' AND parent=?").get(args.task_id,part.position) as {position:number};
+    this.prepare("INSERT INTO task_components(task_id,kind,parent,position,data) VALUES(?,'checkpoints',?,?,?)").run(args.task_id,part.position,next.position,canonical({at,input_revision:args.input_revision,acknowledged,summary:args.summary}));
+    this.prepare("UPDATE task_components SET data=? WHERE task_id=? AND kind='attempts' AND parent=0 AND position=?").run(canonical(attempt),args.task_id,part.position);
+    task.__lease_until=attempt.lease_until;task.change_sequence++;task.updated_at=at;
+    this.prepare('UPDATE tasks SET data=? WHERE id=?').run(canonical(task),args.task_id);
+    this.audit('checkpoint',args.task_id,{attempt:attempt.number,revision:args.input_revision,acknowledged,change_sequence:task.change_sequence});
+    this.changedIds.add(args.task_id);
+    return this.compact({...task,acknowledged,lease_until:attempt.lease_until}) as ReturnType<TaskStore['publicTask']> & {acknowledged:boolean;lease_until:string};
+  }
   checkpoint(args: CheckpointInput) { this.sweep(); return this.transaction(()=>{
+    if(this.normalized && args.response_mode==='compact') {
+      const receipt=this.checkpointCompact(args);
+      if(receipt) return receipt;
+    }
     const {t,a,current}=this.owned(args); if(!current) throw new ProbeError('attempt_not_current'); if(!Number.isInteger(args.input_revision)||args.input_revision<1||args.input_revision>t.input_revision) throw new ProbeError('invalid_revision'); const acknowledged=args.input_revision===t.input_revision; if(acknowledged) a.acknowledged_revision=args.input_revision; a.lease_until=iso(this.now()+LEASE_MS); a.checkpoints.push({at:iso(this.now()),input_revision:args.input_revision,acknowledged,summary:args.summary}); this.changed(t,'checkpoint',{attempt:a.number,revision:args.input_revision,acknowledged}); const value={...this.publicTask(t),acknowledged,lease_until:a.lease_until}; return args.response_mode==='compact'?this.compact(value) as typeof value:value;
   })(); }
   requestInput(args: QuestionInput) { this.sweep(); this.assertWorkerTarget(args.task_id); return this.transaction(()=>this.operation(`question:${args.task_id}`,args.question_key,args,()=>{
@@ -408,14 +448,47 @@ export class TaskStore {
   pending(): Delivery[] { return this.transaction(() => { const ready:Delivery[]=[];let suppressed=false;for(const row of this.prepare("SELECT d.id,d.event_id,d.subscription_id,d.attempts,e.payload,e.input_revision AS event_revision,e.queue_order AS event_queue_order FROM task_deliveries d JOIN task_events e ON e.id=d.event_id WHERE d.status='pending' AND d.next_at<=? ORDER BY d.id LIMIT 100").all(this.now())) {const item=row as Delivery;if(this.deliveryTargetCurrent(item))ready.push(item);else {this.prepare("UPDATE task_deliveries SET status='stopped' WHERE id=? AND status='pending'").run(item.id);suppressed=true;}if(ready.length===10)break;}if(suppressed)this.wake();return ready; })(); }
   isDeliveryPending(id:number) {const item=this.prepare("SELECT d.subscription_id,e.payload,e.input_revision AS event_revision,e.queue_order AS event_queue_order FROM task_deliveries d JOIN task_events e ON e.id=d.event_id WHERE d.id=? AND d.status='pending' AND d.next_at<=?").get(id,this.now()) as {payload:string;subscription_id:string;event_revision?:number|null;event_queue_order?:number|null}|undefined;return !!item && this.deliveryTargetCurrent(item);}
   deliveryResult(item:Delivery,status:number) {this.transaction(()=>{const attempts=item.attempts+1,accepted=status>=200&&status<300,terminal=[410,413].includes(status)||(status>=400&&status<500&&status!==408&&status!==429),state=accepted?'received':terminal||attempts>=6?'failed':'pending';const updated=this.prepare("UPDATE task_deliveries SET attempts=?,status=?,last_status=?,next_at=? WHERE id=? AND status='pending' AND attempts=?").run(attempts,state,status,this.now()+Math.min(60_000,1000*2**attempts),item.id,item.attempts);if(updated.changes){const taskId=(JSON.parse(item.payload) as {data:{task_id:string}}).data.task_id;if(accepted && !this.occupied() && this.queueHead()?.task_id===taskId)this.prepare('UPDATE task_queue_observations SET received_at=COALESCE(received_at,?) WHERE task_id=? AND input_revision=(SELECT input_revision FROM task_events WHERE id=?) AND queue_order=(SELECT queue_order FROM task_events WHERE id=?)').run(this.now(),taskId,item.event_id,item.event_id);this.audit(accepted?'event_receipt':state==='failed'?'event_delivery_failed':'event_retry',taskId,{event_id:item.event_id,subscription_id:item.subscription_id,status,attempts});}})();}
+  private pickupObservation(task:TaskMetadata) {
+    const timing=this.prepare('SELECT received_at FROM task_queue_observations WHERE task_id=? AND input_revision=? AND queue_order=?').get(task.task_id,task.input_revision,task.queued_order) as {received_at:number|null}|undefined;
+    const elapsed=timing?.received_at==null?undefined:Math.max(0,this.now()-timing.received_at);
+    const phase=elapsed===undefined?'awaiting_delivery':elapsed>=300000?'pickup_stalled':elapsed>=60000?'pickup_delayed':'awaiting_pickup';
+    return {phase,task_id:task.task_id,observed_at:iso(this.now()),...(elapsed===undefined?{}:{waiting_ms:elapsed}),next_action:elapsed!==undefined&&elapsed>=300000?'check_dot_route':'wait'} as const;
+  }
+  /** Observations explain durable state; they never sweep, retry or change task status. */
+  taskProgress(taskId:string, known?:TaskMetadata):TaskProgress {
+    const task=known??this.prepare(`SELECT ${metadataColumns} FROM tasks WHERE id=?`).get(taskId) as TaskMetadata|undefined;
+    if(!task) throw new ProbeError('task_not_found');
+    const progress:TaskProgress={phase:'waiting',waiting_reason:null,observed_at:iso(this.now()),next_action:'wait'};
+    if(terminal(task.status)) {
+      progress.phase=task.status as 'completed'|'failed'|'cancelled'|'expired';
+      progress.next_action=task.status==='completed'?'read_result':task.status==='failed'?'inspect_failure':'none';
+      return progress;
+    }
+    if(task.status==='reconciliation_required') return {...progress,phase:'reconciliation_required',next_action:'reconcile_original_task'};
+    if(task.status==='cancel_requested') return {...progress,phase:'cancel_requested',next_action:'wait_for_stop'};
+    if(Date.parse(task.deadline)<=this.now()) return {...progress,phase:task.status==='running'?'working':'waiting',waiting_reason:'deadline_elapsed',next_action:'reconcile_original_task'};
+    if(task.status==='running') {
+      const row=this.prepare('SELECT lease_until FROM tasks WHERE id=?').get(taskId) as {lease_until:string|null};
+      return {...progress,phase:'working',...(row.lease_until && Date.parse(row.lease_until)<=this.now()?{waiting_reason:'execution_unverified' as const,next_action:'reconcile_original_task' as const}:{})};
+    }
+    if(task.status==='waiting_input') return {...progress,phase:'waiting_input',next_action:'answer_question'};
+    if(!this.workerTargetCurrent(task) || !this.subscriptions().some(s=>s.active && s.expires_at>this.now())) return {...progress,waiting_reason:'route_unavailable',next_action:'check_connection'};
+    if(this.occupied()) return {...progress,waiting_reason:'execution_slot_occupied'};
+    if(this.queueHead()?.task_id!==task.task_id) return {...progress,waiting_reason:'queued_behind_task'};
+    const pickup=this.pickupObservation(task);
+    if(pickup.phase==='awaiting_delivery') {
+      const failed=this.prepare("SELECT 1 FROM task_deliveries d JOIN task_events e ON e.id=d.event_id WHERE json_extract(e.payload,'$.data.task_id')=? AND e.input_revision=? AND e.queue_order=? AND d.status='failed' LIMIT 1").get(taskId,task.input_revision,task.queued_order);
+      if(failed) return {...progress,waiting_reason:'event_delivery_failed',next_action:'check_connection'};
+    }
+    return {...progress,waiting_reason:pickup.phase,next_action:pickup.next_action,...('waiting_ms' in pickup?{waiting_ms:pickup.waiting_ms}:{})};
+  }
   pickupDiagnostic() {
     const occupied=this.occupied();
     if(occupied) return {phase:'execution_slot_occupied',task_id:occupied.id,observed_at:iso(this.now()),next_action:'wait_or_reconcile'};
-    const head=this.queueHead();
+    const head=this.queueHead()??this.prepare(`SELECT ${metadataColumns} FROM tasks WHERE status='queued' ORDER BY queued_order LIMIT 1`).get() as TaskMetadata|undefined;
     if(!head) return {phase:'idle',observed_at:iso(this.now()),next_action:'none'};
-    const timing=this.prepare('SELECT received_at FROM task_queue_observations WHERE task_id=? AND input_revision=? AND queue_order=?').get(head.task_id,head.input_revision,head.queued_order) as {received_at:number|null}|undefined;
-    const elapsed=timing?.received_at==null?undefined:Math.max(0,this.now()-timing.received_at);
-    return {phase:elapsed===undefined?'awaiting_delivery':elapsed>=300000?'pickup_stalled':elapsed>=60000?'pickup_delayed':'awaiting_pickup',task_id:head.task_id,observed_at:iso(this.now()),...(elapsed===undefined?{}:{waiting_ms:elapsed}),next_action:elapsed!==undefined&&elapsed>=300000?'check_dot_route':'wait'};
+    const progress=this.taskProgress(head.task_id,head);
+    return {phase:progress.waiting_reason??'awaiting_delivery',task_id:head.task_id,observed_at:progress.observed_at,next_action:progress.next_action,...(progress.waiting_ms===undefined?{}:{waiting_ms:progress.waiting_ms})};
   }
   status(options: {summary?:boolean} = {}) {
     const counts = this.prepare('SELECT status,COUNT(*) AS count FROM tasks GROUP BY status').all() as {status:TaskStatus;count:number}[];

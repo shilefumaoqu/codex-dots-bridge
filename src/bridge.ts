@@ -161,7 +161,10 @@ export async function callControl(store: TaskStore, name: CallerName, args: unkn
     case 'codex_forget_context': return callContext(contexts, name, args);
     case 'dots_submit': return store.submitFromCaller(callerSchemas[name].parse(boundedArguments(args)));
     case 'dots_list': return filteredTasks(store, callerSchemas[name].parse(boundedArguments(args)));
-    case 'dots_get': return store.get(callerSchemas[name].parse(boundedArguments(args)).task_id, {record_read: true});
+    case 'dots_get': {
+      const task=store.get(callerSchemas[name].parse(boundedArguments(args)).task_id,{record_read:true});
+      return {...task,progress:store.taskProgress(task.task_id,task)};
+    }
     case 'dots_message': return store.messageFromCaller(callerSchemas[name].parse(boundedArguments(args)));
     case 'dots_followup': return store.followupFromCaller(callerSchemas[name].parse(boundedArguments(args)));
     case 'dots_cancel': return store.cancel(callerSchemas[name].parse(boundedArguments(args)));
@@ -178,7 +181,7 @@ export async function callControl(store: TaskStore, name: CallerName, args: unkn
         const needsAttention = ['waiting_input','reconciliation_required','completed','failed','cancelled','expired'].includes(task.status);
         if (changed || needsAttention || signal?.aborted || performance.now() >= stopAt) {
           const delivered = task.result_id ? store.markRead(task.task_id) : task;
-          return { task: delivered, changed: delivered.change_sequence !== after, timed_out: !changed && !needsAttention && !signal?.aborted, interrupted: signal?.aborted ?? false };
+          return { task: {...delivered,progress:store.taskProgress(delivered.task_id,delivered)}, changed: delivered.change_sequence !== after, timed_out: !changed && !needsAttention && !signal?.aborted, interrupted: signal?.aborted ?? false };
         }
         await store.waitForChange(p.task_id, after, Math.max(0, stopAt - performance.now()), signal);
       }
@@ -192,7 +195,7 @@ async function callWorker(store: TaskStore, name: WorkerName, args: unknown, not
     case 'get_task': {
       const task = store.get(workerSchemas[name].parse(boundedArguments(args)).task_id, {worker:true});
       const chatContext = store.chats.workerContext(task.task_id);
-      return { ...task, ...store.dispatch.workerContext(task.task_id, task.deadline), ...chatContext,
+      return { ...task, progress:store.taskProgress(task.task_id,task), ...store.dispatch.workerContext(task.task_id, task.deadline), ...chatContext,
         worker_rules: chatContext ? { ...workerRules, chat_scope: 'single_text_reply', instructions: workerRules.instructions + ' ' + chatInstructions } : workerRules };
     }
     case 'claim_task': {
@@ -242,7 +245,7 @@ export function productionWorker(store: TaskStore, events: ProbeEvents, notifica
   for (const name of Object.keys(chatSchemas) as ChatName[]) {
     server.registerTool(name, { icons: xingduIcons(), description: name === 'dots_chat_send'
       ? 'Only when the human explicitly asks to send a message to their existing Dot chat: send this exact text once through the existing Events route. Keep request_id stable for the exact text and Bridge chat_id. A chat_id is not a native conversation ID; no old context is attached and no native conversation is created. Uses the existing shared worker connection, not an independently authenticated ChatGPT identity. An in-flight or uncertain message blocks the next; a definite terminal result permits an explicitly requested new message, never automatic retry. Unavailable or ambiguous routes are rejected without another subscription. An expired handle stays invalid. After the SAME subscription returns and every old message is terminal, an explicitly requested send omitting chat_id may get a new Bridge handle with continuity=route_rebound_context_unverified: tell the human content continuity must be established again; native context was not verified. A different subscription is never adopted. No task execution or other side effects are authorized by this chat call. A queued/working receipt is not a reply; use dots_chat_status and show only its saved reply. Never send merely because the human is discussing this tool.'
-      : 'Read only the saved result of the same dots_chat_send request_id; optionally wait up to 20 seconds. reply requires the accepted text result for that exact message. queued/working/error/expired/unknown are not successful replies. This never sends, retries, recovers or returns another message or task body. Missing native IDs remain absent. Do not change request_id or send the next message to bypass an unresolved result.',
+      : 'Read only the saved result of the same dots_chat_send request_id; optionally wait up to 20 seconds. progress explains the current phase, waiting_reason, observed_at and next_action without redefining status. reply requires the accepted text result for that exact message. queued/working/error/expired/unknown are not successful replies. This never sends, retries, recovers or returns another message or task body. Missing native IDs remain absent. Do not change request_id or send the next message to bypass an unresolved result.',
       inputSchema: chatSchemas[name], annotations: { readOnlyHint: name === 'dots_chat_status', destructiveHint: false, idempotentHint: true, openWorldHint: name === 'dots_chat_send' } }, async (args: unknown, context:{mcpReq:{signal:AbortSignal}}) => {
       invoked(name,args);
       const signal=shutdownSignal?AbortSignal.any([shutdownSignal,context.mcpReq.signal]):context.mcpReq.signal;
@@ -346,7 +349,7 @@ const callerDescriptions: Record<CallerName, string> = {
   ...contextDescriptions,
   dots_submit: 'Submit user-authorized task with stable idempotency_key. safe_to_retry defaults false and requires an explicit no-side-effects retry allowance.',
   dots_list: 'Find tasks by state/session; use this to resolve ambiguous references. Does not acknowledge results.',
-  dots_get: 'Read a specific task and result; records caller retrieval separately from acknowledgment.',
+  dots_get: 'Read a specific task and result, including progress phase, waiting_reason, observed_at and next_action; records caller retrieval separately from acknowledgment.',
   dots_wait: 'Wait at most 20 seconds for task change. Default total follow-up is five minutes; timeout never cancels or resubmits.',
   dots_message: 'Append requirements or answer the saved question_id with the user actual answer. Stable message_key prevents duplicate input.',
   dots_followup: 'Create a new linked task with parent result/context and a new submission key.',

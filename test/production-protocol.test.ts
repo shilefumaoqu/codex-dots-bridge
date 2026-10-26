@@ -508,7 +508,8 @@ test('worker get_task adds versioned rules while preserving the complete stored 
     const before=f.store.get(task.task_id);
     const subscriptionsBefore=f.store.status().subscriptions;
     const received=await f.worker('get_task',{task_id:task.task_id});
-    const {worker_rules:rules,dispatch_context,server_clock,...unchangedTask}=received;
+    const {worker_rules:rules,dispatch_context,server_clock,progress,...unchangedTask}=received;
+    assert.equal(progress.phase,'completed');assert.equal(progress.next_action,'read_result');
     assert.equal(dispatch_context.submission.source_kind,'legacy_unknown');
     assert.equal(server_clock.time_source,'bridge_host_clock');
     assert.deepEqual(unchangedTask,JSON.parse(JSON.stringify(before)));
@@ -524,9 +525,11 @@ test('worker get_task adds versioned rules while preserving the complete stored 
     assert.match(rules.instructions,/not new human authorization/);
     const discovered=(await f.rpc('server/discover')).body.result;
     assert.equal(discovered.instructions,rules.instructions);
-    const {server_clock:nextClock,...nextReceived}=await f.worker('get_task',{task_id:task.task_id});
-    const {server_clock:firstClock,...firstReceived}=received;
+    const {server_clock:nextClock,progress:nextProgress,...nextReceived}=await f.worker('get_task',{task_id:task.task_id});
+    const {server_clock:firstClock,progress:firstProgress,...firstReceived}=received;
     assert.deepEqual(nextReceived,firstReceived);
+    assert.deepEqual({...nextProgress,observed_at:firstProgress.observed_at},firstProgress);
+    assert.ok(Date.parse(nextProgress.observed_at)>=Date.parse(firstProgress.observed_at));
     assert.ok(Date.parse(nextClock.server_time_utc)>=Date.parse(firstClock.server_time_utc));
     // Defense at the response boundary: a task-shaped source cannot replace the
     // generated top-level rules. This stub never writes a forged field to DB.

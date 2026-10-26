@@ -7,9 +7,9 @@ import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { z } from 'zod';
 import { TaskStore } from '../src/task-store.js';
-import { chatSchemas } from '../src/chat.js';
+import { chatSchemas, type ChatReceipt } from '../src/chat.js';
 import { ProbeEvents } from '../src/events.js';
-import { callerInstructions, callerSchemas, createProductionService, workerSchemas } from '../src/bridge.js';
+import { callControl, callerInstructions, callerSchemas, createProductionService, workerSchemas } from '../src/bridge.js';
 
 const subId = (letter='a') => `sub_${letter.repeat(40)}`;
 function subscribe(store: TaskStore, id=subId(), expires=store.now()+3600000) {
@@ -24,6 +24,43 @@ function reply(store:TaskStore, text:string) {
   return task;
 }
 const counts=(store:TaskStore) => ['tasks','task_events','task_deliveries','bridge_chats','bridge_chat_messages'].map(table=>(store.db.prepare(`SELECT count(*) n FROM ${table}`).get() as {n:number}).n);
+const savedReply=({progress:_observation,...receipt}:ChatReceipt)=>receipt;
+
+test('chat and caller queries share task progress without turning delivery failure or delay into a terminal result',async()=>{
+  let now=Date.now();const store=new TaskStore(':memory:',()=>now);
+  try {
+    subscribe(store);
+    const blocker=store.submit({idempotency_key:'blocker',title:'blocker',input:{text:'unrelated private input'}});
+    const sent=store.chats.send({request_id:randomUUID(),text:'synthetic chat'}),task=store.list({status:'queued'}).find(t=>t.bridge_chat_id===sent.chat_id)!;
+    assert.equal(sent.progress!.waiting_reason,'queued_behind_task');
+    const owned={task_id:blocker.task_id,claim_token:store.claim({task_id:blocker.task_id,claim_key:'blocker'}).claim_token};
+    assert.equal((await store.chats.status({request_id:sent.request_id})).progress!.waiting_reason,'execution_slot_occupied');
+    store.checkpoint({...owned,input_revision:1});store.complete({...owned,input_revision:1,completion_key:'blocker',result:{text:'done'}});
+    const event=store.pending().find(item=>JSON.parse(item.payload).data.task_id===task.task_id)!;
+    store.deliveryResult(event,200);now+=61000;
+    const chat=await store.chats.status({request_id:sent.request_id});
+    assert.equal(chat.status,'queued');assert.equal(chat.progress!.waiting_reason,'pickup_delayed');assert.equal(chat.progress!.waiting_ms,61000);
+    assert.equal(chat.progress!.observed_at,new Date(now).toISOString());
+    const queried=await callControl(store,'dots_get',{task_id:task.task_id}) as {progress:unknown};
+    const waited=await callControl(store,'dots_wait',{task_id:task.task_id,timeout_seconds:0}) as {task:{progress:unknown}};
+    assert.deepEqual(queried.progress,chat.progress);assert.deepEqual(waited.task.progress,chat.progress);
+    assert.equal(store.status({summary:true}).waiting_reason,chat.progress!.waiting_reason);
+    assert.ok(!JSON.stringify(chat).includes('unrelated private input'));
+    const claimed=store.claim({task_id:task.task_id,claim_key:'chat'});
+    assert.equal((await store.chats.status({request_id:sent.request_id})).progress!.phase,'working');
+    store.cancel({task_id:task.task_id,request_key:'cancel'});
+    const cancelling=await store.chats.status({request_id:sent.request_id});
+    assert.equal(cancelling.status,'unknown');assert.equal(cancelling.progress!.next_action,'wait_for_stop');
+    store.ackCancel({task_id:task.task_id,claim_token:claimed.claim_token,ack_key:'stopped'});
+    assert.equal((await store.chats.status({request_id:sent.request_id})).progress!.phase,'cancelled');
+    const next=store.chats.send({request_id:randomUUID(),chat_id:sent.chat_id,text:'explicit new message'});
+    const failedEvent=store.pending()[0]!;store.deliveryResult(failedEvent,410);
+    const failed=await store.chats.status({request_id:next.request_id});
+    assert.equal(failed.status,'queued');assert.equal(failed.progress!.waiting_reason,'event_delivery_failed');assert.equal(failed.progress!.next_action,'check_connection');
+    assert.equal(store.status({summary:true}).waiting_reason,failed.progress!.waiting_reason);
+    const before=counts(store);await store.chats.status({request_id:next.request_id});assert.deepEqual(counts(store),before);
+  }finally{store.close();}
+});
 
 test('chat sends only exact current text; source and handle never pretend to be a native or Codex identity',async()=>{
   const store=new TaskStore(':memory:');
@@ -39,7 +76,7 @@ test('chat sends only exact current text; source and handle never pretend to be 
     assert.equal(source.source_kind,'shared_worker_connection_chat'); assert.equal(source.scope,'reply_to_current_chat_message_only');
     assert.equal(source.human_identity_verified,false); assert.equal(source.native_approval_granted,false);
     reply(store,'Stored exact reply.');
-    assert.deepEqual(await store.chats.status({request_id}),{...first,status:'reply',text:'Stored exact reply.'});
+    assert.deepEqual(savedReply(await store.chats.status({request_id})),{...savedReply(first),status:'reply',text:'Stored exact reply.'});
     const second=store.chats.send({request_id:randomUUID(),chat_id:first.chat_id,text:'What was the color?'});
     assert.equal(second.chat_id,first.chat_id);
     const next=store.list({status:'queued'})[0]!;
@@ -55,7 +92,7 @@ test('same ID replays only its original record offline; changed text/route confl
     subscribe(store); const args={request_id:randomUUID(),text:'Exact whitespace\n is retained.'}, initial=store.chats.send(args);
     reply(store,'ONLY_THIS_REPLY'); const before=counts(store);
     store.unsubscribe(subId());
-    assert.deepEqual(store.chats.send(args),{...initial,status:'reply',text:'ONLY_THIS_REPLY'});
+    assert.deepEqual(savedReply(store.chats.send(args)),{...savedReply(initial),status:'reply',text:'ONLY_THIS_REPLY'});
     assert.deepEqual(counts(store),before);
     assert.throws(()=>store.chats.send({...args,text:'changed'}),/chat_idempotency_conflict/);
     assert.throws(()=>store.chats.send({...args,chat_id:randomUUID()}),/chat_idempotency_conflict/);
@@ -326,7 +363,7 @@ test('only a new first message on the same restored subscription gets a fresh ha
     assert.throws(()=>store.chats.send({request_id:randomUUID(),chat_id:first.chat_id,text:'old handle cannot revive'}),/chat_route_unavailable/);
     const nextArgs={request_id:randomUUID(),text:'Explicit new first message'},next=store.chats.send(nextArgs);
     assert.notEqual(next.chat_id,first.chat_id); assert.equal(next.continuity,'route_rebound_context_unverified');
-    assert.deepEqual(store.chats.send(oldArgs),oldReceipt);
+    assert.deepEqual(savedReply(store.chats.send(oldArgs)),savedReply(oldReceipt));
     assert.deepEqual(store.chats.send(nextArgs),next);
     assert.throws(()=>store.chats.send({request_id:randomUUID(),chat_id:first.chat_id,text:'still invalid'}),/chat_route_unavailable/);
     reply(store,'second reply'); const third=store.chats.send({request_id:randomUUID(),chat_id:next.chat_id,text:'continue new handle'});

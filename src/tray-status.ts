@@ -157,7 +157,7 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
   }
   if(observed.service_reachable!==true){result.error='service_identity_unverified';return state('unknown');}
   result.service='响应正常';result.service_version=version(observed.version);
-  if(typeof observed.waiting_reason==='string'&&['execution_slot_occupied','awaiting_delivery','awaiting_pickup','pickup_delayed','pickup_stalled'].includes(observed.waiting_reason))result.waiting_reason=observed.waiting_reason;
+  if(typeof observed.waiting_reason==='string'&&['execution_slot_occupied','queued_behind_task','route_unavailable','event_delivery_failed','awaiting_delivery','awaiting_pickup','pickup_delayed','pickup_stalled','execution_unverified','deadline_elapsed'].includes(observed.waiting_reason))result.waiting_reason=observed.waiting_reason;
   if(typeof observed.last_business_at==='string'&&/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(observed.last_business_at)&&Number.isFinite(Date.parse(observed.last_business_at))&&Date.parse(observed.last_business_at)<=now())result.last_business_at=observed.last_business_at;
   const counts=object(observed.task_counts);
   for(const key of taskStates)if(Number.isSafeInteger(counts[key])&&Number(counts[key])>=0)result.task_counts[key]=Number(counts[key]);

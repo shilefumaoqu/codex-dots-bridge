@@ -126,7 +126,7 @@ public static class DotsBackgroundArguments {
 }
 function Start-DotsBackgroundProcess($Request) {
   # Fixed metadata only: never retain commands, paths, environment or error text.
-  $script:dotsLaunchObservation=[ordered]@{stage='validate_request';observed_at=[DateTime]::UtcNow.ToString('o');helper_pid=$PID;pid=$null;session_id=$null;create_return_code=$null;owner_return_code=$null;elapsed_ms=0;exception_type=$null;hresult=$null}
+  $script:dotsLaunchObservation=[ordered]@{stage='validate_request';observed_at=[DateTime]::UtcNow.ToString('o');helper_pid=$PID;pid=$null;session_id=$null;expected_session_id=$null;actual_session_id=$null;created_process_observed=$null;owner_sid_matches=$null;create_return_code=$null;owner_return_code=$null;elapsed_ms=0;exception_type=$null;hresult=$null}
   $launchClock=[Diagnostics.Stopwatch]::StartNew()
   $directory=Assert-DotsLaunchPath $Request.dataDir ''
   if($Request.kind -ceq 'supervisor') {
@@ -146,6 +146,7 @@ function Start-DotsBackgroundProcess($Request) {
     $session=[Diagnostics.Process]::GetCurrentProcess().SessionId
     $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $script:dotsLaunchObservation.session_id=$session
+    $script:dotsLaunchObservation.expected_session_id=$session
     $script:dotsLaunchObservation.stage='startup'
     $startup=New-DotsProcessStartup $environment
     $submitted=$true
@@ -157,11 +158,14 @@ function Start-DotsBackgroundProcess($Request) {
     if(-not $result.ProcessId){throw 'background_launch_unknown'}
     $script:dotsLaunchObservation.stage='get_process'
     $created=Get-DotsCreatedProcess ([uint32]$result.ProcessId)
+    $script:dotsLaunchObservation.created_process_observed=$null -ne $created
+    if($null -ne $created -and $null -ne $created.SessionId){$script:dotsLaunchObservation.actual_session_id=[int]$created.SessionId}
     $script:dotsLaunchObservation.stage='verify_session'
     if($null -eq $created -or $created.SessionId -ne $session){throw 'background_launch_unknown'}
     $script:dotsLaunchObservation.stage='get_owner_sid'
     $owner=Get-DotsCreatedOwner $created
     $script:dotsLaunchObservation.owner_return_code=[int]$owner.ReturnValue
+    $script:dotsLaunchObservation.owner_sid_matches=$owner.ReturnValue -eq 0 -and $owner.Sid -ceq $sid
     $script:dotsLaunchObservation.stage='verify_owner'
     if($owner.ReturnValue -ne 0 -or $owner.Sid -cne $sid){throw 'background_launch_unknown'}
     $script:dotsLaunchObservation.stage='confirmed'

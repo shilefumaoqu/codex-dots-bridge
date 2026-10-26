@@ -11,6 +11,7 @@ import { performance } from 'node:perf_hooks';
 import { parseArgs } from 'node:util';
 import { TaskStore, type StoredTask } from '../src/task-store.js';
 import { migrateTaskStorage, writeStoredTask } from '../src/task-persistence.js';
+import { ContextService } from '../src/context-service.js';
 
 const { values } = parseArgs({options: {
   sizes: {type: 'string', default: '1000,10000,100000'},
@@ -98,6 +99,30 @@ for (const storageVersion of storageVersions) for (const mode of ['full','compac
     task_json_bytes:store.db.prepare('SELECT length(CAST(data AS BLOB)) bytes FROM tasks WHERE id=?').get(task.task_id),
     component_json_bytes:storageVersion===2?store.db.prepare('SELECT SUM(length(CAST(data AS BLOB))) bytes FROM task_components WHERE task_id=?').get(task.task_id):null,
     memory:process.memoryUsage(),...databaseBytes(store,path)});
+});
+
+// Keep input size and preparation identical for both checkpoint response modes.
+for(const storageVersion of storageVersions) for(const mode of ['full','compact'] as const) for(const count of messages) await scratch(storageVersion,(store,path)=>{
+  const task=store.submit({idempotency_key:'checkpoint',title:'Synthetic long task',input:{text:'i'.repeat(1024)},response_mode:'compact'});
+  const claim=store.claim({task_id:task.task_id,claim_key:'checkpoint',response_mode:'compact'});
+  for(let i=0;i<count;i++)store.message({task_id:task.task_id,message_key:'m'+i,text:'m'.repeat(1024),response_mode:'compact'});
+  emit({kind:'checkpoint_growth',storage_version:storageVersion,mode,message_count:count,seed_response_mode:'compact',
+    checkpoint:sample(()=>store.checkpoint({task_id:task.task_id,claim_token:claim.claim_token,input_revision:count+1,response_mode:mode,summary:'Synthetic checkpoint'})),
+    scope:'TaskStore checkpoint including transaction, lease, append and response construction; no network',...databaseBytes(store,path)});
+});
+
+for(const count of sizes) await scratch(2,async(store,path)=>{
+  const contexts=new ContextService(store.db);
+  try {
+    const insert=store.db.prepare('INSERT INTO context_jobs(id,scope,thread,data) VALUES(?,?,?,?)');
+    store.db.transaction(()=>{
+      for(let i=0;i<count;i++)insert.run('synthetic-job-'+i,'synthetic-scope','synthetic-thread',JSON.stringify({continuation_token:'token-'+i,base:{state:'s'.repeat(1024)}}));
+    })();
+    const sql='SELECT data FROM context_jobs WHERE scope=? AND thread=? AND continuation_token=? LIMIT 1',args=['synthetic-scope','synthetic-thread','token-'+(count-1)];
+    const query=store.db.prepare(sql);
+    emit({kind:'context_continuation_lookup',total_jobs:count,job_state_chars:1024,lookup:sample(()=>JSON.parse((query.get(...args) as {data:string}).data)),
+      query_plan:store.db.prepare('EXPLAIN QUERY PLAN '+sql).all(...args),scope:'Exact SQL lookup and JSON parsing only; excludes source reading and context preparation',...databaseBytes(store,path)});
+  }finally{await contexts.close();}
 });
 
 for (const storageVersion of storageVersions) for (const count of waiterCounts) await scratch(storageVersion,async store=>{

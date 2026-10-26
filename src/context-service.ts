@@ -93,6 +93,10 @@ export class ContextService {
       CREATE TABLE IF NOT EXISTS context_jobs(id TEXT PRIMARY KEY,scope TEXT NOT NULL,thread TEXT NOT NULL,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS context_receipts(id TEXT PRIMARY KEY,scope TEXT NOT NULL,thread TEXT NOT NULL,data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS context_operations(id TEXT PRIMARY KEY,scope TEXT NOT NULL,thread TEXT NOT NULL,fingerprint TEXT NOT NULL,response TEXT NOT NULL);`);
+    // A generated projection also stays correct when a compatibility writer updates JSON.
+    if(!(db.pragma('table_xinfo(context_jobs)') as {name:string}[]).some(column=>column.name==='continuation_token'))
+      db.exec("ALTER TABLE context_jobs ADD COLUMN continuation_token TEXT GENERATED ALWAYS AS (json_extract(data,'$.continuation_token')) VIRTUAL");
+    db.exec('CREATE INDEX IF NOT EXISTS context_jobs_continuation ON context_jobs(scope,thread,continuation_token)');
     if(this.normalizedStorage) createPageTables(db);
     db.transaction(() => {
       for (const row of db.prepare('SELECT id,data FROM context_jobs WHERE scope=?').all(this.scope) as {id:string;data:string}[]) {
@@ -151,8 +155,8 @@ export class ContextService {
       const base = this.current(args.thread_id);
       let continuation: ContextReadContinuation | undefined; let prior_refs: string[] = []; let prior_gaps: string[]=[];let prior_receipts:string[]=[];
       if (args.continuation_token) {
-        const rows = this.db.prepare('SELECT data FROM context_jobs WHERE scope=? AND thread=?').all(this.scope,args.thread_id) as {data:string}[];
-        const prior = rows.map(row=>JSON.parse(row.data) as Job).find(item=>item.continuation_token===args.continuation_token);
+        const row = this.db.prepare('SELECT data FROM context_jobs WHERE scope=? AND thread=? AND continuation_token=? LIMIT 1').get(this.scope,args.thread_id,args.continuation_token) as {data:string}|undefined;
+        const prior = row ? JSON.parse(row.data) as Job : undefined;
         if (!prior || prior.epoch !== base.epoch || !prior.continuation || prior.status === 'forgotten') fail('continuation_invalid');
         continuation = prior!.continuation;
         const previousReceipt = prior!.receipt_id ? this.receipt(prior!.receipt_id) : undefined;

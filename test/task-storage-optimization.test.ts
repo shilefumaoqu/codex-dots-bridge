@@ -52,6 +52,45 @@ test('compact receipts bind response mode, preserve replay revision and append o
   }finally{f.close();}
 });
 
+test('compact checkpoints append without reading message or checkpoint history and preserve ownership/revision/rollback',()=>{
+  const f=fixture();try {
+    f.migrate();
+    let componentScans=0;
+    const prepare=f.store.db.prepare.bind(f.store.db);
+    (f.store.db as any).prepare=(sql:string)=>{
+      const statement=prepare(sql);
+      if(sql.startsWith('SELECT kind,parent,position,data FROM task_components')) {
+        const all=statement.all.bind(statement);
+        (statement as any).all=(...args:unknown[])=>{componentScans++;return all(...args);};
+      }
+      return statement;
+    };
+    const task=submit(f.store,'checkpoint-growth','compact');
+    const owned={task_id:task.task_id,claim_token:f.store.claim({task_id:task.task_id,claim_key:'claim',response_mode:'compact'}).claim_token};
+    for(let i=0;i<1000;i++) f.store.message({task_id:task.task_id,message_key:'m'+i,text:'x'.repeat(1024),response_mode:'compact'});
+    componentScans=0;
+    const stale=f.store.checkpoint({...owned,input_revision:1000,response_mode:'compact',summary:'not yet adopted'});
+    assert.equal(stale.acknowledged,false);
+    const current=f.store.checkpoint({...owned,input_revision:1001,response_mode:'compact',summary:'adopted'});
+    assert.equal(current.acknowledged,true);assert.equal(componentScans,0);
+    assert.ok(JSON.stringify(current).length<500);assert.equal(current.messages,undefined);
+    const components=()=>f.store.db.prepare('SELECT kind,parent,position,data FROM task_components WHERE task_id=? ORDER BY kind,parent,position').all(task.task_id);
+    const before=components(),header=f.store.db.prepare('SELECT data,lease_until FROM tasks WHERE id=?').get(task.task_id);
+    assert.throws(()=>f.store.checkpoint({...owned,claim_token:'wrong',input_revision:1001,response_mode:'compact'}),/invalid_claim_token/);
+    assert.throws(()=>f.store.checkpoint({...owned,input_revision:1002,response_mode:'compact'}),/invalid_revision/);
+    assert.throws(()=>f.store.transaction(()=>{f.store.checkpoint({...owned,input_revision:1001,response_mode:'compact'});throw Error('rollback');})(),/rollback/);
+    assert.deepEqual(components(),before);assert.deepEqual(f.store.db.prepare('SELECT data,lease_until FROM tasks WHERE id=?').get(task.task_id),header);
+    f.restart();
+    const restored=f.store.get(task.task_id);
+    assert.equal(restored.messages.length,1000);assert.equal(restored.attempts[0]!.acknowledged_revision,1001);
+    assert.deepEqual(restored.attempts[0]!.checkpoints.map(c=>[c.input_revision,c.acknowledged,c.summary]),[[1000,false,'not yet adopted'],[1001,true,'adopted']]);
+    f.store.cancel({task_id:task.task_id,request_key:'cancel'});
+    assert.equal(f.store.checkpoint({...owned,input_revision:1001,response_mode:'compact'}).status,'cancel_requested');
+    f.advance(1_800_001);
+    assert.throws(()=>f.store.checkpoint({...owned,input_revision:1001,response_mode:'compact'}),/attempt_not_current/);
+  }finally{f.close();}
+});
+
 test('waiters wake after commit, ignore rollback, and release on abort/close',async()=>{
   const f=fixture();try {
     const task=submit(f.store,'wait');let wakes=0,work=0;const dispose=f.store.onWorkAvailable(()=>work++);

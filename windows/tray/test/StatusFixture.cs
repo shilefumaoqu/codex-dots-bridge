@@ -91,6 +91,11 @@ internal static class StatusHarness
                 Assert(Error(result) == null && (string)Output(result)["state"] == "ready", "authenticated_projection_failed");
             }
             Assert(requests == 3, "polling_did_not_send_once");
+            foreach (string waiting in new string[] { "event_delivery_failed", "route_unavailable", "queued_behind_task", "deadline_elapsed", "execution_unverified" })
+            {
+                object result = Exchange(delegate { var value = Projection(); value["waiting_reason"] = waiting; return Json.Serialize(value); });
+                Assert(Error(result) == null && (string)Output(result)["waiting_reason"] == waiting, "task_waiting_reason_lost");
+            }
             Assert(Error(Exchange(delegate { var value = Projection(); value["instance_id"] = Guid.NewGuid().ToString(); return Json.Serialize(value); })) == "service_identity_unverified", "foreign_instance_accepted");
             Assert(Error(Exchange(delegate { var value = Projection(); value["checked_at"] = DateTimeOffset.UtcNow.AddMinutes(-2).ToString("o"); return Json.Serialize(value); })) != null, "stale_projection_accepted");
             Assert(Error(Exchange(delegate { return new string(' ', 131073); })) != null, "unbounded_projection_accepted");

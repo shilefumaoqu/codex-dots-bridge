@@ -121,6 +121,42 @@ test('multi-batch continuation advances only after every earlier batch was proce
     }finally{await f.cleanup();}
   }
 });
+
+test('legacy continuation tokens are indexed on open and one matching job is read across restart and forget',async()=>{
+  let f:ReturnType<typeof fixture>;
+  f=fixture(async input=>{
+    const batch=f.batch(input,input.continuation?'last':'first');
+    if(!input.continuation){batch.coverage.historyComplete=false;batch.gaps.push({code:'batch_limit'});batch.continuation={version:1,sourceIdentity:batch.sourceIdentity,index:batch.watermark.index,indexComplete:true,pendingTurnIds:[f.turn],startedAt:batch.observation.startedAt};}
+    return batch;
+  });
+  let reopened:ContextService|undefined;
+  try {
+    const firstId=randomUUID(),first=await f.get(firstId);f.update(first,empty(),{processed_refs:first.coverage!.fetched_refs});
+    const source=f.db.prepare('SELECT scope,thread,data FROM context_jobs WHERE id=?').get(firstId) as {scope:string;thread:string;data:string};
+    const history=JSON.parse(source.data);delete history.continuation_token;
+    const insert=f.db.prepare('INSERT INTO context_jobs(id,scope,thread,data) VALUES(?,?,?,?)');
+    f.db.transaction(()=>{for(let i=0;i<2000;i++)insert.run(randomUUID(),source.scope,source.thread,JSON.stringify(history));})();
+    await f.service.close();
+    f.db.exec('DROP INDEX context_jobs_continuation; ALTER TABLE context_jobs DROP COLUMN continuation_token');
+    reopened=new ContextService(f.db,f.config,{reader:f.reader,timeoutMs:1000});
+    assert.equal((f.db.prepare('SELECT data FROM context_jobs WHERE id=?').get(firstId) as {data:string}).data,source.data);
+    const sql='SELECT data FROM context_jobs WHERE scope=? AND thread=? AND continuation_token=? LIMIT 1';
+    assert.match(JSON.stringify(f.db.prepare('EXPLAIN QUERY PLAN '+sql).all(source.scope,f.thread,first.continuation_token)),/SEARCH.*context_jobs_continuation/);
+    let selected=0;
+    const prepare=f.db.prepare.bind(f.db);
+    (f.db as any).prepare=(query:string)=>{
+      const statement=prepare(query);
+      if(query===sql){const get=statement.get.bind(statement);(statement as any).get=(...args:unknown[])=>{const row=get(...args);if(row)selected++;return row;};}
+      return statement;
+    };
+    const last=await reopened.get({request_id:randomUUID(),thread_id:f.thread,continuation_token:first.continuation_token,wait_seconds:1});
+    assert.equal(last.status,'ready');assert.equal(selected,1);
+    await assert.rejects(reopened.get({request_id:randomUUID(),thread_id:randomUUID(),continuation_token:first.continuation_token}),/continuation_invalid/);
+    reopened.forget({operation_id:randomUUID(),thread_id:f.thread,expected_epoch:0,expected_revision:1});
+    await assert.rejects(reopened.get({request_id:randomUUID(),thread_id:f.thread,continuation_token:first.continuation_token}),/continuation_invalid/);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM context_jobs WHERE continuation_token IS NOT NULL').get() as {n:number}).n,0);
+  }finally{await reopened?.close();await f.cleanup();}
+});
 test('forget removes derived, receipt, operation and job-snapshot bodies and rejects stale update',async()=>{
   const f=fixture();try{
     const first=await f.get();const state=empty();state.task.push({id:'task',text:'SECRET_DERIVED_BODY',classification:'reported',source_refs:[first.evidence![0]!.ref]});
