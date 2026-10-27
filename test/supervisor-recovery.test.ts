@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, existsSync, rmSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, copyFileSync, writeFileSync, readFileSync, existsSync, rmSync, unlinkSync, renameSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -15,6 +15,34 @@ import { processIsAlive } from '../src/maintenance.js';
 const delay=(ms:number)=>new Promise<void>(resolve=>setTimeout(resolve,ms));
 async function until(check:()=>boolean,timeout=10000){const end=Date.now()+timeout;while(Date.now()<end){if(check())return;await delay(25);}assert.fail('condition timed out');}
 function cleanup(path:string){assert.ok(resolve(path).startsWith(resolve(tmpdir())+sep));rmSync(path,{recursive:true,force:true,maxRetries:6,retryDelay:150});}
+function publishRenameProbe(file:string,value:unknown,write:(path:string,body:string)=>void,rename:(from:string,to:string)=>void){
+  // This fixture is read concurrently; never expose its truncated/in-progress JSON.
+  const next=file+'.next';write(next,JSON.stringify(value));rename(next,file);
+}
+test('rename probe readers retain a complete snapshot while the next observation is being written',async()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots rename probe publication '));let dir:string|undefined;
+  try{
+    for(const prior of [[{temp:'previous',code:'EPERM'}],undefined]){
+      const file=join(root,prior?'existing.json':'first.json'),next=[{temp:'next',code:'EPERM'}];
+      if(prior)writeFileSync(file,JSON.stringify(prior));
+      let partialWrites=0;
+      publishRenameProbe(file,next,(target,body)=>{
+        writeFileSync(target,body.slice(0,1));partialWrites++;
+        if(prior)assert.deepEqual(JSON.parse(readFileSync(file,'utf8')),prior);
+        else assert.equal(existsSync(file),false,'first receipt must not be visible before it is complete');
+        writeFileSync(target,body);
+      },renameSync);
+      assert.equal(partialWrites,1);assert.deepEqual(JSON.parse(readFileSync(file,'utf8')),next);
+      assert.equal(existsSync(file+'.next'),false);
+    }
+    // Exercise the generated child fixture too, using its captured original rename.
+    const f=withoutTunnel(root,'rename-observe');dir=f.dir;
+    await startSupervisor(dir,{nodePath:process.execPath,entryPath:f.entry});
+    assert.deepEqual(await stopSupervisor(dir),{supervisor:'stopped',dot_tasks:'not_cancelled'});
+    const attempts=JSON.parse(readFileSync(f.renameProbe,'utf8')) as Array<{phase:string;cleanup_complete:boolean}>;
+    assert.ok(attempts.some(a=>a.phase==='stopping'));assert.equal(attempts.at(-1)?.cleanup_complete,true);
+  }finally{if(dir)try{await stopSupervisor(dir);}catch{}cleanup(root);}
+});
 function fixture(root:string,stateFault?:'starting'|'stopping'|'stopping-exit-gate'|'starting-handoff'|'tunnel-alive'|'rename-observe'|'rename-EIO'|'rename-owner'|'guardian-ready-overlap'){
   const dir=join(root,'data'),vendor=join(root,"vendor 空格 O'Brien"),entry=join(root,'fixture main.mjs');initProduction(dir);mkdirSync(vendor);
   const exe=join(vendor,'fake-tunnel.exe'),key=join(dir,'tunnel-runtime.env');copyFileSync(process.execPath,exe);writeFileSync(key,'CONTROL_PLANE_API_KEY=synthetic_recovery_key');
@@ -28,7 +56,7 @@ function fixture(root:string,stateFault?:'starting'|'stopping'|'stopping-exit-ga
   const catchGate=stateFault==='stopping-exit-gate'?`writeFileSync(${JSON.stringify(exitGateReached)},'ready');const deadline=Date.now()+20000;while(!fs.existsSync(${JSON.stringify(exitGate)})&&Date.now()<deadline)await new Promise(resolve=>setTimeout(resolve,10));`:'';
   let injection=stateFault&&stateFault!=='tunnel-alive'&&stateFault!=='guardian-ready-overlap'&&!stateFault.startsWith('rename-')?`const original=fs.writeFileSync;fs.writeFileSync=(path,value,...options)=>{if(String(path).includes('supervisor-state.')&&String(path).endsWith('.tmp')&&JSON.parse(String(value)).phase===${JSON.stringify(faultPhase)}){const error=new Error('synthetic state I/O fault');error.code='EIO';throw error;}return original(path,value,...options);};syncBuiltinESMExports();`:'';
   const renameProbe=join(root,'rename-probe.json');
-  if(stateFault?.startsWith('rename-'))injection+=`const rename=fs.renameSync,attempts=[];fs.renameSync=(from,to)=>{const value=JSON.parse(readFileSync(from,'utf8'));if(value.phase!=='stopping'&&!value.cleanup_complete)return rename(from,to);const attempt={temp:String(from).split(/[\\\\/]/).pop(),phase:value.phase,cleanup_complete:value.cleanup_complete===true};attempts.push(attempt);try{${stateFault==='rename-EIO'?"throw Object.assign(new Error('injected rename'),{code:'EIO'});":stateFault==='rename-owner'?"const next={owner:'next-owner',pid:process.pid,phase:'running'};writeFileSync(join(dir,'supervisor.lock'),JSON.stringify(next));writeFileSync(join(dir,'supervisor-state.json'),JSON.stringify(next));throw Object.assign(new Error('injected owner handoff'),{code:'EPERM'});":"return rename(from,to);"}}catch(error){attempt.code=error.code;throw error;}finally{writeFileSync(${JSON.stringify(renameProbe)},JSON.stringify(attempts));}};syncBuiltinESMExports();`;
+  if(stateFault?.startsWith('rename-'))injection+=`const rename=fs.renameSync,attempts=[];fs.renameSync=(from,to)=>{const value=JSON.parse(readFileSync(from,'utf8'));if(value.phase!=='stopping'&&!value.cleanup_complete)return rename(from,to);const attempt={temp:String(from).split(/[\\\\/]/).pop(),phase:value.phase,cleanup_complete:value.cleanup_complete===true};attempts.push(attempt);try{${stateFault==='rename-EIO'?"throw Object.assign(new Error('injected rename'),{code:'EIO'});":stateFault==='rename-owner'?"const next={owner:'next-owner',pid:process.pid,phase:'running'};writeFileSync(join(dir,'supervisor.lock'),JSON.stringify(next));writeFileSync(join(dir,'supervisor-state.json'),JSON.stringify(next));throw Object.assign(new Error('injected owner handoff'),{code:'EPERM'});":"return rename(from,to);"}}catch(error){attempt.code=error.code;throw error;}finally{(${publishRenameProbe.toString()})(${JSON.stringify(renameProbe)},attempts,writeFileSync,rename);}};syncBuiltinESMExports();`;
   if(stateFault==='guardian-ready-overlap')injection+=`const cp=(await import('node:child_process')).default,realSpawn=cp.spawn,rename=fs.renameSync,overlap={rename_failures:0,guardian_failed:false};let launched=false;cp.spawn=(command,args,options)=>{if(options?.env?.CODEX_DOTS_GUARDIAN_CONFIG){launched=true;const child=realSpawn(process.execPath,['-e','process.stdout.write(JSON.stringify({type:"guardian_error"})+String.fromCharCode(10));process.stdin.resume();process.stdin.on("end",()=>process.exit(0));'],{windowsHide:true,stdio:['pipe','pipe','ignore'],env:options.env});overlap.guardian_pid=child.pid;child.stdout.once('data',()=>{overlap.guardian_failed=true;writeFileSync(${JSON.stringify(renameProbe)},JSON.stringify(overlap));});return child;}return realSpawn(command,args,options);};fs.renameSync=(from,to)=>{if(launched&&!overlap.guardian_failed&&JSON.parse(readFileSync(from,'utf8')).phase==='starting'){overlap.rename_failures++;overlap.bridge_pid=JSON.parse(readFileSync(from,'utf8')).bridge_pid;writeFileSync(${JSON.stringify(renameProbe)},JSON.stringify(overlap));throw Object.assign(new Error('injected overlap'),{code:'EPERM'});}return rename(from,to);};syncBuiltinESMExports();`;
   if(stateFault==='starting-handoff')injection+=`const remove=fs.unlinkSync;fs.unlinkSync=(path)=>{remove(path);if(String(path)===join(dir,'supervisor.lock')){const next={owner:'next-owner',pid:process.pid,phase:'running'};writeFileSync(join(dir,'supervisor.lock'),JSON.stringify(next));writeFileSync(join(dir,'supervisor-state.json'),JSON.stringify(next));}};syncBuiltinESMExports();`;
   if(stateFault==='tunnel-alive')injection+=`const kill=process.kill;process.kill=function(pid,signal){if(signal===0&&fs.existsSync(${JSON.stringify(probe)})&&pid===JSON.parse(readFileSync(${JSON.stringify(probe)},'utf8')).pid)return true;return kill.call(process,pid,signal);};`;
