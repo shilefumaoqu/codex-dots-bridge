@@ -2,17 +2,18 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative, isAbsolute } from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import test from 'node:test';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { TaskStore } from '../src/task-store.js';
 import { ProbeEvents } from '../src/events.js';
-import { callerSchemas, createProductionService, productionWorker, VERSION, type RuntimeStatusProvider } from '../src/bridge.js';
+import { callerSchemas, createProductionService, productionCall, productionWorker, VERSION, type RuntimeStatusProvider } from '../src/bridge.js';
 import { DesktopConversationsError, type DesktopConversationsService } from '../src/desktop-conversations.js';
 import { writeProductionConfig, acquireLock } from '../src/runtime.js';
 import { ProbeError } from '../src/store.js';
+import { requestFailure } from '../src/request-policy.js';
 
 const tokens={caller:'a'.repeat(64),worker:'b'.repeat(64)};
 const meta={'io.modelcontextprotocol/protocolVersion':'2026-07-28','io.modelcontextprotocol/clientCapabilities':{}};
@@ -353,7 +354,11 @@ test('task finish distinguishes returned tools from missing, expired, FIFO and o
     const chat=f.store.chats.send({request_id:randomUUID(),text:'SECRET_CHAT'});
     const chatTask=f.store.db.prepare('SELECT task_id FROM bridge_chat_messages WHERE request_id=?').get(chat.request_id) as {task_id:string};
     f.store.db.prepare("UPDATE tasks SET data=json_set(data,'$.deadline',?) WHERE id=?").run(new Date(now-1).toISOString(),chatTask.task_id);
-    await check('get_task',{task_id:chatTask.task_id},'reply_subscription_unavailable');
+    const expired=await check('get_task',{task_id:chatTask.task_id},'reply_subscription_unavailable');
+    assert.deepEqual(JSON.parse(expired.body.result.content[0].text),{error:'reply_subscription_unavailable',category:'state',retryable:false,reason:'chat_message_expired'});
+    f.store.chats.subscriptionStopped(sub);
+    const stale=await check('get_task',{task_id:chatTask.task_id},'reply_subscription_unavailable');
+    assert.deepEqual(JSON.parse(stale.body.result.content[0].text),{error:'reply_subscription_unavailable',category:'state',retryable:false,reason:'chat_route_unavailable'});
     assert.equal(f.store.inspectChatTask(chatTask.task_id).attempt,0);assert.equal(f.store.inspectChatTask(first.task_id).attempt,1);
   } finally {await f.close();}
 });
@@ -725,6 +730,50 @@ test('service shutdown interrupts an active status provider and handles its late
     assert.ok(!JSON.stringify(response.body).includes('PRIVATE_'));
   }finally{await f.close();}
 });
+test('productionCall, real CLI and stdio retain only allowlisted chat refusal reasons',async t=>{
+  const f=await fixture();let caller:ReturnType<typeof stdio>|undefined,body:Record<string,unknown>={};
+  let requests=0;
+  // A real local HTTP boundary supplies hostile error extras, not a real Dot failure.
+  const endpoint=createServer((request,response)=>{
+    assert.equal(request.url,'/control/dots_get');assert.equal(request.headers.authorization,'Bearer '+tokens.caller);
+    requests++;request.resume();response.writeHead(409,{'content-type':'application/json'});response.end(JSON.stringify(body));
+  });
+  try {
+    await new Promise<void>(resolve=>endpoint.listen(0,'127.0.0.1',resolve));
+    const address=endpoint.address();assert.ok(address&&typeof address==='object');
+    writeProductionConfig(f.dir,{owner:'codex-dots-bridge',schema_version:1,instance_id:randomUUID(),endpoint:`http://127.0.0.1:${address.port}/`});
+    caller=stdio(f.dir);await caller.initialize();const task_id=randomUUID();
+    for(const item of [
+      {name:'message expiry',reason:'chat_message_expired',expected:'chat_message_expired'},
+      {name:'route invalidation',reason:'chat_route_unavailable',expected:'chat_route_unavailable'},
+      {name:'legacy omission'},
+      {name:'unknown reason',reason:'PRIVATE_REASON'},
+      {name:'object reason',reason:{text:'PRIVATE_REASON'}},
+      {name:'array reason',reason:['chat_message_expired']},
+      {name:'reason bound to a different error',code:'task_not_found',reason:'chat_message_expired'},
+    ])await t.test(item.name,async()=>{
+      const code=item.code??'reply_subscription_unavailable';
+      body={error:code,reason:item.reason,category:'PRIVATE_CATEGORY',retryable:true,isError:false,activity:'PRIVATE_ACTIVITY',message:'PRIVATE_BODY',secret:tokens.caller};
+      const expected={error:code,category:'state',retryable:false,...(item.expected?{reason:item.expected}:{})};
+      const before=requests;
+      await assert.rejects(productionCall(f.dir,'dots_get',{task_id}),error=>{
+        assert.ok(error instanceof ProbeError);assert.equal(error.code,code);assert.equal(error.message,code);assert.equal(error.reason,item.expected);
+        assert.deepEqual(requestFailure(error,code),{status:409,body:expected});assert.ok(!JSON.stringify(error).includes('PRIVATE_'));return true;
+      });
+      const rpc=await caller!.call('tools/call',{name:'dots_get',arguments:{task_id}});
+      toolError(rpc,code);assert.deepEqual(JSON.parse(rpc.result.content[0].text),expected);
+      const cli=await new Promise<{error:Error|null;stdout:string;stderr:string}>(resolve=>{
+        execFile(process.execPath,['--import','tsx','src/main.ts','tasks','get','--data-dir',f.dir,'--task',task_id],{cwd:process.cwd(),windowsHide:true,timeout:10000},(error,stdout,stderr)=>resolve({error,stdout,stderr}));
+      });
+      assert.equal((cli.error as {code?:number})?.code,1);assert.deepEqual(JSON.parse(cli.stdout),expected);
+      for(const secret of ['PRIVATE_',tokens.caller])assert.ok(!(cli.stdout+cli.stderr+JSON.stringify(rpc)).includes(secret));
+      assert.equal(requests-before,3,'each caller performs one HTTP request without retrying');
+    });
+  } finally {
+    try {if(caller)await caller.close();} finally {endpoint.closeAllConnections();await new Promise<void>(resolve=>endpoint.close(()=>resolve()));await f.close();}
+  }
+});
+
 function stdio(dir:string) {
   const child=spawn(process.execPath,['--import','tsx','src/main.ts','stdio','--data-dir',dir],{cwd:process.cwd(),stdio:['pipe','pipe','pipe'],windowsHide:true});
   let buffer='',sequence=0,stdout='',stderr='';const parseErrors:string[]=[];

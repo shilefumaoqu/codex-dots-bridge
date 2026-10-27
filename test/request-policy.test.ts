@@ -3,7 +3,18 @@ import assert from 'node:assert/strict';
 import { TaskStore } from '../src/task-store.js';
 import { ProbeEvents } from '../src/events.js';
 import { createProductionService, callControl, workerSchemas } from '../src/bridge.js';
-import { boundedArguments, BUSINESS_ARGUMENT_BYTES, PROTOCOL_ENVELOPE_BYTES } from '../src/request-policy.js';
+import { boundedArguments, BUSINESS_ARGUMENT_BYTES, PROTOCOL_ENVELOPE_BYTES, requestFailure } from '../src/request-policy.js';
+import { ProbeError } from '../src/store.js';
+
+test('refusal reasons are additive, typed and sanitized without changing legacy errors',()=>{
+  const code='reply_subscription_unavailable',legacy={status:409,body:{error:code,category:'state',retryable:false}};
+  assert.deepEqual(requestFailure(new ProbeError(code),code),legacy);
+  for(const reason of ['chat_message_expired','chat_route_unavailable'] as const)
+    assert.deepEqual(requestFailure(new ProbeError(code,reason),code),{...legacy,body:{...legacy.body,reason}});
+  assert.deepEqual(requestFailure({code,reason:'PRIVATE_BODY'},code),legacy);
+  assert.deepEqual(requestFailure(Object.assign(new ProbeError(code),{reason:'PRIVATE_BODY'}),code),legacy);
+  assert.deepEqual(requestFailure(new ProbeError('other','chat_message_expired'),code),legacy);
+});
 
 test('UTF-8 business budget includes escaping and permits 100,000 Chinese characters', () => {
   assert.equal(boundedArguments({text:'中'.repeat(100000)}).text.length,100000);

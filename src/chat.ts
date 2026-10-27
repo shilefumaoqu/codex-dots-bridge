@@ -71,9 +71,15 @@ export class ChatStore {
     return true;
   }
   taskCurrent(taskId: string, chatId: string, deadline: string, status: TaskStatus) {
+    return this.taskUnavailableReason(taskId,chatId,deadline,status) === undefined;
+  }
+  taskUnavailableReason(taskId: string, chatId: string, deadline: string, status: TaskStatus): 'chat_route_unavailable'|'chat_message_expired'|undefined {
     const message = this.store.db.prepare('SELECT * FROM bridge_chat_messages WHERE task_id=?').get(taskId) as Message | undefined;
     const routeCurrent = this.routeCurrent(chatId);
-    return (message ? this.messageCurrent(message, deadline, status) : true) && routeCurrent;
+    // Observe both facts even if one fails, preserving durable expiry on rollback.
+    const messageCurrent = message ? this.messageCurrent(message, deadline, status) : true;
+    if (!routeCurrent) return 'chat_route_unavailable';
+    if (!messageCurrent) return 'chat_message_expired';
   }
   private settled(message: Message) { return ['completed','failed','cancelled','expired'].includes(this.store.inspectChatTask(message.task_id).status); }
   workerContext(taskId: string) {

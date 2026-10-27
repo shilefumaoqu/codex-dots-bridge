@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 export class ProbeError extends Error {
-  constructor(public code: string) { super(code); }
+  constructor(public code: string, public readonly reason?: 'chat_message_expired'|'chat_route_unavailable') { super(code); }
 }
 export const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 export type ProbeCase = 'echo' | 'clarify';

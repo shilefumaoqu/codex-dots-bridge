@@ -6,7 +6,8 @@ import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { z } from 'zod';
-import { TaskStore } from '../src/task-store.js';
+import { TaskStore, migrateTaskStorage } from '../src/task-store.js';
+import { ProbeError } from '../src/store.js';
 import { chatSchemas, type ChatReceipt } from '../src/chat.js';
 import { ProbeEvents } from '../src/events.js';
 import { callControl, callerInstructions, callerSchemas, createProductionService, workerSchemas } from '../src/bridge.js';
@@ -25,6 +26,42 @@ function reply(store:TaskStore, text:string) {
 }
 const counts=(store:TaskStore) => ['tasks','task_events','task_deliveries','bridge_chats','bridge_chat_messages'].map(table=>(store.db.prepare(`SELECT count(*) n FROM ${table}`).get() as {n:number}).n);
 const savedReply=({progress:_observation,...receipt}:ChatReceipt)=>receipt;
+
+test('worker refusals distinguish message expiry from stale routes while retaining the legacy error code',()=>{
+  for (const schema of [1,2]) {
+    const dir=mkdtempSync(join(tmpdir(),'dots-chat-test-')),path=join(dir,'tasks.sqlite'),start=Date.now();
+    let now=start,store=new TaskStore(path,()=>now);
+    try {
+      if(schema===2){migrateTaskStorage(store.db);store.close();store=new TaskStore(path,()=>now);}
+      subscribe(store);
+      const sent=store.chats.send({request_id:randomUUID(),text:'synthetic expiry'}),task=store.list()[0]!;
+      const refusal=(fn:()=>unknown,reason:string)=>assert.throws(fn,error=>{
+        assert.ok(error instanceof ProbeError);
+        assert.equal(error.code,'reply_subscription_unavailable');
+        assert.equal((error as ProbeError & {reason?:string}).reason,reason);
+        return true;
+      });
+      now+=300001;
+      refusal(()=>store.get(task.task_id,{worker:true}),'chat_message_expired');
+      refusal(()=>store.claim({task_id:task.task_id,claim_key:'too-late',response_mode:'compact'}),'chat_message_expired');
+      assert.equal(store.inspectChatTask(task.task_id).attempt,0);
+      assert.equal(store.chats.routeCurrent(sent.chat_id!),true);
+      for(const response_mode of ['full','compact'] as const){
+        const next=store.chats.send({request_id:randomUUID(),text:'synthetic owned expiry'});
+        const id=(store.db.prepare('SELECT task_id FROM bridge_chat_messages WHERE request_id=?').get(next.request_id) as {task_id:string}).task_id;
+        const claim=store.claim({task_id:id,claim_key:response_mode,response_mode});
+        now+=300001;
+        refusal(()=>store.checkpoint({task_id:id,claim_token:claim.claim_token,input_revision:1,response_mode}),'chat_message_expired');
+        assert.equal(store.inspectChatTask(id).attempt,1);
+        assert.equal(store.inspectChatTask(id).results.length,0);
+        // Resolve only this synthetic fixture before testing the other response mode.
+        store.resolve({task_id:id,resolution_key:response_mode,decision:'fail',basis:'isolated test: no work was executed'});
+      }
+      now=start+3600001;
+      refusal(()=>store.get(task.task_id,{worker:true}),'chat_route_unavailable');
+    }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+  }
+});
 
 test('chat and caller queries share task progress without turning delivery failure or delay into a terminal result',async()=>{
   let now=Date.now();const store=new TaskStore(':memory:',()=>now);
@@ -265,7 +302,7 @@ test('message deadline expiry stays durable after rollback and restart while the
     store.close();now=start;store=new TaskStore(path,()=>now);
     assert.equal(store.subscriptionCurrent(subId()),true);assert.equal(store.chats.routeCurrent(sent.chat_id!),true);
     assert.equal(store.chats.send(args).status,'unknown');assert.equal(store.pending().length,0);
-    assert.throws(()=>store.get(task.task_id,{worker:true}),/reply_subscription_unavailable/);
+    assert.throws(()=>store.get(task.task_id,{worker:true}),error=>error instanceof ProbeError && error.code==='reply_subscription_unavailable' && (error as ProbeError & {reason?:string}).reason==='chat_message_expired');
     assert.deepEqual(store.db.prepare('SELECT * FROM tasks').all(),tasks);assert.deepEqual(counts(store),before);
   } finally {
     store.close();const owned=relative(resolve(tmpdir()),resolve(dir));assert.ok(owned.startsWith('dots-chat-test-')&&!owned.includes('..'));rmSync(dir,{recursive:true,force:true});

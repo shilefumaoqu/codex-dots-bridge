@@ -139,6 +139,15 @@ test('send rechecks a native state change during beforeSend before writing the s
   assert.equal(result.status, 'skipped_unknown'); assert(!f.socket.frames.some(frame => frame.method === 'thread-follower-start-turn'));
 }));
 
+test('matching abort or failure in the fast reply path retains the ACK and sends only once',async()=>{
+  for(const type of ['turn_aborted','task_failed'])await fixture(async f=>{
+    f.onStart(()=>f.append({type:'event_msg',payload:{type,turn_id:f.turnId}}));
+    assert.deepEqual(await f.send(),{status:'uncertain',reason:'reply_failed'});
+    assert.equal(f.accepted(),f.turnId);
+    assert.equal(f.socket.frames.filter(frame=>frame.method==='thread-follower-start-turn').length,1);
+  });
+});
+
 test('custom message inherits settings, persists before write, binds ACK and accepts arbitrary exact-turn reply', async () => fixture(async f => {
   f.append(f.complete(f.turnId, 'HISTORY_MUST_NOT_WIN', Date.now() - 10000));
   f.onStart(() => { f.append(f.complete(randomUUID(), 'UNRELATED_MUST_NOT_WIN')); f.append(f.complete()); });

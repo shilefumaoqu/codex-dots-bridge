@@ -3,6 +3,11 @@ import { ProbeError } from './store.js';
 export const BUSINESS_ARGUMENT_BYTES = 1024 * 1024;
 export const PROTOCOL_ENVELOPE_BYTES = 2 * 1024 * 1024;
 
+/** Only these additive diagnostics may cross an error boundary. */
+export function chatRefusalReason(code: string, reason: unknown) {
+  if (code === 'reply_subscription_unavailable' && (reason === 'chat_message_expired' || reason === 'chat_route_unavailable')) return reason;
+}
+
 /** Count the actual UTF-8 wire representation, including JSON escaping. */
 export function boundedArguments<T>(args: T): T {
   let encoded: string | undefined;
@@ -22,7 +27,10 @@ export function requestFailure(error: unknown, fallbackCode: string) {
     return {status: 409, body: {error: fallbackCode, category: 'capacity', retryable: true, accepted: false}};
   if (['local_service_unreachable','local_service_failed','service_not_started','service_not_running','tray_status_unavailable','context_service_closed','storage_maintenance_required'].includes(fallbackCode))
     return {status: 503, body: {error: fallbackCode, category: 'availability', retryable: true}};
-  if (fallbackCode !== 'bridge_operation_failed')
-    return {status: 409, body: {error: fallbackCode, category: 'state', retryable: false}};
+  if (fallbackCode !== 'bridge_operation_failed') {
+    // Keep the legacy error code; expose only known, non-sensitive refusal reasons.
+    const reason = error instanceof ProbeError && error.code === fallbackCode ? chatRefusalReason(fallbackCode,error.reason) : undefined;
+    return {status: 409, body: {error: fallbackCode, category: 'state', retryable: false, ...(reason ? {reason} : {})}};
+  }
   return {status: 500, body: {error: fallbackCode, category: 'internal', retryable: false}};
 }

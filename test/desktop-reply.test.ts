@@ -83,6 +83,46 @@ test('read-only recovery refuses replaced files, mismatched sessions and offsets
   }
 });
 
+test('only a matching abort or failure ends exact-turn recovery; another completed turn never wins',async()=>{
+  for(const type of ['turn_aborted','task_failed']){
+    const f=fixture(),read=(binding=f.binding)=>runReply({binding,turnId:f.turn,signal:new AbortController().signal,deadline:Date.now()+1000});
+    try {
+      appendFileSync(f.path,JSON.stringify({type:'event_msg',payload:{type,turn_id:randomUUID()}})+'\n'+turnComplete(randomUUID(),f.now,'unrelated final'));
+      const pending=await read();assert.equal(pending.status,'pending');if(pending.status!=='pending')return;
+      appendFileSync(f.path,JSON.stringify({type:'event_msg',payload:{type,turn_id:f.turn}})+'\n');
+      assert.deepEqual(await read({...f.binding,offset:pending.next_offset}),{status:'unavailable',reason:'reply_failed'});
+    }finally{f.cleanup();}
+  }
+});
+
+test('known exact-turn failure stops fast and background observation durably without a resend',async()=>{
+  for(const phase of ['fast','background']){
+    const f=fixture();let sends=0,reads=0,reopened:DesktopConversationsService|undefined;
+    const service=new DesktopConversationsService(f.db,f.config,{transport:{runRead:noRead,runSend:async input=>{
+      sends++;f.accept(input);
+      if(phase==='fast')throw Object.assign(new Error('reply_failed'),{code:'reply_failed'});
+      appendFileSync(f.path,JSON.stringify({type:'event_msg',payload:{type:'turn_aborted',turn_id:f.turn}})+'\n');
+      return {status:'uncertain',reason:'reply_timeout'};
+    },runReply:async input=>{reads++;return runReply(input);}}});
+    const args={request_id:f.request,thread_id:f.thread,text:'synthetic original request'};
+    try {
+      service.send(args);await service.get({request_id:f.request,wait_seconds:1});
+      await until(()=>service.resourceStatus.sending_targets===0);
+      const result=await service.get({request_id:f.request});
+      assert.equal(result.status,'uncertain');assert.equal(result.reason,'reply_failed');
+      assert.equal(result.watch_state,'unavailable');assert.equal(result.delivery_state,'accepted');
+      assert.equal(result.turn_id,f.turn);assert.equal(result.reply,undefined);assert.equal(result.receipt_nonce,undefined);
+      assert.equal(service.resourceStatus.reply_observer_timers,0);
+      assert.deepEqual(service.send(args),result);assert.equal(sends,1);
+      assert.equal(reads,phase==='fast'?0:1);
+      await service.close();
+      reopened=new DesktopConversationsService(f.db,f.config,{transport:{runRead:noRead,runSend:noSend,runReply:async()=>assert.fail('known terminal must not restart observation')}});
+      assert.deepEqual(await reopened.get({request_id:f.request}),result);
+      assert.equal(reopened.resourceStatus.sending_targets,0);assert.equal(reopened.resourceStatus.reply_observer_timers,0);
+    }finally{await service.close();await reopened?.close();f.cleanup();}
+  }
+});
+
 test('70-second and multi-minute replies use one accepted request and status coalesces the existing observer',async()=>{
   for(const age of [70_000,240_000]) {
     const f=fixture();let now=f.now,sends=0,reads=0,release:((value:DesktopReplyResult)=>void)|undefined;

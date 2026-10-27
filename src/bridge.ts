@@ -1,5 +1,5 @@
 import { ReadCapacityError } from './read-scheduler.js';
-import { boundedArguments, PROTOCOL_ENVELOPE_BYTES, requestFailure } from './request-policy.js';
+import { boundedArguments, chatRefusalReason, PROTOCOL_ENVELOPE_BYTES, requestFailure } from './request-policy.js';
 import { xingduIcons } from './xingdu-icons.js';
 import Fastify from 'fastify';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
@@ -552,7 +552,10 @@ export async function productionCall(dir: string, name: CallerName | 'resolve' |
     response = await fetch(new URL(`control/${name}`, config.endpoint), { method: 'POST', redirect: 'error', signal: AbortSignal.timeout(timeoutMs),
       headers: { 'content-type': 'application/json', authorization: `Bearer ${readToken(dir, 'caller')}` }, body: JSON.stringify(args) });
   } catch { throw new ProbeError('local_service_unreachable'); }
-  if (!response.ok) { const error = await response.json() as { error?: string }; throw new ProbeError(error.error ?? 'local_service_failed'); }
+  if (!response.ok) {
+    const error = await response.json() as { error?: string; reason?: unknown }, code = error.error ?? 'local_service_failed';
+    throw new ProbeError(code,chatRefusalReason(code,error.reason));
+  }
   return response.json();
 }
 export function startProductionCaller(dir: string) {

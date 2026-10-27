@@ -41,6 +41,7 @@ interface ResultRecord { result_id: string; attempt?: number; input_revision: nu
 export interface StoredTask { bridge_chat_id?: string; reply_binding_key?: string; reply_subscription_id?: string; task_id: string; idempotency_key: string; title: string; input: TaskInput; logical_session_id?: string; parent_task_id?: string; parent_context?: unknown; status: TaskStatus; safe_to_retry: boolean; input_revision: number; change_sequence: number; created_at: string; updated_at: string; deadline: string; queued_order: number; attempt: number; retry_count: number; attempts: Attempt[]; messages: { message_key: string; text: string; question_id?: string; input_revision: number; at: string }[]; questions: Question[]; results: ResultRecord[]; active_question_id?: string; result_id?: string; cancel_request?: { request_key: string; reason?: string; at: string }; cancellation_ack?: { at: string; note?: string }; error?: { code: string; message: string }; reconciliation_reason?: string }
 type TaskHeader = Omit<StoredTask,'input'|'parent_context'|'attempts'|'messages'|'questions'|'results'> & {__task_storage_version:number;__lease_until?:string};
 type TaskMetadata = Pick<StoredTask,'task_id'|'title'|'status'|'input_revision'|'change_sequence'|'parent_task_id'|'logical_session_id'|'created_at'|'updated_at'|'deadline'|'active_question_id'|'result_id'|'bridge_chat_id'|'reply_subscription_id'|'reply_binding_key'|'queued_order'>;
+type WorkerTarget = Pick<TaskMetadata,'task_id'|'status'|'deadline'|'bridge_chat_id'|'reply_subscription_id'|'reply_binding_key'>;
 const metadataColumns='id AS task_id,title,status,input_revision,change_sequence,parent_task_id,logical_session_id,created_at,updated_at,deadline,active_question_id,result_id,bridge_chat_id,reply_subscription_id,reply_binding_key,queued_order';
 const LEASE_MS = 1_800_000;
 const iso = (n: number) => new Date(n).toISOString();
@@ -81,11 +82,19 @@ export class TaskStore {
   private replySubscriptionGuard?: (subscriptionId: string, bindingKey: string) => boolean;
   setReplySubscriptionGuard(guard: (subscriptionId: string, bindingKey: string) => boolean) { this.replySubscriptionGuard=guard; this.transaction(()=>this.wake())(); }
   subscriptionCurrent(id: string) { return this.subscriptions().some(s=>s.id===id && s.active && s.expires_at>this.now()); }
-  private workerTargetCurrent(t: Pick<TaskMetadata,'task_id'|'status'|'deadline'|'bridge_chat_id'|'reply_subscription_id'|'reply_binding_key'>) { if (t.bridge_chat_id) return this.chats.taskCurrent(t.task_id,t.bridge_chat_id,t.deadline,t.status); return !t.reply_subscription_id || (!!t.reply_binding_key && /^[a-f0-9]{64}$/.test(t.reply_binding_key) && this.subscriptionCurrent(t.reply_subscription_id) && (this.replySubscriptionGuard?.(t.reply_subscription_id,t.reply_binding_key) ?? false)); }
+  private workerTargetReason(t: WorkerTarget) {
+    if (t.bridge_chat_id) return this.chats.taskUnavailableReason(t.task_id,t.bridge_chat_id,t.deadline,t.status);
+    if (t.reply_subscription_id && !(t.reply_binding_key && /^[a-f0-9]{64}$/.test(t.reply_binding_key) && this.subscriptionCurrent(t.reply_subscription_id) && (this.replySubscriptionGuard?.(t.reply_subscription_id,t.reply_binding_key) ?? false))) return 'reply_subscription_unavailable';
+  }
+  private workerTargetCurrent(t: WorkerTarget) { return this.workerTargetReason(t) === undefined; }
+  private requireWorkerTarget(t: WorkerTarget) {
+    const reason=this.workerTargetReason(t);
+    if(reason) throw new ProbeError('reply_subscription_unavailable',reason==='reply_subscription_unavailable'?undefined:reason);
+  }
   private assertWorkerTarget(id: string) {
     const task=this.prepare(`SELECT ${metadataColumns} FROM tasks WHERE id=?`).get(id) as TaskMetadata|undefined;
     if(!task) throw new ProbeError('task_not_found');
-    if(!this.workerTargetCurrent(task)) throw new ProbeError('reply_subscription_unavailable');
+    this.requireWorkerTarget(task);
   }
   submitNotificationReply(args: SubmitInput, subscriptionId: string, bindingKey: string) {
     if(!/^sub_[a-f0-9]{40}$/.test(subscriptionId) || !/^[a-f0-9]{64}$/.test(bindingKey) || !this.subscriptionCurrent(subscriptionId) || !(this.replySubscriptionGuard?.(subscriptionId,bindingKey) ?? false)) throw new ProbeError('reply_subscription_unavailable');
@@ -261,7 +270,7 @@ export class TaskStore {
     for(const sub of this.subscriptions().filter(s=>s.active && s.expires_at>this.now() && (!t.reply_subscription_id || t.reply_subscription_id===s.id) && (!t.bridge_chat_id || this.chats.subscriptionId(t.bridge_chat_id)===s.id))) { this.prepare('INSERT INTO task_deliveries(event_id,subscription_id,next_at) VALUES(?,?,?)').run(eventId,sub.id,this.now()); this.audit('event_scheduled',taskId,{event_id:eventId,subscription_id:sub.id,generation:sub.generation}); }
   }
   private wake() { if(this.occupied()) return; const next=this.queueHead(); if(next) this.enqueue(next.task_id); }
-  private owned(args: OwnedInput) { const t=this.raw(args.task_id); if(!this.workerTargetCurrent(t)) throw new ProbeError('reply_subscription_unavailable'); const a=t.attempts.find(a=>a.claim_token===args.claim_token); if(!a) throw new ProbeError('invalid_claim_token'); return {t,a,current:a.number===t.attempt && a.status==='running' && ['running','cancel_requested'].includes(t.status)}; }
+  private owned(args: OwnedInput) { const t=this.raw(args.task_id); this.requireWorkerTarget(t); const a=t.attempts.find(a=>a.claim_token===args.claim_token); if(!a) throw new ProbeError('invalid_claim_token'); return {t,a,current:a.number===t.attempt && a.status==='running' && ['running','cancel_requested'].includes(t.status)}; }
   private create(args: SubmitInput,parent?: StoredTask,replySubscriptionId?: string,replyBindingKey?: string,chatId?: string) {
     required(args.idempotency_key); required(args.title); required(args.input?.text); links(args.input.links); const hours=deadlineHours(args.deadline_hours);
     if(args.safe_to_retry!==undefined && typeof args.safe_to_retry!=='boolean') throw new ProbeError('invalid_argument'); if(args.logical_session_id!==undefined) required(args.logical_session_id);
@@ -381,7 +390,7 @@ export class TaskStore {
     if(!row) throw new ProbeError('task_not_found');
     const task=JSON.parse(row.data) as TaskHeader;
     if(task.__task_storage_version!==2) return undefined;
-    if(!this.workerTargetCurrent(task)) throw new ProbeError('reply_subscription_unavailable');
+    this.requireWorkerTarget(task);
     const part=this.prepare("SELECT position,data FROM task_components WHERE task_id=? AND kind='attempts' AND parent=0 AND json_extract(data,'$.claim_token')=? LIMIT 1").get(args.task_id,args.claim_token) as {position:number;data:string}|undefined;
     if(!part) throw new ProbeError('invalid_claim_token');
     const attempt=JSON.parse(part.data) as Omit<Attempt,'checkpoints'>;
