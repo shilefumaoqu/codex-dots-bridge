@@ -60,6 +60,8 @@ You can also choose to let your Dot read the stored history of a local Codex con
 
 The alpha.21 program rendered this image with a synthetic status; “Connection ready” does not mean a specific message succeeded. Left-click to open status. Right-click to toggle start-at-login; closing the tray leaves the backend running.
 
+This source candidate adds [subscription checks and a recovery entry](docs/托盘订阅检查.md): expiry display, an amber warning near expiry, and one local notification for a confirmed outage. A click rechecks the current instance and can open the saved original rule. It never resends tasks or treats opening the rule as a successful renewal.
+
 For your first task, ask Codex:
 
 > Give the text below to my Dot, organize it into three bullet points, and tell me the task ID once submitted.

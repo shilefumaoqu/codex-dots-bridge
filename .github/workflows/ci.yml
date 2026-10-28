@@ -66,6 +66,7 @@ jobs:
           if ($tray.Count -ne 1) { throw 'Expected one packaged tray executable.' }
           ./test/tray-http.test.ps1 -TrayExecutable $tray[0].FullName
           ./test/tray-refresh.test.ps1 -TrayExecutable $tray[0].FullName
+          ./test/tray-subscription.test.ps1 -TrayExecutable $tray[0].FullName
       - name: Build and validate single-file Setup
         shell: pwsh
         run: |

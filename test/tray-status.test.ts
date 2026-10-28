@@ -8,8 +8,10 @@ import { readToken, writeProductionConfig } from '../src/runtime.js';
 import { getTrayStatus } from '../src/tray-status.js';
 import { ProbeError } from '../src/store.js';
 import { startupDiagnosticPath } from '../src/startup-diagnostics.js';
+import { projectTraySubscription, trayDataBinding, unknownTraySubscription } from '../src/tray-subscription.js';
 const version='0.2.0-alpha.20';
-const ready={version,service_reachable:true,task_counts:{queued:2,running:1,waiting_input:1,cancel_requested:1,reconciliation_required:1,completed:8},diagnostics:'available',supervisor:'running',bridge:'running',tunnel_configured:true,tunnel_health:'ready',tunnel:'running',active_subscription_count:1};
+const subscriptionId='sub_'+'a'.repeat(40);
+const ready={version,service_reachable:true,task_counts:{queued:2,running:1,waiting_input:1,cancel_requested:1,reconciliation_required:1,completed:8},diagnostics:'available',supervisor:'running',bridge:'running',tunnel_configured:true,tunnel_health:'ready',tunnel:'running',active_subscription_count:1,subscriptions:[{id:subscriptionId,active:true,expires_at:new Date(Date.now()+86400000).toISOString()}]};
 function fixture() {
   const root=mkdtempSync(join(tmpdir(),'dots tray status ')),dir=join(root,'data');mkdirSync(dir);
   // Pure status never changes ACL or installation state; this fixture does not require runtime setup.
@@ -41,7 +43,7 @@ test('tray retains task blocking reasons from the common progress projection',as
 });
 test('long-lived tray providers bound Startup inspection caching and invalidate settings changes',async()=>{
   const f=fixture();try {
-    let time=100000,reads=0;
+    let time=Date.now(),reads=0;
     const readAutostart=()=>{reads++;return reads===1?'disabled' as const:'enabled' as const;};
     const options={call:async()=>ready,now:()=>time,autostartCacheMs:30000,readAutostart};
     const first=await getTrayStatus(f.dir,version,options);
@@ -59,7 +61,7 @@ test('long-lived tray providers bound Startup inspection caching and invalidate 
 });
 test('service autostart refresh is asynchronous, shared and explicitly stale until verified',async()=>{
   const f=fixture();try {
-    let time=100000,reads=0;
+    let time=Date.now(),reads=0;
     const resolutions:Array<(state:'enabled'|'disabled'|'unknown')=>void>=[];
     const readAutostart=()=>{reads++;return new Promise<'enabled'|'disabled'|'unknown'>(resolve=>resolutions.push(resolve));};
     const options={call:async()=>ready,now:()=>time,autostartCacheMs:30000,readAutostart};
@@ -191,4 +193,104 @@ test('actual productionCall uses caller authentication and enforces bounded tray
     assert.equal((await getTrayStatus(f.dir,version)).state,'ready');assert.equal(requests,1);
     hang=true;const began=performance.now();const timeout=await getTrayStatus(f.dir,version);assert.equal(timeout.state,'unknown');assert.equal(timeout.inflight_count,null);assert.ok(performance.now()-began<4500);
   }finally {server?.closeAllConnections();if(server)await new Promise<void>(resolve=>server!.close(()=>resolve()));f.close();}
+});
+
+test('subscription projection distinguishes expiry, missing routes and platform renewal without caching stale conclusions',async()=>{
+  const f=fixture();try {
+    let time=Date.now();
+    const snapshot=(expires:number,active=true)=>({...ready,active_subscription_count:active?1:0,subscriptions:[{id:subscriptionId,active,expires_at:new Date(expires).toISOString()}]});
+    let observed=snapshot(time+7200001);
+    const options={now:()=>time,call:async()=>observed,readAutostart:()=> 'disabled' as const};
+    const valid=await getTrayStatus(f.dir,version,options);
+    assert.equal(valid.subscription.state,'valid');assert.equal(valid.tone,'green');assert.equal(valid.subscription.id,subscriptionId);
+    time++;
+    const expiring=await getTrayStatus(f.dir,version,options);
+    assert.equal(expiring.subscription.state,'expiring');assert.equal(expiring.state,'ready');assert.equal(expiring.tone,'amber');assert.equal(expiring.control,'stop');
+    time+=7200000;
+    const expired=await getTrayStatus(f.dir,version,options);
+    assert.equal(expired.subscription.state,'expired');assert.equal(expired.subscription.active_count,0);assert.equal(expired.state,'disconnected');
+    observed=snapshot(time+86400000);
+    assert.equal((await getTrayStatus(f.dir,version,options)).subscription.state,'valid','a current platform renewal restores readiness');
+    observed={...ready,active_subscription_count:0,subscriptions:[]};
+    const missing=await getTrayStatus(f.dir,version,options);
+    assert.deepEqual(missing.subscription,{state:'missing',active_count:0,id:null,expires_at:null});assert.equal(missing.state,'disconnected');
+    const failed=await getTrayStatus(f.dir,version,{...options,call:async()=>{throw new ProbeError('local_service_unreachable');}});
+    assert.deepEqual(failed.subscription,unknownTraySubscription());assert.equal(failed.state,'unknown');
+  }finally{f.close();}
+});
+
+test('subscription projection validates counts and dates, strips secrets and never treats a legacy count as ready',async()=>{
+  const f=fixture();try {
+    const time=Date.now(),expires_at=new Date(time+86400000).toISOString();
+    const row={id:subscriptionId,active:true,expires_at};
+    for(const observed of [
+      {...ready,subscriptions:undefined},
+      {...ready,subscriptions:null},
+      {...ready,active_subscription_count:-1},
+      {...ready,active_subscription_count:2},
+      {...ready,active_subscription_count:'1'},
+      {...ready,subscriptions:[{...row,active:'true'}]},
+      {...ready,subscriptions:[{...row,expires_at:'PRIVATE_DATE'}]},
+      {...ready,subscriptions:[{...row,expires_at:'2026-02-31T00:00:00Z'}]},
+      {...ready,subscriptions:[{...row,expires_at:'2026-10-28T02:30:00+00:00'}]},
+    ]) {
+      const actual=await getTrayStatus(f.dir,version,{now:()=>time,call:async()=>observed,readAutostart:()=> 'disabled'});
+      assert.deepEqual(actual.subscription,unknownTraySubscription());assert.notEqual(actual.tone,'green');assert.equal(actual.dot,'订阅待确认');
+    }
+    const privateRow={...row,id:'PRIVATE_ID',url:'PRIVATE_CALLBACK',secret:'PRIVATE_SECRET',previous_secret:'PRIVATE_OLD_SECRET'};
+    const actual=await getTrayStatus(f.dir,version,{now:()=>time,call:async()=>({...ready,subscriptions:[privateRow]}),readAutostart:()=> 'disabled'});
+    assert.deepEqual(actual.subscription,unknownTraySubscription());assert.notEqual(actual.tone,'green');assert(!JSON.stringify(actual).includes('PRIVATE'));
+    const safe=await getTrayStatus(f.dir,version,{now:()=>time,call:async()=>({...ready,subscriptions:[{...privateRow,id:subscriptionId}]}),readAutostart:()=> 'disabled'});
+    assert.equal(safe.subscription.state,'valid');assert(!JSON.stringify(safe).includes('PRIVATE'));
+    for(const diagnostics of ['unavailable','PRIVATE_DIAGNOSTICS']) {
+      const unavailable=await getTrayStatus(f.dir,version,{now:()=>time,call:async()=>({...ready,diagnostics,subscriptions:[row]}),readAutostart:()=> 'disabled'});
+      assert.deepEqual(unavailable.subscription,unknownTraySubscription());
+    }
+  }finally{f.close();}
+});
+
+test('pure subscription projection uses earliest active expiry and handles a response crossing its deadline',()=>{
+  const now=Date.now(),id2='sub_'+'b'.repeat(40);
+  const rows=[{id:subscriptionId,active:true,expires_at:new Date(now+86400000).toISOString()},{id:id2,active:true,expires_at:new Date(now+60000).toISOString()}];
+  assert.deepEqual(projectTraySubscription(rows,2,now),{state:'expiring',active_count:2,id:id2,expires_at:rows[1]!.expires_at});
+  assert.equal(projectTraySubscription(rows,2,now+86400000).state,'expired');
+  assert.equal(projectTraySubscription([{...rows[0],active:false}],0,now).state,'missing','a stopped subscription is not a live route');
+  assert.equal(projectTraySubscription([{...rows[0],active:false}],0,now+86400000).state,'expired');
+  const old={id:subscriptionId,active:false,expires_at:new Date(now-86400000).toISOString()};
+  const latest={id:id2,active:false,expires_at:new Date(now+60000).toISOString()};
+  assert.deepEqual(projectTraySubscription([old,latest],0,now),{state:'missing',active_count:0,id:null,expires_at:null},'a newer stopped lease is not attributed to an old expired record');
+  assert.equal(projectTraySubscription([old,latest],0,now+60000).id,id2);
+});
+
+test('data binding separates cloned instances with frozen ordinary and extended Windows path vectors',async()=>{
+  const a=fixture(),b=fixture();try {
+    const options={call:async()=>ready,readAutostart:()=> 'disabled' as const};
+    const first=await getTrayStatus(a.dir,version,options),clone=await getTrayStatus(b.dir,version,options);
+    assert.equal(first.instance_id,clone.instance_id);assert.match(first.data_binding!,/^[a-f0-9]{64}$/);assert.notEqual(first.data_binding,clone.data_binding);
+    assert.equal(first.data_binding,trayDataBinding(a.dir,a.config.instance_id));assert(!JSON.stringify(first).includes(a.dir));
+    const instance=a.config.instance_id;
+    // Frozen cross-language vectors for the UUID above and the C# tray fixture.
+    const vectors:Array<[string,string[]]>=[
+      ['a9fbfe16db93cffde6738e1cc9e54c4b33febc2486bba254b6315c6722b36f90',['C:\\Example\\Data','c:/example/data/','\\\\?\\C:\\Example\\Data\\']],
+      ['23fab878822509ff5b911f1c4699cd4d54fcf23a492507b4cc42eb4b3ab5a838',['\\\\server\\share\\data','//SERVER/SHARE/data/','\\\\?\\UNC\\server\\share\\data\\']],
+      ['8dce214756934056f249763b2dc52ee14f673e8d22417ee2186759ed8ff2f00f',['C:\\','c:/','\\\\?\\C:\\']],
+      ['d787daf89c82d2114ba1632651fb89b061a7308a42998fa829b39d7ecd64dbc8',['C:\\Example\\Clone']],
+    ];
+    for(const [expected,paths] of vectors)for(const path of paths)assert.equal(trayDataBinding(path,instance.toUpperCase(),'win32'),expected,path);
+    for(const path of ['\\\\.\\C:\\Data','\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1','\\\\?\\Volume{11111111-1111-4111-8111-111111111111}\\','\\\\?\\C:relative','\\\\?\\UNC\\server'])assert.throws(()=>trayDataBinding(path,instance,'win32'),/unsupported_data_path/);
+    writeFileSync(join(a.dir,'config.json'),'{}');
+    const invalid=await getTrayStatus(a.dir,version,options);
+    assert.equal(invalid.data_binding,null);assert.deepEqual(invalid.subscription,unknownTraySubscription());
+  }finally{a.close();b.close();}
+});
+
+test('subscription checks only project one supplied snapshot and preserve fixture bytes',async()=>{
+  const f=fixture();try {
+    const names=['config.json','service.lock','supervisor.lock','supervisor-state.json'];
+    const before=names.map(name=>readFileSync(join(f.dir,name),'utf8'));
+    let calls=0;
+    const result=await getTrayStatus(f.dir,version,{readAutostart:()=> 'disabled',call:async()=>{calls++;return ready;}});
+    assert.equal(result.subscription.state,'valid');assert.equal(calls,1);
+    assert.deepEqual(names.map(name=>readFileSync(join(f.dir,name),'utf8')),before);
+  }finally{f.close();}
 });

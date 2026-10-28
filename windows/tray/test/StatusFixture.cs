@@ -27,6 +27,8 @@ internal static class StatusHarness
     {
         return new Dictionary<string, object> {
             { "schema", 1 }, { "instance_id", Instance }, { "installed_version", version }, { "service_version", version }, { "state", "ready" },
+            { "data_binding", clientType.GetMethod("DataBinding").Invoke(null, new object[] { data, Instance }) },
+            { "subscription", new { state = "valid", active_count = 1, id = "synthetic-subscription", expires_at = DateTimeOffset.UtcNow.AddHours(4).ToString("o") } },
             { "tone", "green" }, { "title", "连接就绪" }, { "reason", "连接检查" }, { "service", "响应正常" }, { "cloud", "已连接" }, { "dot", "订阅有效" },
             { "control", "stop" }, { "autostart", "unknown" }, { "checked_at", DateTimeOffset.UtcNow.ToString("o") },
             { "task_counts", new Dictionary<string, int>() }, { "inflight_count", 0 }, { "error", null }
@@ -77,6 +79,20 @@ internal static class StatusHarness
             clientType = assembly.GetType("CodexDotsBridge.Tray.StatusClient");
             version = (string)assembly.GetType("CodexDotsBridge.Tray.Program").GetField("Version").GetValue(null);
             client = Activator.CreateInstance(clientType, BindingFlags.Public | BindingFlags.Instance, null, new object[] { root, data }, null);
+            Func<string, string> binding = delegate(string path) { return (string)clientType.GetMethod("DataBinding").Invoke(null, new object[] {path, Instance}); };
+            Assert(binding(@"C:\Example\Data") == binding("c:/example/data/"), "case_slash_alias_binding_mismatch");
+            Assert(binding(@"C:\Example\Data") == binding(@"\\?\C:\Example\Data\"), "extended_drive_alias_binding_mismatch");
+            Assert(binding(@"\\server\share\data") == binding(@"\\?\UNC\server\share\data\"), "extended_unc_alias_binding_mismatch");
+            Assert(binding(@"C:\") == binding("c:/"), "volume_root_binding_mismatch");
+            Assert(binding(@"C:\Example\Data") != binding(@"C:\Example\Clone"), "same_instance_clone_binding_collided");
+            Assert(binding(@"C:\Example\Data") == "a9fbfe16db93cffde6738e1cc9e54c4b33febc2486bba254b6315c6722b36f90", "drive_binding_hash_vector_changed");
+            Assert(binding(@"\\server\share\data") == "23fab878822509ff5b911f1c4699cd4d54fcf23a492507b4cc42eb4b3ab5a838", "unc_binding_hash_vector_changed");
+            Assert(binding(@"C:\") == "8dce214756934056f249763b2dc52ee14f673e8d22417ee2186759ed8ff2f00f", "root_binding_hash_vector_changed");
+            foreach (string path in new string[] { @"\\.\C:\Example\Data", @"\\?\Volume{11111111-1111-4111-8111-111111111111}\", @"\\?\GLOBALROOT\Device\HarddiskVolume1\" })
+            {
+                bool rejected = false; try { binding(path); } catch (TargetInvocationException error) { rejected = error.InnerException is FormatException; }
+                Assert(rejected, "device_object_binding_accepted");
+            }
             int pid = Process.GetCurrentProcess().Id;
             Write("supervisor-state.json", new { owner = "fixture-supervisor", pid = pid, phase = "running" });
             Write("supervisor.lock", new { owner = "fixture-supervisor", pid = pid });
@@ -97,6 +113,8 @@ internal static class StatusHarness
                 Assert(Error(result) == null && (string)Output(result)["waiting_reason"] == waiting, "task_waiting_reason_lost");
             }
             Assert(Error(Exchange(delegate { var value = Projection(); value["instance_id"] = Guid.NewGuid().ToString(); return Json.Serialize(value); })) == "service_identity_unverified", "foreign_instance_accepted");
+            Assert(Error(Exchange(delegate { var value = Projection(); value["data_binding"] = new string('0', 64); return Json.Serialize(value); })) == "data_binding_mismatch", "other_database_clone_accepted");
+            Assert(Error(Exchange(delegate { var value = Projection(); value.Remove("data_binding"); return Json.Serialize(value); })) == "subscription_projection_upgrade_required", "legacy_projection_called_expired");
             Assert(Error(Exchange(delegate { var value = Projection(); value["checked_at"] = DateTimeOffset.UtcNow.AddMinutes(-2).ToString("o"); return Json.Serialize(value); })) != null, "stale_projection_accepted");
             Assert(Error(Exchange(delegate { return new string(' ', 131073); })) != null, "unbounded_projection_accepted");
             Assert(Error(Exchange(delegate { return Json.Serialize(Projection()); }, 302)) != null, "redirect_accepted");

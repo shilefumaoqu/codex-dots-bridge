@@ -6,13 +6,14 @@ import { safePath } from './maintenance.js';
 import { ProbeError } from './store.js';
 import { readTrayAutostartAsync, type AutostartState } from './tray-autostart.js';
 import { readRecentStartupFailure } from './startup-diagnostics.js';
+import { projectTraySubscription, trayDataBinding, unknownTraySubscription, type TraySubscription } from './tray-subscription.js';
 
 export type TrayState='ready'|'starting'|'stopping'|'stop_unconfirmed'|'stopped'|'setup'|'disconnected'|'unknown'|'failed'|'mismatch';
 export interface TrayStatus {
   schema:1;instance_id:string|null;installed_version:string;service_version:string|null;state:TrayState;tone:'green'|'amber'|'red'|'gray';
   title:string;reason:string;service:string;cloud:string;dot:string;control:'start'|'stop'|'disabled';
   autostart:AutostartState;autostart_checked_at:string|null;autostart_stale:boolean;autostart_refreshing:boolean;checked_at:string;task_counts:Record<string,number>;inflight_count:number|null;error:string|null;
-  waiting_reason:string|null;last_business_at:string|null;
+  waiting_reason:string|null;last_business_at:string|null;data_binding:string|null;subscription:TraySubscription;
 }
 export interface TrayStatusOptions {
   call?:(dir:string,name:'dots_status',args:unknown,options:{timeoutMs:number})=>Promise<unknown>;
@@ -94,7 +95,7 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
   const now=options.now??Date.now;
   const autostart=await autostartStatus(dir,now(),options);
   const result:TrayStatus={schema:1,instance_id:null,installed_version:version(installedVersion)??'unknown',service_version:null,state:'unknown',tone:'amber',title:'状态未知',reason:'暂时无法核验当前服务状态',
-    service:'待确认',cloud:'待确认',dot:'待确认',control:'disabled',autostart:autostart.state,autostart_checked_at:autostart.at===null?null:new Date(autostart.at).toISOString(),autostart_stale:autostart.stale,autostart_refreshing:autostart.refreshing,checked_at:new Date(now()).toISOString(),task_counts:{},inflight_count:null,error:null,waiting_reason:null,last_business_at:null};
+    service:'待确认',cloud:'待确认',dot:'待确认',control:'disabled',autostart:autostart.state,autostart_checked_at:autostart.at===null?null:new Date(autostart.at).toISOString(),autostart_stale:autostart.stale,autostart_refreshing:autostart.refreshing,checked_at:new Date(now()).toISOString(),task_counts:{},inflight_count:null,error:null,waiting_reason:null,last_business_at:null,data_binding:null,subscription:unknownTraySubscription()};
   function state(next:TrayState,control:TrayStatus['control']='disabled') {result.state=next;[result.tone,result.title,result.reason]=labels[next];result.control=control;return result;}
   function withStartupFailure() {
     if(result.state==='failed'||result.state==='unknown') {
@@ -112,6 +113,7 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
   try {
     safePath(dir);safePath(join(dir,'config.json'));config=readProductionConfig(dir);
     result.instance_id=config.instance_id;
+    result.data_binding=trayDataBinding(dir,config.instance_id);
     hint=localJson(dir,'supervisor-state.json');lock=localJson(dir,'supervisor.lock');serviceLock=localJson(dir,'service.lock');
     stop=localJson(dir,'supervisor.stop');oldStop=!!stop&&now()-lstatSync(join(dir,'supervisor.stop')).mtimeMs>35000;
     if(hint&&(typeof hint.owner!=='string'||!Number.isSafeInteger(hint.pid)||Number(hint.pid)<1))throw new ProbeError('tray_local_state_invalid');
@@ -178,7 +180,13 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
   if(observed.tunnel_configured===false){result.cloud='未配置';result.dot='未连接';return state('setup',control);}
   const cloudReady=observed.tunnel_configured===true&&observed.tunnel_health==='ready'&&observed.tunnel==='running'&&(observed.tunnel_connection===undefined||observed.tunnel_connection==='ready');
   result.cloud=cloudReady?'已连接':observed.tunnel_connection==='auth_required'?'待授权':observed.tunnel_connection==='starting'?'正在连接':observed.tunnel_connection==='unknown'||observed.tunnel_health==='unknown'?'待确认':'未连接';
-  const dotReady=Number.isSafeInteger(observed.active_subscription_count)&&Number(observed.active_subscription_count)>0;
-  result.dot=dotReady?'订阅有效':'无有效订阅';
-  return state(cloudReady&&dotReady?'ready':'disconnected',control);
+  const checkedAt=now();result.checked_at=new Date(checkedAt).toISOString();
+  result.subscription=projectTraySubscription(observed.subscriptions,observed.active_subscription_count,checkedAt);
+  const dotReady=result.subscription.state==='valid'||result.subscription.state==='expiring';
+  result.dot=result.subscription.state==='valid'?'订阅有效':result.subscription.state==='expiring'?'订阅即将到期':result.subscription.state==='expired'?'订阅已失效':result.subscription.state==='missing'?'无有效订阅':'订阅待确认';
+  state(cloudReady&&dotReady?'ready':'disconnected',control);
+  if(cloudReady&&result.subscription.state==='expiring') {
+    result.tone='amber';result.title='订阅即将到期';result.reason='订阅将在两小时内到期，等待平台自动续订';
+  }
+  return result;
 }
