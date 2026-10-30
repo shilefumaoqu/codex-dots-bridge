@@ -1,6 +1,14 @@
-# 0.3.0-alpha.1：候选验收与迁移 / Candidate acceptance and migration
+# 0.3.0-alpha.2：预发布验收与迁移 / Pre-release acceptance and migration
 
-记录日期：2026-10-26。基线为 `0.2.0-alpha.32 / 126f09e`。这是候选构建时的验收记录，尚未生产部署；最终发布状态以对应 Release 及其附带验收报告为准。Windows CI、本机隔离安装、真实 Dot 和 72 小时运行分别记录，不能互相替代。历史版本证据见 [CHANGELOG.md](CHANGELOG.md)。
+记录日期：2026-10-30。本版在 `0.3.0-alpha.1 / 716f829` 上修复 schema 2 重启恢复。最终提交、Windows 成品、本机安装和真实 Dot 验收分别记录，不能互相替代。历史版本证据见 [CHANGELOG.md](CHANGELOG.md)。
+
+## alpha.2 重启恢复修复
+
+恢复脚本此前只接受 schema 1。正式迁移后的数据目录是受支持的 schema 2，因此 Windows 重启后的旧锁恢复在存活检查前返回 `supervisor_recovery_unowned_data`。alpha.2 只将该白名单扩为 schema 1 和 2；owner、实例 UUID、文件/目录归属、端点、进程与 PID 复用判断、锁身份和最终元数据复核均保留。
+
+Windows 定向测试覆盖合法 schema 1/2、未知 schema、错误 owner 和错误实例 UUID。既有恢复集成测试使用正式迁移与激活后的 schema 2，真实启动 dist 服务并核对 health 和任务保留。修复版 Setup 已在原数据目录执行一次，恢复原实例、原 Tunnel 和自动 Tray；任务、请求、凭据和三份可选配置通过一致性记录核对，历史 uncertain 保留。
+
+本版仍为实验性预发布。真实长链路、所有进程创建计数和完整 72 小时稳定性仍按独立记录判断；Events HTTP 200 后零领取与历史 RPC 超时原因不会被本版修复自动关闭。
 
 ## 候选证据边界
 
@@ -151,6 +159,6 @@ Windows CI 已接入打包后的托盘 HTTP 和刷新生命周期测试。候选
 
 ## English
 
-0.3.0-alpha.1 is an unreleased source candidate based on alpha.32. Isolated fixtures and synthetic SQLite measurements cover only exercised code paths. They do not prove Windows artifacts, live round trips, client catalog adoption, native recovery or 72-hour stability. HTTP 200 events without pickup remain a separate unresolved blocker.
+0.3.0-alpha.2 is an experimental pre-release based on alpha.1. It fixes reboot recovery for supported schema 2 data directories while retaining all ownership, process, endpoint and lock checks. Windows CI, the packaged artifact and isolated recovery tests cover the stated changes; they do not complete extended live-chain acceptance or 72-hour stability. HTTP 200 events without pickup remain a separate unresolved blocker.
 
 Schema 2 migration requires a stopped, idle instance, consistent backup, maintenance gating, transactional verification and activation after installation commits. Do not run alpha.32 against an upgraded database or restore old snapshots over new business writes. Measure full and compact separately. Historical release evidence is in the changelog.

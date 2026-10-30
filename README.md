@@ -7,18 +7,18 @@
 <p align="center">把任务交给你的 Dot，在 Codex 中跟进过程并取回结果。</p>
 
 <p align="center">
-  <a href="README.en.md">English</a> · 0.3.0-alpha.1 源码候选（未发布） · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.en.md">English</a> · 0.3.0-alpha.2 预发布 · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.32/Codex-Dots-Bridge-0.2.0-alpha.32-Setup.exe"><strong>下载已发布的 alpha.32 Windows 安装程序</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.3.0-alpha.2/Codex-Dots-Bridge-0.3.0-alpha.2-Setup.exe"><strong>下载 alpha.2 Windows 安装程序</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">Windows ZIP、SHA256 校验文件与完整发布说明</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.3.0-alpha.2">Windows ZIP、SHA256 校验文件与完整发布说明</a>
 </p>
 
-> **当前源码：0.3.0-alpha.1，未发布、未部署的存储升级候选。** 上方下载仍指向已发布的 0.2.0-alpha.32；它不包含本候选改动。本候选增加接纳保护、准确回合后台取回、compact 回执、索引化任务存储、共享读取预算和托盘轻量查询。迁移后的数据库不能由 alpha.32 打开，须按[迁移与验收说明](ACCEPTANCE.md)操作。Events HTTP 200 后零领取仍是独立阻塞项，程序就绪不等于消息往返成功。
+> **当前版本：0.3.0-alpha.2，实验性预发布。** 本版在 alpha.1 基线上修复 schema 2 数据目录在 Windows 重启后的恢复拒绝，并增加真实 Windows 恢复回归。迁移后的数据库不能由 0.2.0-alpha.32 打开，须按[迁移与验收说明](ACCEPTANCE.md)操作。Events HTTP 200 后零领取、真实长链路和 72 小时稳定性仍单独记录；程序就绪不等于消息往返成功。
 
 Codex Dots Bridge 是连接 Codex 与你已有 Dot 的协作插件。派出一项文本任务后，可以沿同一任务查看进度、回答澄清、补充要求并取回结果。
 

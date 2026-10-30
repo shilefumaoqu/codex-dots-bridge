@@ -22,16 +22,17 @@ $boot = Get-DotsBootUtc
 $old = $boot.AddMinutes(-5)
 $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
 $listener.Start(); $port = $listener.LocalEndpoint.Port; $listener.Stop()
-function Fixture([string]$Name) {
+function Fixture([string]$Name, [int]$SchemaVersion=1) {
     $dir = Join-Path $root $Name
     [IO.Directory]::CreateDirectory($dir) | Out-Null
     $owner = [Guid]::NewGuid().ToString()
     $files = @{
-        'config.json' = @{owner='codex-dots-bridge';schema_version=1;instance_id=[Guid]::NewGuid().ToString();endpoint="http://127.0.0.1:$port/"}
+        'config.json' = @{owner='codex-dots-bridge';schema_version=$SchemaVersion;instance_id=[Guid]::NewGuid().ToString();endpoint="http://127.0.0.1:$port/"}
         'supervisor-state.json' = @{owner=$owner;pid=2147483000;bridge_pid=2147483001;phase='running'}
         'supervisor.lock' = @{owner=$owner;pid=2147483000}
         'service.lock' = @{owner=[Guid]::NewGuid().ToString();pid=2147483001}
     }
+    if ($SchemaVersion -eq 2) { $files['config.json'].storage = @{database_version=2;migration_id=[Guid]::NewGuid().ToString();phase='ready'} }
     foreach ($name in $files.Keys) {
         $file = Join-Path $dir $name
         [IO.File]::WriteAllText($file,($files[$name] | ConvertTo-Json -Compress))
@@ -43,8 +44,8 @@ function Fixture([string]$Name) {
     [IO.File]::WriteAllText((Join-Path $dir 'worker.key'),'do not open credential')
     return $dir
 }
-function SameBootFixture([string]$Name) {
-    $dir = Fixture $Name
+function SameBootFixture([string]$Name, [int]$SchemaVersion=1) {
+    $dir = Fixture $Name $SchemaVersion
     $dated = [DateTime]::UtcNow.AddSeconds(-15)
     foreach ($name in @('supervisor-state.json','service.lock','supervisor.lock')) {
         [IO.File]::SetCreationTimeUtc((Join-Path $dir $name),$dated)
@@ -53,6 +54,34 @@ function SameBootFixture([string]$Name) {
     return $dir
 }
 try {
+    foreach ($sameBoot in @($false,$true)) {
+        $dir = if ($sameBoot) { SameBootFixture 'schema2-same-boot' 2 } else { Fixture 'schema2-prior-boot' 2 }
+        $retained = @{}
+        foreach ($name in @('config.json','supervisor-state.json','tasks.sqlite','worker.key')) { $retained[$name] = [IO.File]::ReadAllText((Join-Path $dir $name)) }
+        $result = Invoke-DotsRebootRecovery $dir
+        $expected = if ($sameBoot) { 'same_boot_locks_recovered' } else { 'prior_boot_locks_recovered' }
+        Assert ($result.recovered -and $result.clearPreviousState -and $result.reason -eq $expected -and $result.removed.Count -eq 2) ('schema 2 recovers exact old locks: '+$result.reason)
+        Assert (-not [IO.File]::Exists((Join-Path $dir 'service.lock')) -and -not [IO.File]::Exists((Join-Path $dir 'supervisor.lock'))) 'schema 2 removes both proven stale locks'
+        foreach ($name in $retained.Keys) { Assert ([IO.File]::ReadAllText((Join-Path $dir $name)) -ceq $retained[$name]) ('schema 2 preserves '+$name) }
+    }
+    foreach ($invalid in @(
+        @{name='unknown-schema';version=3;field='schema_version';value=3},
+        @{name='owner-v1';version=1;field='owner';value='foreign-owner'},
+        @{name='owner-v2';version=2;field='owner';value='foreign-owner'},
+        @{name='uuid-v1';version=1;field='instance_id';value='not-a-guid'},
+        @{name='uuid-v2';version=2;field='instance_id';value='not-a-guid'}
+    )) {
+        $dir = Fixture $invalid.name $invalid.version
+        $configPath = Join-Path $dir 'config.json'
+        $config = [IO.File]::ReadAllText($configPath) | ConvertFrom-Json
+        $config.($invalid.field) = $invalid.value
+        [IO.File]::WriteAllText($configPath,($config | ConvertTo-Json -Depth 4 -Compress))
+        $retained = @{}
+        foreach ($name in @('config.json','supervisor-state.json','service.lock','supervisor.lock','tasks.sqlite','worker.key')) { $retained[$name] = [IO.File]::ReadAllText((Join-Path $dir $name)) }
+        $result = Invoke-DotsRebootRecovery $dir
+        Assert (-not $result.recovered -and -not $result.clearPreviousState -and $result.reason -eq 'unowned_data' -and $result.removed.Count -eq 0) ('invalid config is still refused: '+$invalid.name)
+        foreach ($name in $retained.Keys) { Assert ([IO.File]::Exists((Join-Path $dir $name)) -and [IO.File]::ReadAllText((Join-Path $dir $name)) -ceq $retained[$name]) ('invalid config preserves '+$name) }
+    }
     $dir = Fixture 'complete'
     $state = [IO.File]::ReadAllText((Join-Path $dir 'supervisor-state.json'))
     $result = Invoke-DotsRebootRecovery $dir

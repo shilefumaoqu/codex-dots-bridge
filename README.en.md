@@ -7,18 +7,18 @@
 <p align="center">Hand work to your Dot, follow it in Codex, and retrieve the result.</p>
 
 <p align="center">
-  <a href="README.md">简体中文</a> · 0.3.0-alpha.1 source candidate (unreleased) · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.md">简体中文</a> · 0.3.0-alpha.2 pre-release · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.32/Codex-Dots-Bridge-0.2.0-alpha.32-Setup.exe"><strong>Download the released alpha.32 Windows installer</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.3.0-alpha.2/Codex-Dots-Bridge-0.3.0-alpha.2-Setup.exe"><strong>Download the alpha.2 Windows installer</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">Windows ZIP, SHA256 files and full release notes</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.3.0-alpha.2">Windows ZIP, SHA256 files and full release notes</a>
 </p>
 
-> **Current source: 0.3.0-alpha.1, an unreleased, undeployed storage upgrade candidate.** Downloads above remain the released 0.2.0-alpha.32 and do not include these changes. The candidate adds admission safeguards, background retrieval of exact turn replies, compact receipts, indexed task storage, shared read limits and lightweight tray queries. Alpha.32 cannot open migrated databases; follow the [migration and acceptance notes](ACCEPTANCE.md). Events accepted with HTTP 200 but never claimed remain a separate blocker. A ready service does not prove a message round trip.
+> **Current version: 0.3.0-alpha.2, an experimental pre-release.** This release fixes the Windows reboot-recovery rejection for schema 2 data directories and adds real Windows recovery regressions. Alpha 0.2.0-alpha.32 cannot open migrated databases; follow the [migration and acceptance notes](ACCEPTANCE.md). Events accepted with HTTP 200 but never claimed, extended live chains and 72-hour stability remain separately tracked; a ready service does not prove a message round trip.
 
 Codex Dots Bridge connects Codex to your existing Dot. Delegate a text task, then use the same task ID to follow progress, answer questions, add requirements and retrieve the result.
 
