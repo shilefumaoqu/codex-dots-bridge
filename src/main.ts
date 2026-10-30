@@ -4,20 +4,23 @@ import { existsSync, readFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
-import { TaskStore } from './task-store.js';
+import { TaskStore, migrateTaskStorage } from './task-store.js';
 import { DesktopEchoService } from './desktop-echo.js';
 import { DesktopConversationsService } from './desktop-conversations.js';
-import { ContextService } from './context-service.js';
+import { ContextService, migrateContextStorage } from './context-service.js';
 import { observeDesktopContextState } from './desktop-echo-ipc.js';
 import { configureDesktopAccess, validateDesktopAccess } from './desktop-conversation-settings.js';
 import { ProbeError } from './store.js';
 import { ProbeEvents } from './events.js';
 import { acquireLock, defaultProductionDataDir, initProduction, protectProductionDirectory, readProductionConfig, readOwnerNotificationConfig, writeProductionConfig, readToken } from './runtime.js';
-import { VERSION, callerSchemas, createProductionService, productionCall, resolveSchema, startProductionCaller, type CallerName } from './bridge.js';
+import { VERSION, diagnosticStatus, callerSchemas, createProductionService, productionCall, resolveSchema, startProductionCaller, type CallerName } from './bridge.js';
 import { installCodex, uninstallCodex, backupData, restoreData, statusData, doctorData, connectionDiagnosticsData, assertStopped, safePath } from './maintenance.js';
 import { runSupervisor, startSupervisor, stopSupervisor, supervisorStatus } from './supervisor.js';
 import { getTrayStatus } from './tray-status.js';
 import { setTrayAutostart } from './tray-autostart.js';
+import { activateStorage, assertStorageServingAllowed, migrateStorage, preflightStorageMigration, rollbackStorageMigration, SUPPORTED_STORAGE_VERSION } from './storage-migration.js';
+import { boundedArguments, requestFailure } from './request-policy.js';
+import { migrateDesktopSnapshotStorage } from './desktop-snapshot-storage.js';
 
 const {values,positionals}=parseArgs({allowPositionals:true,options:{
   'data-dir':{type:'string'},'request':{type:'string'},'task':{type:'string'},'title':{type:'string'},'text':{type:'string'},
@@ -30,6 +33,7 @@ const {values,positionals}=parseArgs({allowPositionals:true,options:{
   'upgrade-registration':{type:'boolean'},'startup-launcher':{type:'string'},'startup-link-content':{type:'string'},'preserve-autostart':{type:'boolean'},'registration-root':{type:'string'},
   'foreground':{type:'boolean'},'supervisor':{type:'boolean'},'start':{type:'boolean'},'stop':{type:'boolean'},
   'tray':{type:'boolean'},'autostart-state':{type:'string'},
+  'migration-id':{type:'string'},'response-mode':{type:'string'},
   'to':{type:'string'},'from':{type:'string'},'help':{type:'boolean'},'version':{type:'boolean'},
 }});
 const dataDir=resolve(values['data-dir']??defaultProductionDataDir());
@@ -41,13 +45,17 @@ const numeric=(name:'hours'|'after'|'timeout'|'limit')=>values[name]===undefined
 const fromRequest=()=>values.request?JSON.parse(readFileSync(resolve(values.request),'utf8')):undefined;
 async function foreground() {
   protectProductionDirectory(dataDir);
-  const config=readProductionConfig(dataDir),release=acquireLock(dataDir);
+  const release=acquireLock(dataDir);
   let store:TaskStore|undefined;
   let service:ReturnType<typeof createProductionService>|undefined;
   let desktop:DesktopEchoService|undefined;
   let conversations:DesktopConversationsService|undefined;
   let contexts:ContextService|undefined;
   try {
+    // Ownership must cover the gate read; otherwise a concurrent migration could
+    // finish between verification and lock acquisition and expose maintenance DBs.
+    assertStorageServingAllowed(dataDir);
+    const config=readProductionConfig(dataDir);
     store=new TaskStore(join(dataDir,'tasks.sqlite'));
     try {
       const desktopConfig=join(dataDir,'desktop-echo.json');
@@ -57,12 +65,13 @@ async function foreground() {
       const conversationConfig=join(dataDir,'desktop-conversations.json');
       const conversationStore=store;
       if(existsSync(conversationConfig)) conversations=new DesktopConversationsService(store.db,JSON.parse(readFileSync(conversationConfig,'utf8')),{
+        normalizedStorage:config.schema_version===2,
         onIpcDiagnostic:(requestId,event)=>conversationStore.audit('desktop_ipc_failure',null,{request_id:requestId,...event}),
       });
     } catch { process.stderr.write(JSON.stringify({service:'codex-dots-bridge',code:'desktop_conversations_config_invalid'})+'\n'); }
     try {
       const contextConfig=join(dataDir,'desktop-conversations.json');
-      if(existsSync(contextConfig)) contexts=new ContextService(store.db,JSON.parse(readFileSync(contextConfig,'utf8')),{observeOwner:observeDesktopContextState});
+      if(existsSync(contextConfig)) contexts=new ContextService(store.db,JSON.parse(readFileSync(contextConfig,'utf8')),{observeOwner:observeDesktopContextState,normalizedStorage:config.schema_version===2});
     } catch { process.stderr.write(JSON.stringify({service:'codex-dots-bridge',code:'context_config_invalid'})+'\n'); }
     const {loadOwnerNotifier,computeNotificationBindingKey}=await import('./owner-notification.js');
     let notificationConfig:ReturnType<typeof readOwnerNotificationConfig>;
@@ -72,8 +81,10 @@ async function foreground() {
     catch {notificationConfig=undefined;process.stderr.write(JSON.stringify({service:'codex-dots-bridge',code:'owner_notification_config_invalid'})+'\n');}
     try {notifier=await loadOwnerNotifier(notificationConfig);}
     catch {process.stderr.write(JSON.stringify({service:'codex-dots-bridge',code:'owner_notifier_unavailable'})+'\n');}
+    const runtimeStatus = async()=>({...await connectionDiagnosticsData(dataDir),...supervisorStatus(dataDir),bridge:'running',desktop_conversations:conversations?.accessStatus??{enabled:false,mode:'disabled',read:false,send:false}});
+    const foregroundStore = store;
     service=createProductionService(store,new ProbeEvents(store,undefined,'tasks'),{caller:readToken(dataDir,'caller'),worker:readToken(dataDir,'worker')},
-      async()=>({...await connectionDiagnosticsData(dataDir),...supervisorStatus(dataDir),bridge:'running',desktop_conversations:conversations?.accessStatus??{enabled:false,mode:'disabled',read:false,send:false}}),
+      runtimeStatus,
       {instanceId:config.instance_id,bindingKey,config:notificationConfig,notifier,readCurrentConfig:()=>{
         const current=readProductionConfig(dataDir);
         if(current.instance_id!==config.instance_id) throw new ProbeError('notification_instance_mismatch');
@@ -81,7 +92,7 @@ async function foreground() {
       },readCurrentBindingKey:()=>{
         const current=readProductionConfig(dataDir),binding=readOwnerNotificationConfig(dataDir);
         return binding?.enabled?computeNotificationBindingKey(current.instance_id,binding):undefined;
-      }},config.instance_id,desktop,conversations,contexts);
+      }},config.instance_id,desktop,conversations,contexts,()=>getTrayStatus(dataDir,VERSION,{autostartCacheMs:30_000,call:async()=>diagnosticStatus(foregroundStore,runtimeStatus,undefined,true)}));
     const endpoint=await service.start();
     writeProductionConfig(dataDir,{...config,endpoint});
     process.stderr.write(JSON.stringify({service:'codex-dots-bridge',version:VERSION,endpoint})+'\n');
@@ -114,6 +125,7 @@ async function setup() {
   }
   if(dataDir===root || dataDir.toLowerCase().startsWith(root.toLowerCase()+'\\') || dataDir.startsWith(root+'/'))throw new ProbeError('data_must_be_outside_source');
   const config=initProduction(dataDir);
+  if(config.schema_version===2&&config.storage.database_version!==SUPPORTED_STORAGE_VERSION)throw new ProbeError('unsupported_storage_version');
   assertStopped(dataDir);
   if(values['desktop-access']!==undefined)validateDesktopAccess(dataDir,values['desktop-access'],values['codex-home']);
   const startupWait=values['tunnel-startup-wait-seconds']===undefined?undefined:z.number().int().min(1).max(300).parse(Number(values['tunnel-startup-wait-seconds']));
@@ -159,14 +171,15 @@ async function tasks() {
     case 'wait': name='dots_wait';args=requested??{task_id:values.task,after_sequence:numeric('after'),timeout_seconds:numeric('timeout')};break;
     default:throw new ProbeError('unknown_tasks_operation');
   }
-  args=callerSchemas[name].parse(args);
+  if(values['response-mode']!==undefined) args={...(args as Record<string,unknown>),response_mode:values['response-mode']};
+  args=callerSchemas[name].parse(boundedArguments(args));
   const result=await productionCall(dataDir,name,args);
   // The default maintenance index omits task input, message and result bodies.
   output(name==='dots_list'?result.map((t:{task_id:string;title:string;status:string;input_revision:number;change_sequence:number})=>({task_id:t.task_id,title:t.title,status:t.status,input_revision:t.input_revision,change_sequence:t.change_sequence})):result);
 }
 try {
   if(values.version)output({name:'codex-dots-bridge',version:VERSION});
-  else if(values.help||!positionals[0])process.stdout.write(`Codex Dots Bridge ${VERSION}\nWindows x64 prerelease; keep P0 evidence separate.\n\nsetup [--tunnel-id ID --organization-id ID --tunnel-client EXE --tunnel-env ENV_FILE] [--tunnel-startup-wait-seconds 1..300] [--autostart]\nsetup --desktop-access off|read|read-send [--codex-home PATH] (service stopped)\nrun [--start | --stop | --foreground]\nstatus [--tray] | doctor\nsetup --autostart-state enabled|disabled (no restart)\ntasks list|get|submit|message|followup|cancel|ack|wait [--request JSON_FILE]\nresolve --request JSON_FILE\nbackup --to PROTECTED_DIRECTORY\nrestore --from BACKUP_DIRECTORY [--data-dir EMPTY_TARGET]\nuninstall [--codex-command NEW_NATIVE_EXE]\n\nAll commands accept --data-dir PATH. stdio and run --supervisor are managed entry points.\nNo command accepts a plaintext Tunnel key. Registration is not proof that Codex loaded the tools.\n`);
+  else if(values.help||!positionals[0])process.stdout.write(`Codex Dots Bridge ${VERSION}\nWindows x64 prerelease; keep P0 evidence separate.\n\nsetup [--tunnel-id ID --organization-id ID --tunnel-client EXE --tunnel-env ENV_FILE] [--tunnel-startup-wait-seconds 1..300] [--autostart]\nsetup --desktop-access off|read|read-send [--codex-home PATH] (service stopped)\nrun [--start | --stop | --foreground]\nstatus [--tray] | doctor\nsetup --autostart-state enabled|disabled (no restart)\ntasks list|get|submit|message|followup|cancel|ack|wait [--request JSON_FILE]\nresolve --request JSON_FILE\nbackup --to PROTECTED_DIRECTORY\nrestore --from BACKUP_DIRECTORY [--data-dir EMPTY_TARGET]\nmigration-preflight\nmigrate-storage --to PROTECTED_BACKUP_DIRECTORY\nactivate-storage --migration-id ID (after installation commit)\nrollback-storage --migration-id ID (only before activation)\nuninstall [--codex-command NEW_NATIVE_EXE]\n\nAll commands accept --data-dir PATH. stdio and run --supervisor are managed entry points.\nNo command accepts a plaintext Tunnel key. Registration is not proof that Codex loaded the tools.\n`);
   else switch(positionals[0]) {
     case 'setup':await setup();break;
     case 'run':
@@ -181,11 +194,26 @@ try {
     case 'tasks':await tasks();break;
     case 'resolve':output(await productionCall(dataDir,'resolve',resolveSchema.parse(fromRequest())));break;
     case 'backup':if(!values.to)throw new ProbeError('backup_destination_required');output(await backupData(dataDir,resolve(values.to)));break;
+    case 'migration-preflight':output(preflightStorageMigration(dataDir));break;
+    case 'migrate-storage':
+      if(!values.to)throw new ProbeError('backup_destination_required');
+      if(!existsSync(join(dataDir,'tasks.sqlite'))) {
+        readProductionConfig(dataDir); assertStopped(dataDir);
+        const release=acquireLock(dataDir);
+        try { new TaskStore(join(dataDir,'tasks.sqlite')).close(); } finally { release(); }
+      }
+      output(await migrateStorage(dataDir,{from:1,to:2,backupDirectory:resolve(values.to),migrate:db=>{migrateTaskStorage(db);migrateContextStorage(db);migrateDesktopSnapshotStorage(db);}}));break;
+    case 'activate-storage':
+      if(!values['migration-id'])throw new ProbeError('migration_identity_required');
+      output(activateStorage(dataDir,values['migration-id']));break;
+    case 'rollback-storage':
+      if(!values['migration-id'])throw new ProbeError('migration_identity_required');
+      output(await rollbackStorageMigration(dataDir,values['migration-id']));break;
     case 'restore':if(!values.from)throw new ProbeError('backup_source_required');output(await restoreData(resolve(values.from),dataDir));break;
     case 'uninstall':await stopSupervisor(dataDir);output(uninstallCodex(dataDir,values['codex-command']));break;
     default:throw new ProbeError('unknown_command');
   }
 } catch(e) {
   const error=e instanceof ProbeError?e.code:e instanceof z.ZodError?'invalid_parameters':(e as NodeJS.ErrnoException).code==='ENOENT'?'required_file_or_command_missing':'bridge_operation_failed';
-  output({error,...(e instanceof z.ZodError?{fields:e.issues.map(i=>i.path.join('.'))}:{} )});process.exitCode=1;
+  output({...requestFailure(e,error).body,...(e instanceof z.ZodError?{fields:e.issues.map(i=>i.path.join('.'))}:{} ),...('activity' in Object(e)?{activity:(e as {activity:unknown}).activity}:{})});process.exitCode=1;
 }

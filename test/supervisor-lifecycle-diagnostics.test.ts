@@ -10,6 +10,14 @@ import { processIsAlive } from '../src/maintenance.js';
 
 const delay=(ms:number)=>new Promise<void>(done=>setTimeout(done,ms));
 async function until(check:()=>boolean){for(let i=0;i<600;i++){if(check())return;await delay(25);}assert.fail('diagnostic fixture timed out');}
+function childHasExited(pid:number):boolean {
+  if(!processIsAlive(pid))return true;
+  // A container's PID 1 may not reap an orphan after the deliberately fatal
+  // supervisor exit. A zombie has exited even though kill(pid, 0) succeeds.
+  if(process.platform!=='linux')return false;
+  try {return /^Z\s/.test(readFileSync(`/proc/${pid}/stat`,'utf8').split(') ').slice(1).join(') '));}
+  catch(error){return (error as NodeJS.ErrnoException).code==='ENOENT';}
+}
 
 for(const failDiagnostic of [false,true])test(`uncaught supervisor diagnostic contains no exception body and preserves fatal exit (I/O fault ${failDiagnostic})`,{timeout:45_000},async()=>{
   const root=mkdtempSync(join(tmpdir(),'dots lifecycle diagnostic ')),dir=join(root,'data');let child:ChildProcess|undefined;
@@ -30,7 +38,7 @@ for(const failDiagnostic of [false,true])test(`uncaught supervisor diagnostic co
     else {assert.equal(state.phase,'failed');assert.equal(state.error,'supervisor_uncaught_exception');assert.equal(state.lifecycle!.at(-1)!.event,'uncaught_exception');}
     // A fatal process exit is not orderly cleanup on Windows. Diagnose it without
     // promising child-lock deletion; strict recovery owns any residual locks.
-    await until(()=>!processIsAlive(state.bridge_pid));
+    await until(()=>childHasExited(state.bridge_pid));
     assert.equal(existsSync(join(dir,'supervisor.lock')),true,'crashed owner locks remain for proven recovery');
   }finally {
     if(child?.exitCode===null)child.kill();

@@ -10,8 +10,11 @@ import { createServer } from 'node:net';
 import { recoverRebootLocks } from '../src/reboot-recovery.js';
 import { initProduction, readProductionConfig, writeProductionConfig } from '../src/runtime.js';
 import { startSupervisor, stopSupervisor } from '../src/supervisor.js';
-import { TaskStore } from '../src/task-store.js';
+import { TaskStore, migrateTaskStorage } from '../src/task-store.js';
 import { processIsAlive } from '../src/maintenance.js';
+import { activateStorage, assertStorageServingAllowed, migrateStorage } from '../src/storage-migration.js';
+import { migrateContextStorage } from '../src/context-service.js';
+import { migrateDesktopSnapshotStorage } from '../src/desktop-snapshot-storage.js';
 
 test('recovery fast paths leave fresh and clean instances untouched',async()=>{
   const dir=mkdtempSync(join(tmpdir(),'dots reboot fast '));
@@ -25,7 +28,43 @@ test('recovery fast paths leave fresh and clean instances untouched',async()=>{
   }finally {rmSync(dir,{recursive:true,force:true});}
 });
 
-test('startSupervisor recovers synthetic prior-boot records and starts real dist service without losing tasks',{skip:process.platform!=='win32',timeout:120_000},async t=>{
+test('Windows recovery helper accepts known schemas and preserves locks for invalid ownership',{skip:process.platform!=='win32',timeout:90_000},async()=>{
+  const root=mkdtempSync(join(tmpdir(),'dots recovery schema ownership '));
+  try {
+    const server=createServer();await new Promise<void>(done=>server.listen(0,'127.0.0.1',done));
+    const port=(server.address() as {port:number}).port;await new Promise<void>(done=>server.close(()=>done()));
+    const cases=[
+      {name:'valid-v1',version:1}, {name:'valid-v2',version:2},
+      {name:'unknown-schema',version:3},
+      {name:'owner-v1',version:1,owner:'foreign-owner'}, {name:'owner-v2',version:2,owner:'foreign-owner'},
+      {name:'uuid-v1',version:1,instance:'not-a-guid'}, {name:'uuid-v2',version:2,instance:'not-a-guid'},
+    ];
+    for(const example of cases) {
+      const dir=join(root,example.name),owner=randomUUID();mkdirSync(dir);
+      const files={
+        'config.json':JSON.stringify({owner:example.owner??'codex-dots-bridge',schema_version:example.version,instance_id:example.instance??randomUUID(),endpoint:`http://127.0.0.1:${port}/`,
+          ...(example.version===2?{storage:{database_version:2,migration_id:randomUUID(),phase:'ready'}}:{})}),
+        'supervisor-state.json':JSON.stringify({owner,pid:2147483000,bridge_pid:2147483001,phase:'running'}),
+        'supervisor.lock':JSON.stringify({owner,pid:2147483000}),
+        'service.lock':JSON.stringify({owner:randomUUID(),pid:2147483001}),
+        'tasks.sqlite':'isolated database sentinel', 'worker.key':'isolated credential sentinel',
+      };
+      for(const [name,body] of Object.entries(files))writeFileSync(join(dir,name),body);
+      const result=await recoverRebootLocks(dir),valid=example.name.startsWith('valid-');
+      assert.equal(result.recovered,valid,`${example.name}: ${result.reason}`);assert.equal(result.clearPreviousState,valid);
+      assert.equal(result.reason,valid?'same_boot_locks_recovered':'unowned_data');
+      assert.deepEqual(result.removed,valid?['service.lock','supervisor.lock']:[]);
+      for(const [name,body] of Object.entries(files)) {
+        if(valid&&name.endsWith('.lock'))assert.equal(existsSync(join(dir,name)),false);
+        else assert.equal(readFileSync(join(dir,name),'utf8'),body,`${example.name} preserves ${name}`);
+      }
+    }
+  }finally {
+    assert.ok(resolve(root).startsWith(resolve(tmpdir())+sep));rmSync(root,{recursive:true,force:true,maxRetries:5,retryDelay:150});
+  }
+});
+
+test('startSupervisor recovers migrated schema 2 prior-boot records and starts real dist service without losing tasks',{skip:process.platform!=='win32',timeout:120_000},async t=>{
   const root=mkdtempSync(join(tmpdir(),'dots reboot supervisor integration ')),dir=join(root,'data');
   const oldOwner=randomUUID(),dataMarker=randomUUID();let started=false;
   // Observe the real helper's safe receipt without mocking its decision or outputs.
@@ -53,6 +92,16 @@ test('startSupervisor recovers synthetic prior-boot records and starts real dist
     const oldPort=(server.address() as {port:number}).port;await new Promise<void>(done=>server.close(()=>done()));
     writeProductionConfig(dir,{...config,endpoint:`http://127.0.0.1:${oldPort}/`});
     const keys={caller:readFileSync(join(dir,'caller.key'),'utf8'),worker:readFileSync(join(dir,'worker.key'),'utf8')};
+    // Use the same migration and activation path as the CLI, before introducing
+    // queued work. A hand-written schema 2 config would not prove serving works.
+    const legacyStore=new TaskStore(join(dir,'tasks.sqlite'));legacyStore.close();
+    const migration=await migrateStorage(dir,{from:1,to:2,backupDirectory:join(root,'migration-backup'),migrate:db=>{
+      migrateTaskStorage(db);migrateContextStorage(db);migrateDesktopSnapshotStorage(db);
+    }});
+    activateStorage(dir,migration.migration_id);assertStorageServingAllowed(dir);
+    const migratedConfig=readProductionConfig(dir);
+    assert.ok(migratedConfig.schema_version===2);
+    assert.equal(migratedConfig.storage.phase,'ready');assert.equal(migratedConfig.storage.migration_id,migration.migration_id);
     const store=new TaskStore(join(dir,'tasks.sqlite'));
     let taskId:string;
     try {
@@ -79,6 +128,8 @@ test('startSupervisor recovers synthetic prior-boot records and starts real dist
     assert.equal(supervisorLock.owner,state.owner);assert.equal(supervisorLock.pid,state.pid);assert.equal(serviceLock.pid,state.bridge_pid);
     const runningConfig=readProductionConfig(dir);
     assert.equal(runningConfig.instance_id,config.instance_id);assert.equal(runningConfig.tunnel,undefined);
+    assert.ok(runningConfig.schema_version===2);
+    assert.deepEqual(runningConfig.storage,migratedConfig.storage);
     const healthResponse=await fetch(new URL('health',runningConfig.endpoint),{signal:AbortSignal.timeout(5000)});
     assert.equal(healthResponse.status,200);
     assert.equal((await healthResponse.json() as {service:string}).service,'codex-dots-bridge');

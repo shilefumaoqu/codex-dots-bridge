@@ -29,6 +29,33 @@ function localFixture(transport: DesktopConversationsTransport, capabilities = {
 }
 async function finish(f: ReturnType<typeof fixture>, request_id = f.request): Promise<DesktopConversationResult> { return f.service.get({ request_id, wait_seconds: 1 }); }
 
+test('schema 2 fixed snapshot paging survives restart without retaining the body in request metadata',async()=>{
+  const context=JSON.stringify({text:'原文🌟'.repeat(30000)});let reads=0;
+  const f=fixture({runSend:noSend,runRead:async()=>{reads++;return {status:'completed',context_json:context,source_complete:false};}},{normalizedStorage:true,readCacheMaxBytes:0,timeoutMs:1000});
+  let reopened:DesktopConversationsService|undefined;
+  try{
+    f.service.read({request_id:f.request,thread_id:f.thread});const first=await finish(f);
+    const stored=f.db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id=?').get(f.request) as {data:string};
+    assert.equal(JSON.parse(stored.data).snapshot_storage_version,2);assert.equal(JSON.parse(stored.data).context_json,undefined);assert(stored.data.length<2000);
+    assert((f.db.prepare('SELECT count(*) AS n FROM desktop_read_snapshot_pages WHERE request_id=?').get(f.request) as {n:number}).n>1);
+    await f.service.close();reopened=new DesktopConversationsService(f.db,f.config,{normalizedStorage:true,transport:{runRead:noRead,runSend:noSend}});
+    let offset:number|null=0,assembled='';
+    while(offset!==null){const page=await reopened.get({request_id:f.request,offset});assembled+=page.context_chunk;offset=page.next_offset!;assert.equal(page.context_sha256,first.context_sha256);assert.equal(page.receipt_nonce,first.receipt_nonce);}
+    assert.equal(assembled,context);assert.equal(reads,1);
+    assert.equal(reopened.read({request_id:f.request,thread_id:f.thread}).context_chunk,first.context_chunk);
+  }finally{await reopened?.close();await f.cleanup();}
+});
+
+test('schema 2 snapshot and completed receipt commit atomically when the final receipt save fails',async()=>{
+  const f=fixture({runSend:noSend,runRead:async()=>({status:'completed',context_json:'{"text":"immutable"}',source_complete:false})},{normalizedStorage:true});
+  try{
+    f.db.exec("CREATE TRIGGER reject_completed BEFORE UPDATE ON desktop_conversation_requests WHEN json_extract(NEW.data,'$.result.status')='completed' BEGIN SELECT RAISE(ABORT,'test write failure'); END");
+    f.service.read({request_id:f.request,thread_id:f.thread});assert.equal((await finish(f)).status,'pending');
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM desktop_read_snapshots').get() as {n:number}).n,0);
+    assert.equal((f.db.prepare('SELECT count(*) AS n FROM desktop_read_snapshot_pages').get() as {n:number}).n,0);
+  }finally{await f.cleanup();}
+});
+
 test('IPC diagnostics are fixed metadata bound to the original request and absent from public results',async()=>{
   const observed:unknown[]=[];
   const f=fixture({runRead:noRead,runSend:async input=>{
@@ -231,7 +258,7 @@ test('local stored read stays independent while sends retain per-thread busy res
   try {
     f.service.send({ request_id: f.request, thread_id: f.thread, text: 'first' }); await new Promise(resolve => setImmediate(resolve));
     const readId = randomUUID(); assert.equal(f.service.read({ request_id: readId, thread_id: f.thread }).status, 'pending'); assert.equal((await f.service.get({ request_id: readId, wait_seconds: 1 })).verification, 'native_stored_history');
-    const blocked = f.service.send({ request_id: randomUUID(), thread_id: f.thread, text: 'second' }); assert.equal(blocked.status, 'awaiting_delivery_choice'); assert.equal(sends, 1);
+    const blockedId = randomUUID(); assert.throws(() => f.service.send({ request_id: blockedId, thread_id: f.thread, text: 'second' }), /thread_send_in_progress/); assert.equal(f.db.prepare('SELECT 1 FROM desktop_conversation_requests WHERE request_id=?').get(blockedId),undefined); assert.equal(sends, 1);
     release(); assert.equal((await f.service.get({ request_id: f.request, wait_seconds: 1 })).verification, 'exact_turn_reply');
   } finally { release?.(); await f.cleanup(); }
 });
@@ -358,10 +385,11 @@ test('per-thread sends reject concurrent work; different threads remain independ
   let resolve!: () => void, calls = 0, f: ReturnType<typeof fixture>;
   f = fixture({ runRead: async () => ({ status: 'completed', context_json: '{}', source_complete: false }), runSend: async input => { calls++; input.beforeSend(); input.onAccepted(f.turn); await new Promise<void>(done => { if (input.threadId === f.thread) resolve = done; else done(); }); return { status: 'completed', turn_id: f.turn, reply: input.text }; } });
   try {
-    f.service.send({ request_id: f.request, thread_id: f.thread, text: 'first' }); const secondId = randomUUID(); assert.equal(f.service.send({ request_id: secondId, thread_id: f.thread, text: 'second' }).status, 'skipped_busy');
+    f.service.send({ request_id: f.request, thread_id: f.thread, text: 'first' }); const secondId = randomUUID(); assert.throws(() => f.service.send({ request_id: secondId, thread_id: f.thread, text: 'second' }), /thread_send_in_progress/); assert.equal(f.db.prepare('SELECT 1 FROM desktop_conversation_requests WHERE request_id=?').get(secondId),undefined);
     const readId = randomUUID(); assert.equal(f.service.read({ request_id: readId, thread_id: f.thread }).status, 'pending'); assert.equal((await finish(f, readId)).status, 'completed');
     const otherId = randomUUID(); f.service.send({ request_id: otherId, thread_id: f.thread2, text: 'parallel' }); assert.equal((await finish(f, otherId)).status, 'completed'); resolve(); assert.equal((await finish(f)).status, 'completed'); assert.equal(calls, 2);
-    assert.equal(f.service.send({ request_id: secondId, thread_id: f.thread, text: 'second' }).status, 'skipped_busy');
+    assert.equal(f.service.send({ request_id: secondId, thread_id: f.thread, text: 'second' }).status, 'pending');
+    await new Promise(done => setImmediate(done)); resolve(); assert.equal((await finish(f,secondId)).status,'completed'); assert.equal(calls,3);
   } finally { resolve?.(); await f.cleanup(); }
 });
 test('ACK loss and transport errors are uncertain, with no raw error leakage or retry', async () => {

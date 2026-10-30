@@ -65,10 +65,11 @@ Name: "{code:GetShortcutsDirectory}\卸载 Codex Dots Bridge"; Filename: "{unins
 Type: files; Name: "{app}\installation-state.json"
 Type: files; Name: "{app}\.setup-result.txt"
 Type: files; Name: "{app}\.launcher-diagnostics.json"
+Type: files; Name: "{app}\.setup-activation.json"
 
 [Code]
 var
-  Prepared, Committed, InstallPayload: Boolean;
+  Prepared, Committed, InstallPayload, ActivationRecoveryRequired: Boolean;
   PreparedDataDirectory: String;
 
 function IsStrictGuid(const Value: String): Boolean;
@@ -241,20 +242,35 @@ begin
   { Post-install script exceptions alone can leave Inno's normal exit code at zero. }
   Result := 0;
   if Prepared and not Committed then Result := 20;
+  { Preserve the compatible payload without reporting an uncertain activation as success. }
+  if ActivationRecoveryRequired or (Prepared and not Committed and FileExists(ExpandConstant('{app}\.setup-activation.json'))) then Result := 21;
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then begin
     Committed := RunLifecycle(RunnerParameters('Commit'));
-    if not Committed then RaiseException(OperationError);
-    WizardForm.FinishedLabel.Caption := '本机组件已安装。首次账号连接仍需通过官方页面完成；可从开始菜单打开“首次连接与维护”。配置、任务与访问设置由原数据目录保留。实际工具加载和 Dot 任务结果仍需验收。';
+    if not Committed then begin
+      { The lifecycle helper writes this durable intent before activation and
+        retains it through process exit. Even an unreadable/uncertain intent is
+        reason to preserve the only program that can open the upgraded DB.
+        Its presence never authorizes restore or proves successful activation. }
+      ActivationRecoveryRequired := FileExists(ExpandConstant('{app}\.setup-activation.json'));
+      if not ActivationRecoveryRequired then RaiseException(OperationError);
+    end;
+    if ActivationRecoveryRequired then
+      WizardForm.FinishedLabel.Caption := '兼容当前数据的程序已保留，存储激活或安装收尾尚待核对。请保留安装目录、数据与迁移备份，勿用旧版覆盖。当前状态需要人工恢复；安装器退出码为 21。' + #13#10 + OperationError
+    else
+      WizardForm.FinishedLabel.Caption := '本机组件已安装。首次账号连接仍需通过官方页面完成；可从开始菜单打开“首次连接与维护”。配置、任务与访问设置由原数据目录保留。实际工具加载和 Dot 任务结果仍需验收。';
   end;
 end;
 
 procedure DeinitializeSetup;
 begin
-  if Prepared and not Committed then RunLifecycle(RunnerParameters('Rollback'));
+  { A helper crash may occur after DB activation but before a success receipt.
+    Never interpret that missing receipt as permission to restore old storage. }
+  if Prepared and not Committed and not FileExists(ExpandConstant('{app}\.setup-activation.json')) then
+    RunLifecycle(RunnerParameters('Rollback'));
 end;
 
 function InitializeUninstall: Boolean;

@@ -125,6 +125,15 @@ public static class DotsBackgroundArguments {
   }catch{return $false}
 }
 function Start-DotsBackgroundProcess($Request) {
+  # Fixed metadata only: never retain commands, paths, environment or error text.
+  $script:dotsLaunchObservation=[ordered]@{
+    stage='validate_request';observed_at=[DateTime]::UtcNow.ToString('o');helper_pid=$PID;pid=$null
+    session_id=$null;expected_session_id=$null;actual_session_id=$null;created_process_observed=$null
+    owner_sid_matches=$null;create_return_code=$null;owner_return_code=$null;owner_attempts=0
+    owner_recheck_identity_matches=$null;initial_owner_exception_type=$null;initial_owner_hresult=$null
+    elapsed_ms=0;exception_type=$null;hresult=$null
+  }
+  $launchClock=[Diagnostics.Stopwatch]::StartNew()
   $directory=Assert-DotsLaunchPath $Request.dataDir ''
   if($Request.kind -ceq 'supervisor') {
     $exe=Assert-DotsLaunchPath $Request.nodePath 'node.exe'
@@ -135,28 +144,63 @@ function Start-DotsBackgroundProcess($Request) {
     $exe=Assert-DotsLaunchPath $Request.executable 'CodexDotsBridge.Tray.exe'
     $arguments=@($Request.mode,'--data-dir',$directory)
   } else {throw 'background_launch_invalid_request'}
+  $script:dotsLaunchObservation.stage='environment'
   $environment=Get-DotsBackgroundEnvironment $Request.environment
   $command=(@($exe)+$arguments|ForEach-Object{Quote-DotsWindowsArgument $_}) -join ' '
   $submitted=$false
   try {
     $session=[Diagnostics.Process]::GetCurrentProcess().SessionId
     $sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $script:dotsLaunchObservation.session_id=$session
+    $script:dotsLaunchObservation.expected_session_id=$session
+    $script:dotsLaunchObservation.stage='startup'
     $startup=New-DotsProcessStartup $environment
     $submitted=$true
+    $script:dotsLaunchObservation.stage='create'
     $result=Invoke-DotsProcessCreate $command (Split-Path -Parent $exe) $startup
+    $script:dotsLaunchObservation.create_return_code=[int]$result.ReturnValue
+    if($result.ProcessId){$script:dotsLaunchObservation.pid=[int]$result.ProcessId}
     if($result.ReturnValue -ne 0){throw 'background_launch_rejected'}
     if(-not $result.ProcessId){throw 'background_launch_unknown'}
+    $script:dotsLaunchObservation.stage='get_process'
     $created=Get-DotsCreatedProcess ([uint32]$result.ProcessId)
+    $script:dotsLaunchObservation.created_process_observed=$null -ne $created
+    if($null -ne $created -and $null -ne $created.SessionId){$script:dotsLaunchObservation.actual_session_id=[int]$created.SessionId}
+    $script:dotsLaunchObservation.stage='verify_session'
     if($null -eq $created -or $created.SessionId -ne $session){throw 'background_launch_unknown'}
-    $owner=Get-DotsCreatedOwner $created
+    $script:dotsLaunchObservation.stage='get_owner_sid'
+    $script:dotsLaunchObservation.owner_attempts=1
+    try { $owner=Get-DotsCreatedOwner $created } catch [Microsoft.Management.Infrastructure.CimException] {
+      $script:dotsLaunchObservation.initial_owner_exception_type=$_.Exception.GetType().FullName
+      $script:dotsLaunchObservation.initial_owner_hresult=$_.Exception.HResult
+      # Creation has already succeeded. Reconcile one failed read, never Create
+      # again. A PID alone cannot bind the second read after process exit/reuse.
+      if($created.ProcessId -ne $result.ProcessId -or $created.CreationDate -isnot [DateTime] -or $created.ExecutablePath -ine $exe){throw}
+      $script:dotsLaunchObservation.stage='recheck_process_identity'
+      $again=Get-DotsCreatedProcess ([uint32]$result.ProcessId)
+      $same=($null -ne $again -and $again.ProcessId -eq $created.ProcessId -and
+        $again.CreationDate -eq $created.CreationDate -and $again.ExecutablePath -ieq $created.ExecutablePath -and
+        $again.SessionId -eq $session)
+      $script:dotsLaunchObservation.owner_recheck_identity_matches=$same
+      if(-not $same){throw 'background_launch_unknown'}
+      $script:dotsLaunchObservation.stage='get_owner_sid'
+      $script:dotsLaunchObservation.owner_attempts=2
+      $owner=Get-DotsCreatedOwner $again
+    }
+    $script:dotsLaunchObservation.owner_return_code=[int]$owner.ReturnValue
+    $script:dotsLaunchObservation.owner_sid_matches=$owner.ReturnValue -eq 0 -and $owner.Sid -ceq $sid
+    $script:dotsLaunchObservation.stage='verify_owner'
     if($owner.ReturnValue -ne 0 -or $owner.Sid -cne $sid){throw 'background_launch_unknown'}
-    # No process handles, locks or service-ready claims; no kill or retry on failure.
+    $script:dotsLaunchObservation.stage='confirmed'
+    # No process handles, locks or service-ready claims; no kill or Create retry.
     return @{pid=[int]$result.ProcessId;sessionId=[int]$session}
   } catch {
+    $script:dotsLaunchObservation.exception_type=$_.Exception.GetType().FullName
+    $script:dotsLaunchObservation.hresult=$_.Exception.HResult
     if($_.Exception.Message -in @('background_launch_rejected','background_launch_unknown')){throw $_.Exception.Message}
     if($submitted){throw 'background_launch_unknown'}
     throw 'background_broker_unavailable'
-  }
+  } finally { $script:dotsLaunchObservation.elapsed_ms=$launchClock.ElapsedMilliseconds }
 }
 # Dot-source is used only by isolated regression tests; normal entry is fixed.
 if($MyInvocation.InvocationName -eq '.'){return}
@@ -175,6 +219,8 @@ try {
 } catch {
   $code=$_.Exception.Message
   if($code -notin @('background_launch_rejected','background_broker_unavailable','background_launch_unknown','background_launch_invalid_request')){$code='background_launch_invalid_request'}
-  @{error=$code}|ConvertTo-Json -Compress
+  $failure=@{error=$code}
+  if($script:dotsLaunchObservation){$failure.diagnostic=$script:dotsLaunchObservation}
+  $failure|ConvertTo-Json -Depth 4 -Compress
   exit 1
 }

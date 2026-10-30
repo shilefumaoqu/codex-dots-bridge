@@ -4,19 +4,57 @@ import { productionCall } from './bridge.js';
 import { readProductionConfig } from './runtime.js';
 import { safePath } from './maintenance.js';
 import { ProbeError } from './store.js';
-import { readTrayAutostart, type AutostartState } from './tray-autostart.js';
+import { readTrayAutostartAsync, type AutostartState } from './tray-autostart.js';
 import { readRecentStartupFailure } from './startup-diagnostics.js';
+import { projectTraySubscription, trayDataBinding, unknownTraySubscription, type TraySubscription } from './tray-subscription.js';
 
 export type TrayState='ready'|'starting'|'stopping'|'stop_unconfirmed'|'stopped'|'setup'|'disconnected'|'unknown'|'failed'|'mismatch';
 export interface TrayStatus {
-  schema:1;installed_version:string;service_version:string|null;state:TrayState;tone:'green'|'amber'|'red'|'gray';
+  schema:1;instance_id:string|null;installed_version:string;service_version:string|null;state:TrayState;tone:'green'|'amber'|'red'|'gray';
   title:string;reason:string;service:string;cloud:string;dot:string;control:'start'|'stop'|'disabled';
-  autostart:AutostartState;checked_at:string;task_counts:Record<string,number>;inflight_count:number|null;error:string|null;
+  autostart:AutostartState;autostart_checked_at:string|null;autostart_stale:boolean;autostart_refreshing:boolean;checked_at:string;task_counts:Record<string,number>;inflight_count:number|null;error:string|null;
+  waiting_reason:string|null;last_business_at:string|null;data_binding:string|null;subscription:TraySubscription;
 }
 export interface TrayStatusOptions {
   call?:(dir:string,name:'dots_status',args:unknown,options:{timeoutMs:number})=>Promise<unknown>;
   now?:()=>number;
   processPresence?:(pid:number)=>'gone'|'present'|'unknown';
+  // A long-lived provider may cache the Windows Startup inspection, whose native
+  // helper is much more expensive than the local service projection itself.
+  autostartCacheMs?:number;
+  readAutostart?:(dir:string)=>AutostartState|Promise<AutostartState>;
+}
+let autostartCache:{dir:string;binding:string;read:NonNullable<TrayStatusOptions['readAutostart']>;at:number|null;state:AutostartState;pending?:Promise<void>}|undefined;
+async function autostartStatus(dir:string,now:number,options:TrayStatusOptions) {
+  const read=options.readAutostart??readTrayAutostartAsync,ttl=Math.min(30000,Math.max(0,options.autostartCacheMs??0)),clock=options.now??Date.now;
+  let binding='';
+  try {
+    // A successful settings command rewrites the manifest: its next read must
+    // not wait for cache expiry before reflecting the user's change.
+    binding=['config.json','installation.json'].map(name=>{
+      const path=join(dir,name);safePath(path);if(!existsSync(path))return 'absent';
+      const stat=lstatSync(path);if(!stat.isFile())throw new Error();return `${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
+    }).join('|');
+  }catch {return {state:'unknown' as const,at:now,stale:false,refreshing:false};}
+  if(ttl===0) {
+    let state:AutostartState='unknown';try{state=await read(dir);}catch{}
+    return {state,at:clock(),stale:false,refreshing:false};
+  }
+  let cached=autostartCache;
+  if(cached?.dir!==dir||cached.read!==read)autostartCache=cached={dir,binding,read,at:null,state:'unknown'};
+  if(cached.binding!==binding){cached.binding=binding;cached.at=null;cached.state='unknown';}
+  const fresh=()=>cached.at!==null&&cached.at<=now&&now-cached.at<ttl;
+  if(!fresh()&&!cached.pending) {
+    const entry=cached,expectedBinding=binding;
+    const finish=(state:AutostartState)=>{if(entry.binding===expectedBinding){entry.at=clock();entry.state=state;}};
+    try {
+      const value=read(dir);
+      if(typeof value==='string')finish(value);
+      else entry.pending=Promise.resolve(value).then(finish,()=>finish('unknown')).finally(()=>{entry.pending=undefined;});
+    }catch{finish('unknown');}
+  }
+  // Stale observations do not present a previous enabled/disabled state as current.
+  return {state:fresh()?cached.state:'unknown' as const,at:cached.at,stale:!fresh(),refreshing:!!cached.pending};
 }
 const taskStates=['queued','running','waiting_input','cancel_requested','reconciliation_required','completed','failed','cancelled','expired'];
 const inflight=['queued','running','waiting_input','cancel_requested','reconciliation_required'];
@@ -55,8 +93,9 @@ function recordedProcessesGone(hint:Record<string,unknown>,serviceLock:Record<st
 }
 export async function getTrayStatus(dir:string,installedVersion:string,options:TrayStatusOptions={}):Promise<TrayStatus> {
   const now=options.now??Date.now;
-  const result:TrayStatus={schema:1,installed_version:version(installedVersion)??'unknown',service_version:null,state:'unknown',tone:'amber',title:'状态未知',reason:'暂时无法核验当前服务状态',
-    service:'待确认',cloud:'待确认',dot:'待确认',control:'disabled',autostart:readTrayAutostart(dir),checked_at:new Date(now()).toISOString(),task_counts:{},inflight_count:null,error:null};
+  const autostart=await autostartStatus(dir,now(),options);
+  const result:TrayStatus={schema:1,instance_id:null,installed_version:version(installedVersion)??'unknown',service_version:null,state:'unknown',tone:'amber',title:'状态未知',reason:'暂时无法核验当前服务状态',
+    service:'待确认',cloud:'待确认',dot:'待确认',control:'disabled',autostart:autostart.state,autostart_checked_at:autostart.at===null?null:new Date(autostart.at).toISOString(),autostart_stale:autostart.stale,autostart_refreshing:autostart.refreshing,checked_at:new Date(now()).toISOString(),task_counts:{},inflight_count:null,error:null,waiting_reason:null,last_business_at:null,data_binding:null,subscription:unknownTraySubscription()};
   function state(next:TrayState,control:TrayStatus['control']='disabled') {result.state=next;[result.tone,result.title,result.reason]=labels[next];result.control=control;return result;}
   function withStartupFailure() {
     if(result.state==='failed'||result.state==='unknown') {
@@ -73,6 +112,8 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
   let oldStop=false;
   try {
     safePath(dir);safePath(join(dir,'config.json'));config=readProductionConfig(dir);
+    result.instance_id=config.instance_id;
+    result.data_binding=trayDataBinding(dir,config.instance_id);
     hint=localJson(dir,'supervisor-state.json');lock=localJson(dir,'supervisor.lock');serviceLock=localJson(dir,'service.lock');
     stop=localJson(dir,'supervisor.stop');oldStop=!!stop&&now()-lstatSync(join(dir,'supervisor.stop')).mtimeMs>35000;
     if(hint&&(typeof hint.owner!=='string'||!Number.isSafeInteger(hint.pid)||Number(hint.pid)<1))throw new ProbeError('tray_local_state_invalid');
@@ -118,6 +159,8 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
   }
   if(observed.service_reachable!==true){result.error='service_identity_unverified';return state('unknown');}
   result.service='响应正常';result.service_version=version(observed.version);
+  if(typeof observed.waiting_reason==='string'&&['execution_slot_occupied','queued_behind_task','route_unavailable','event_delivery_failed','awaiting_delivery','awaiting_pickup','pickup_delayed','pickup_stalled','execution_unverified','deadline_elapsed'].includes(observed.waiting_reason))result.waiting_reason=observed.waiting_reason;
+  if(typeof observed.last_business_at==='string'&&/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(observed.last_business_at)&&Number.isFinite(Date.parse(observed.last_business_at))&&Date.parse(observed.last_business_at)<=now())result.last_business_at=observed.last_business_at;
   const counts=object(observed.task_counts);
   for(const key of taskStates)if(Number.isSafeInteger(counts[key])&&Number(counts[key])>=0)result.task_counts[key]=Number(counts[key]);
   // Require every returned status/count to be understood before reporting a total.
@@ -137,7 +180,13 @@ export async function getTrayStatus(dir:string,installedVersion:string,options:T
   if(observed.tunnel_configured===false){result.cloud='未配置';result.dot='未连接';return state('setup',control);}
   const cloudReady=observed.tunnel_configured===true&&observed.tunnel_health==='ready'&&observed.tunnel==='running'&&(observed.tunnel_connection===undefined||observed.tunnel_connection==='ready');
   result.cloud=cloudReady?'已连接':observed.tunnel_connection==='auth_required'?'待授权':observed.tunnel_connection==='starting'?'正在连接':observed.tunnel_connection==='unknown'||observed.tunnel_health==='unknown'?'待确认':'未连接';
-  const dotReady=Number.isSafeInteger(observed.active_subscription_count)&&Number(observed.active_subscription_count)>0;
-  result.dot=dotReady?'订阅有效':'无有效订阅';
-  return state(cloudReady&&dotReady?'ready':'disconnected',control);
+  const checkedAt=now();result.checked_at=new Date(checkedAt).toISOString();
+  result.subscription=projectTraySubscription(observed.subscriptions,observed.active_subscription_count,checkedAt);
+  const dotReady=result.subscription.state==='valid'||result.subscription.state==='expiring';
+  result.dot=result.subscription.state==='valid'?'订阅有效':result.subscription.state==='expiring'?'订阅即将到期':result.subscription.state==='expired'?'订阅已失效':result.subscription.state==='missing'?'无有效订阅':'订阅待确认';
+  state(cloudReady&&dotReady?'ready':'disconnected',control);
+  if(cloudReady&&result.subscription.state==='expiring') {
+    result.tone='amber';result.title='订阅即将到期';result.reason='订阅将在两小时内到期，等待平台自动续订';
+  }
+  return result;
 }

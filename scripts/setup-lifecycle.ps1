@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-  [Parameter(Mandatory=$true)][ValidateSet('Prepare','Commit','Rollback','RecoverRollback','PreflightUninstall','Uninstall','Connect','Tray')][string]$Action,
+  [Parameter(Mandatory=$true)][ValidateSet('Prepare','Commit','Rollback','RecoverRollback','RecoverActivation','PreflightUninstall','Uninstall','Connect','Tray')][string]$Action,
   [Parameter(Mandatory=$true)][string]$InstallDirectory,
   [string]$NewVersion,
   [string]$PackageFingerprint,
@@ -132,8 +132,10 @@ function Invoke-TrayCommand([string]$Executable,[string[]]$Arguments) {
   } finally { $process.Dispose() }
 }
 function Start-Tray([string]$Root,[string]$Directory,[switch]$Show) {
+  $script:trayStartObservation=[ordered]@{stage='validate_binary';observed_at=[DateTime]::UtcNow.ToString('o');helper=$null}
   $exe=Tray-Path $Root
   if(-not $exe) { return }
+  $script:trayStartObservation.stage='check_running'
   if(Tray-Running $Root $Directory) {
     if($Show -and (Invoke-TrayCommand $exe @('--show','--data-dir',$Directory)) -ne 0) { throw 'tray_show_unconfirmed' }
     return
@@ -141,9 +143,13 @@ function Start-Tray([string]$Root,[string]$Directory,[switch]$Show) {
   $mode=if($Show){'--show'}else{'--background'}
   # The runner owns this helper, including rollback to an older payload that has
   # no helper. Inno extracts it beside the temporary runner before Prepare.
+  $script:trayStartObservation.stage='launch_helper'
   $receipt=@(& (Join-Path $PSScriptRoot 'launch-background.ps1') -TrayExecutable $exe -DataDir $Directory -TrayMode $mode)
-  if($LASTEXITCODE -ne 0) { throw 'tray_background_launch_unconfirmed' }
-  try { $launch=($receipt -join "`n") | ConvertFrom-Json; if(-not $launch.pid) { throw 'invalid_receipt' } } catch { throw 'tray_background_launch_unconfirmed' }
+  $launchExit=$LASTEXITCODE
+  try { $launch=($receipt -join "`n") | ConvertFrom-Json } catch { throw 'tray_background_launch_unconfirmed' }
+  if($launch.diagnostic){$script:trayStartObservation.helper=$launch.diagnostic}
+  if($launchExit -ne 0 -or -not $launch.pid) { throw 'tray_background_launch_unconfirmed' }
+  $script:trayStartObservation.stage='wait_running'
   for($attempt=0;$attempt -lt 30;$attempt++) {
     Start-Sleep -Milliseconds 100
     if(Tray-Running $Root $Directory) { return }
@@ -156,34 +162,52 @@ function Assert-NoInFlightTasks($Status) {
     $count=$Status.tasks.$name
     if($null -ne $count -and ([int]$count -gt 0)) { throw 'inflight_tasks_block_upgrade' }
   }
+  if(-not $Status.maintenance_activity -or $null -eq $Status.maintenance_activity.total) { throw 'maintenance_activity_unavailable' }
+  if([int]$Status.maintenance_activity.total -gt 0) { throw ('inflight_work_blocks_upgrade: '+($Status.maintenance_activity|ConvertTo-Json -Compress)) }
+  if($Status.storage -and $Status.storage.phase -ne 'ready') { throw 'storage_migration_requires_recovery' }
 }
 function Get-UpgradeRuntimeStatus([string]$Root,[string]$Directory) {
-  try { return (Invoke-Bridge $Root @('status','--data-dir',$Directory)) } catch {
-    # An unreachable legacy status path cannot skip the task gate. Load only the
-    # already authenticated old runtime's SQLite library, in read-only mode.
+    $status=$null
+    try { $status=Invoke-Bridge $Root @('status','--data-dir',$Directory) } catch { }
+    if($status -and $status.maintenance_activity) { return $status }
+    # Legacy status omits native sends and reads. Inspect every known queue using
+    # only the authenticated old runtime's SQLite library, in read-only mode.
     $previous=$env:BRIDGE_SETUP_TASK_PROBE
     $env:BRIDGE_SETUP_TASK_PROBE=(@{root=$Root;dir=$Directory}|ConvertTo-Json -Compress)
     $probe=@'
 import {createRequire} from 'node:module';
 import {existsSync,lstatSync} from 'node:fs';
 import {join} from 'node:path';
-const r=JSON.parse(process.env.BRIDGE_SETUP_TASK_PROBE),counts={};
+const r=JSON.parse(process.env.BRIDGE_SETUP_TASK_PROBE),counts={},activity={tasks:0,desktop_sends:0,desktop_reads:0,desktop_echo:0,context_reads:0,total:0};
 const require=createRequire(join(r.root,'package.json')),Database=require('better-sqlite3');
 const p=join(r.dir,'tasks.sqlite');
 if(existsSync(p)) {
  if(!lstatSync(p).isFile()||lstatSync(p).isSymbolicLink())throw new Error('unsafe_database');
  const db=new Database(p,{readonly:true,fileMustExist:true});
- try {for(const row of db.prepare('SELECT data FROM tasks').all()){const t=JSON.parse(row.data);if(typeof t.status!=='string')throw new Error('invalid_task');counts[t.status]=(counts[t.status]??0)+1;}}finally{db.close();}
+ try {
+  const tables=new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row=>row.name));
+  const count=(table,where)=>tables.has(table)?db.prepare(`SELECT COUNT(*) AS n FROM ${table} WHERE ${where}`).get().n:0;
+  if(tables.has('tasks'))for(const row of db.prepare("SELECT json_extract(data,'$.status') AS status,COUNT(*) AS n FROM tasks GROUP BY json_extract(data,'$.status')").all()){if(typeof row.status!=='string')throw new Error('invalid_task');counts[row.status]=row.n;}
+  activity.tasks=count('tasks',"json_extract(data,'$.status') IN ('queued','running','waiting_input','cancel_requested','reconciliation_required')");
+  activity.desktop_sends=count('desktop_conversation_requests',"json_extract(data,'$.result.operation')='send' AND (json_extract(data,'$.result.status') IN ('pending','waiting_next_turn','awaiting_delivery_choice') OR json_extract(data,'$.watch.state')='active')");
+  activity.desktop_reads=count('desktop_conversation_requests',"json_extract(data,'$.result.operation')='read' AND json_extract(data,'$.result.status')='pending'");
+  activity.desktop_echo=count('desktop_echo_requests',"json_extract(data,'$.result.status')='pending'");
+  activity.context_reads=count('context_jobs',"json_extract(data,'$.status')='pending'");
+  activity.total=activity.tasks+activity.desktop_sends+activity.desktop_reads+activity.desktop_echo+activity.context_reads;
+ }finally{db.close();}
 }
-console.log(JSON.stringify({supervisor:'unknown',service:'unknown',tasks:counts}));
+console.log(JSON.stringify({supervisor:'unknown',service:'unknown',tasks:counts,maintenance_activity:activity}));
 '@
     try {
-      $text=@(& (Runtime-Node $Root) --input-type=module -e $probe 2>$null)
+      # PS5 reparses native command arguments and strips the SQL string quotes
+      # in -e source. Stdin preserves the script without another quoting layer.
+      $text=@($probe | & (Runtime-Node $Root) --input-type=module - 2>$null)
       if($LASTEXITCODE -ne 0){throw 'task_state_unavailable'}
-      return (($text -join "`n")|ConvertFrom-Json)
+      $observed=($text -join "`n")|ConvertFrom-Json
+      if($status) { $status|Add-Member -NotePropertyName maintenance_activity -NotePropertyValue $observed.maintenance_activity -Force;return $status }
+      return $observed
     } catch {throw 'task_state_unavailable'}
     finally {if($null -eq $previous){Remove-Item Env:BRIDGE_SETUP_TASK_PROBE -ErrorAction SilentlyContinue}else{$env:BRIDGE_SETUP_TASK_PROBE=$previous}}
-  }
 }
 function Quote-InstallerArgument([string]$Value) {
   $b=[Text.StringBuilder]::new('"');$slashes=0
@@ -696,6 +720,30 @@ namespace CodexDotsBridge {
 }
 function Rollback-Transaction($Transaction) {
   $env:APPDATA=$Transaction.app_data
+  # Never overwrite a newer database's configuration with an old executable's
+  # schema. Snapshot restore is available only before activation and only after
+  # the new runtime verifies that no database writes followed the migration.
+  $storageConfigPath=Join-Path $Transaction.data_dir 'config.json'
+  if(Test-Path -LiteralPath $storageConfigPath) {
+    $storageConfig=Read-Json $storageConfigPath
+    $journalPath=Join-Path $Transaction.data_dir 'storage-migration.json'
+    if(-not $Transaction.storage_migration_id -and $Transaction.storage_backup_directory -and (Test-Path -LiteralPath $journalPath)) {
+      $journal=Read-Json $journalPath
+      if($journal.owner -cne 'codex-dots-bridge-storage-migration' -or $journal.instance_id -cne $storageConfig.instance_id -or $journal.backup_directory -ine $Transaction.storage_backup_directory) { throw 'rollback_storage_binding_mismatch' }
+      Set-TransactionProperty $Transaction 'storage_migration_id' $journal.migration_id
+      Write-Json $transactionPath $Transaction
+    }
+    if($storageConfig.schema_version -eq 1 -and $Transaction.storage_migration_id -and (Test-Path -LiteralPath $journalPath)) {
+      Invoke-Bridge $Transaction.new_root @('rollback-storage','--data-dir',$Transaction.data_dir,'--migration-id',$Transaction.storage_migration_id) | Out-Null
+      $storageConfig=Read-Json $storageConfigPath
+    }
+    $oldStorageVersion=if($Transaction.old_config -and $Transaction.old_config.schema_version -eq 2){[int]$Transaction.old_config.storage.database_version}else{1}
+    if($storageConfig.schema_version -eq 2 -and [int]$storageConfig.storage.database_version -gt $oldStorageVersion) {
+      if($storageConfig.storage.phase -ne 'maintenance') { throw 'rollback_after_storage_activation_forbidden' }
+      if(-not $Transaction.storage_migration_id -or $Transaction.storage_migration_id -cne $storageConfig.storage.migration_id) { throw 'rollback_storage_requires_recovery' }
+      Invoke-Bridge $Transaction.new_root @('rollback-storage','--data-dir',$Transaction.data_dir,'--migration-id',$Transaction.storage_migration_id) | Out-Null
+    } elseif($storageConfig.schema_version -eq 2 -and $storageConfig.storage.phase -ne 'ready') { throw 'rollback_storage_requires_recovery' }
+  }
   $errors=[Collections.Generic.List[string]]::new()
   $runtimeRoot=''
   try { if($Transaction.was_running) {
@@ -843,13 +891,40 @@ function Rollback-Transaction($Transaction) {
     if($Transaction.stable_startup){Set-TransactionProperty $Transaction 'rollback_errors' @($errors);Write-Json $transactionPath $Transaction}
     throw $errors[0]
   }
+  if($Transaction.storage_migration_id) {
+    $activationPath=Join-Path $InstallDirectory '.setup-activation.json'
+    if(Test-Path -LiteralPath $activationPath) {
+      $activation=Read-Json $activationPath
+      if($activation.owner -ceq 'codex-dots-bridge-storage-activation' -and $activation.migration_id -ceq $Transaction.storage_migration_id -and (Read-Json (Join-Path $Transaction.data_dir 'config.json')).schema_version -eq 1) { Remove-Item -LiteralPath $activationPath }
+    }
+  }
   Remove-Item -LiteralPath $transactionPath -ErrorAction SilentlyContinue
 }
 
 try {
   Assert-SafePath $InstallDirectory
   if($InstallDirectory -eq [IO.Path]::GetPathRoot($InstallDirectory).TrimEnd('\')) { throw 'unsafe_install_directory' }
-  if($Action -eq 'RecoverRollback') {
+  if($Action -eq 'RecoverActivation') {
+    $markerPath=Join-Path $InstallDirectory '.setup-activation.json'
+    $marker=Read-Json $markerPath;$state=Read-Json $statePath;Assert-State $state
+    if($marker.owner -cne 'codex-dots-bridge-storage-activation' -or $marker.install_directory -ine $InstallDirectory -or $marker.payload_root -ine $state.payload_root -or $marker.data_dir -ine $state.data_dir -or $marker.package_fingerprint -cne $state.package_fingerprint) { throw 'storage_activation_binding_mismatch' }
+    $validatedDirectory=$true;$env:APPDATA=$state.app_data
+    & (Join-Path $state.payload_root 'scripts\check-package.ps1') -PackageRoot $state.payload_root | Out-Null
+    if((Get-FileHash -LiteralPath (Join-Path $state.payload_root 'release-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant() -cne $state.package_fingerprint) { throw 'payload_manifest_changed' }
+    Assert-RuntimeLocksReleased $state.data_dir
+    $ownership=Assert-OwnedRegistration $state.payload_root $state.data_dir $state.codex_home $state.codex_command
+    if(-not $ownership.mcp_present -or -not $ownership.skill_complete) { throw 'storage_activation_registration_unconfirmed' }
+    $pending=$null
+    if(Test-Path -LiteralPath $transactionPath) {
+      $pending=Read-Json $transactionPath
+      if($pending.owner -cne 'codex-dots-bridge-setup' -or $pending.new_root -ine $state.payload_root -or $pending.data_dir -ine $state.data_dir -or $pending.storage_migration_id -cne $marker.migration_id) { throw 'storage_activation_transaction_mismatch' }
+    }
+    Invoke-Bridge $state.payload_root @('activate-storage','--data-dir',$state.data_dir,'--migration-id',$marker.migration_id) | Out-Null
+    if($pending) { Remove-Item -LiteralPath $transactionPath }
+    $marker.phase='committed';Write-Json $markerPath $marker
+    $state.connection='stopped_preserved';Write-Json $statePath $state
+    [IO.File]::WriteAllText($resultPath,'storage_activation_recovered_runtime_stopped',[Text.UTF8Encoding]::new($false))
+  } elseif($Action -eq 'RecoverRollback') {
     $transaction=Read-Json $transactionPath;Assert-Transaction $transaction
     if($InstallerIdentity -and $InstallerIdentity -cne $transaction.installer_app_id){throw 'installer_identity_mismatch'}
     if(-not $transaction.old_root -or -not $transaction.old_config_text){throw 'recovery_requires_owned_previous_installation'}
@@ -890,7 +965,7 @@ try {
     if(Test-Path -LiteralPath $transactionPath) { throw 'previous_installation_requires_recovery' }
     if(Test-Path -LiteralPath $InstallDirectory) {
       foreach($item in Get-ChildItem -LiteralPath $InstallDirectory -Force) {
-        if($item.Name -notmatch '^(payload|recovery|CodexDotsBridge\.Launcher\.exe|setup-lifecycle\.ps1|launch-background\.ps1|recover-reboot-locks\.ps1|installation-state\.json|\.launcher-diagnostics\.json|\.setup-result\.txt|unins\d+\.(exe|dat|msg))$') { throw 'foreign_install_directory_entry' }
+        if($item.Name -notmatch '^(payload|recovery|CodexDotsBridge\.Launcher\.exe|setup-lifecycle\.ps1|launch-background\.ps1|recover-reboot-locks\.ps1|installation-state\.json|\.launcher-diagnostics\.json|\.setup-activation\.json|\.setup-result\.txt|unins\d+\.(exe|dat|msg))$') { throw 'foreign_install_directory_entry' }
       }
       if(-not $prior -and @(Get-ChildItem -LiteralPath $InstallDirectory -Force).Count) { throw 'unowned_install_directory' }
     }
@@ -919,6 +994,7 @@ try {
       $oldConfig=Read-Json (Join-Path $DataDir 'config.json')
       $oldConfigText=[IO.File]::ReadAllText((Join-Path $DataDir 'config.json'))
       if($oldConfig.owner -ne 'codex-dots-bridge') { throw 'unowned_data_directory' }
+      if($oldConfig.schema_version -gt 2 -or ($oldConfig.schema_version -eq 2 -and $oldConfig.storage.database_version -ne 2)) { throw 'unsupported_storage_version' }
       if(Test-Path -LiteralPath (Join-Path $DataDir 'installation.json')) {
         $manifest=Read-Json (Join-Path $DataDir 'installation.json')
         Assert-OldCliIdentity $prior $manifest
@@ -965,6 +1041,12 @@ try {
       if(((-not $prior.recovery_resolved_by) -and $evidence.old_root -ine $oldRoot) -or $evidence.data_dir -ine $DataDir -or -not $evidence.recovery.core_restored){throw 'recovery_record_binding_mismatch'}
     }
     $transaction=[ordered]@{schema=1;owner='codex-dots-bridge-setup';install_directory=$InstallDirectory;installer_app_id=$InstallerIdentity;version=$NewVersion;package_fingerprint=$PackageFingerprint;new_root=$newRoot;data_dir=$DataDir;codex_home=$CodexHome;codex_command=$CodexCommand;app_data=$AppDataDirectory;autostart=([bool]$Autostart -or $oldAutostart);old_root=$oldRoot;old_runtime_root=$oldRuntimeRoot;old_codex_command=$oldCodexCommand;old_installer_state=([bool]$prior);old_state_text=$(if($prior){[IO.File]::ReadAllText($statePath)}else{''});old_config=$oldConfig;old_config_text=$oldConfigText;old_manifest_text=$oldManifestText;old_autostart=$oldAutostart;was_running=$wasRunning;was_tray_running=$wasTrayRunning;registration_changed=$false;current_registration_root=$oldRoot;shortcut_path=$shortcutPath;old_shortcut_exists=$oldShortcutExists;old_shortcut_bytes=$oldShortcutBytes;stable_startup=$false;prepared_autostart=$null;startup_created=$false;startup_creation_intent=$false;legacy_removed=$false;preserve_legacy=$false;core_restored=$false;rollback_errors=@();previous_recovery=$previousRecovery;previous_recovery_sha256=$previousRecoveryHash}
+    $previousActivationPath=Join-Path $InstallDirectory '.setup-activation.json'
+    if(Test-Path -LiteralPath $previousActivationPath) {
+      $previousActivation=Read-Json $previousActivationPath
+      if(-not $prior -or $previousActivation.owner -cne 'codex-dots-bridge-storage-activation' -or $previousActivation.phase -cne 'committed' -or $previousActivation.install_directory -ine $InstallDirectory -or $previousActivation.payload_root -ine $prior.payload_root -or $previousActivation.package_fingerprint -cne $prior.package_fingerprint -or $previousActivation.data_dir -ine $DataDir) { throw 'storage_activation_requires_recovery' }
+      Remove-Item -LiteralPath $previousActivationPath
+    }
     Write-Json $transactionPath $transaction
     $ownsTransaction=$true
     # Register/verify the fixed entry while the original service and MCP are still intact.
@@ -995,20 +1077,21 @@ try {
     $transaction.current_registration_root=$transaction.new_root; Write-Json $transactionPath $transaction
     Setup-Registration $transaction.new_root $transaction $transaction.autostart $client
     $config=Read-Json (Join-Path $transaction.data_dir 'config.json')
-    $connection='pending_official_account_setup'
-    if($transaction.old_root -and -not $transaction.was_running -and $config.tunnel) { $connection='stopped_preserved' }
-    elseif($transaction.old_root -and $transaction.was_running) {
-      try {
-        Invoke-Bridge $transaction.new_root @('run','--data-dir',$transaction.data_dir) | Out-Null
-        $connection=if($config.tunnel){'started_requires_real_acceptance'}else{'local_started_pending_official_account_setup'}
-      } catch { $connection='pending_connection_diagnostics' }
+    if($config.schema_version -eq 1) {
+      $backupDirectory=Join-Path $InstallDirectory ('recovery\storage-'+[Guid]::NewGuid().ToString('D'))
+      Set-TransactionProperty $transaction 'storage_backup_directory' $backupDirectory
+      Write-Json $transactionPath $transaction
+      $migration=Invoke-Bridge $transaction.new_root @('migrate-storage','--data-dir',$transaction.data_dir,'--to',$backupDirectory)
+      Set-TransactionProperty $transaction 'storage_migration_id' $migration.migration_id
+      Write-Json $transactionPath $transaction
+      $config=Read-Json (Join-Path $transaction.data_dir 'config.json')
+    } elseif($config.storage.phase -ne 'ready') {
+      throw 'storage_migration_requires_recovery'
     }
-    elseif($config.tunnel -and (Test-Path -LiteralPath $config.tunnel.key_file -PathType Leaf) -and (Test-Path -LiteralPath $config.tunnel.client_path -PathType Leaf)) {
-      # Registration and data preservation define installation success. A connection failure remains pending.
-      try { Invoke-Bridge $transaction.new_root @('run','--data-dir',$transaction.data_dir) | Out-Null; $connection='started_requires_real_acceptance' } catch { $connection='pending_connection_diagnostics' }
-    }
+    # Registration, launcher and installation state must commit while business
+    # ingress and background observers are still blocked by the storage gate.
+    $connection=if($transaction.storage_migration_id){'storage_maintenance'}else{'pending_official_account_setup'}
     $state=[ordered]@{owner='codex-dots-bridge-setup';schema=1;install_directory=$InstallDirectory;installer_app_id=$transaction.installer_app_id;version=$transaction.version;package_fingerprint=$transaction.package_fingerprint;payload_root=$transaction.new_root;data_dir=$transaction.data_dir;codex_home=$transaction.codex_home;codex_command=$transaction.codex_command;app_data=$transaction.app_data;autostart=$transaction.autostart;connection=$connection}
-    Start-Tray $transaction.new_root $transaction.data_dir
     if($transaction.stable_startup){
       Complete-StableStartupMigration $transaction
       $state.launcher_sha256=$transaction.launcher_sha256;$state.launcher_source_sha256=$transaction.launcher_source_sha256
@@ -1019,8 +1102,36 @@ try {
       $state.recovery_record=$transaction.previous_recovery;$state.recovery_sha256=$transaction.previous_recovery_sha256;$state.recovery_resolved_by=$transaction.version
     }
     Write-Json $statePath $state
+    if($transaction.storage_migration_id) {
+      $activationMarker=[ordered]@{owner='codex-dots-bridge-storage-activation';phase='intent';install_directory=$InstallDirectory;payload_root=$transaction.new_root;package_fingerprint=$transaction.package_fingerprint;data_dir=$transaction.data_dir;migration_id=$transaction.storage_migration_id}
+      Write-Json (Join-Path $InstallDirectory '.setup-activation.json') $activationMarker
+      Invoke-Bridge $transaction.new_root @('activate-storage','--data-dir',$transaction.data_dir,'--migration-id',$transaction.storage_migration_id) | Out-Null
+    }
+    # After activation no older database snapshot may be restored. Connection
+    # startup is post-commit work; failures remain actionable installed states.
     Remove-Item -LiteralPath $transactionPath
+    $connection='pending_official_account_setup'
+    if($transaction.old_root -and -not $transaction.was_running -and $config.tunnel) { $connection='stopped_preserved' }
+    elseif($transaction.old_root -and $transaction.was_running) {
+      try {
+        Invoke-Bridge $transaction.new_root @('run','--data-dir',$transaction.data_dir) | Out-Null
+        $connection=if($config.tunnel){'started_requires_real_acceptance'}else{'local_started_pending_official_account_setup'}
+      } catch { $connection='pending_connection_diagnostics' }
+    }
+    elseif($config.tunnel -and (Test-Path -LiteralPath $config.tunnel.key_file -PathType Leaf) -and (Test-Path -LiteralPath $config.tunnel.client_path -PathType Leaf)) {
+      try { Invoke-Bridge $transaction.new_root @('run','--data-dir',$transaction.data_dir) | Out-Null; $connection='started_requires_real_acceptance' } catch { $connection='pending_connection_diagnostics' }
+    }
+    $state.connection=$connection;Write-Json $statePath $state
+    try { Start-Tray $transaction.new_root $transaction.data_dir } catch {
+      $state.tray='pending_tray_diagnostics'
+      # Persist the actual failed branch without exception text, paths or keys.
+      $code=$_.Exception.Message
+      if($code -notin @('tray_binary_identity_mismatch','tray_status_unavailable','tray_control_timeout','tray_show_unconfirmed','tray_background_launch_unconfirmed','tray_start_unconfirmed')){$code='tray_start_failed'}
+      $state.tray_diagnostic=[ordered]@{code=$code;observation=$script:trayStartObservation}
+      Write-Json $statePath $state
+    }
     [IO.File]::WriteAllText($resultPath,$connection,[Text.UTF8Encoding]::new($false))
+    if($transaction.storage_migration_id) { $activationMarker.phase='committed';Write-Json (Join-Path $InstallDirectory '.setup-activation.json') $activationMarker }
   } elseif($Action -eq 'Rollback') {
     if(Test-Path -LiteralPath $transactionPath) { Rollback-Transaction (Read-Json $transactionPath) }
   } else {
@@ -1031,6 +1142,11 @@ try {
     $state.codex_command=$currentCommand
     if($Action -eq 'Uninstall' -or $Action -eq 'PreflightUninstall') {
       if(Test-Path -LiteralPath $transactionPath) { throw 'previous_installation_requires_recovery' }
+      $markerPath=Join-Path $InstallDirectory '.setup-activation.json'
+      if(Test-Path -LiteralPath $markerPath) {
+        $marker=Read-Json $markerPath
+        if($marker.owner -cne 'codex-dots-bridge-storage-activation' -or $marker.phase -cne 'committed' -or $marker.install_directory -ine $InstallDirectory -or $marker.payload_root -ine $state.payload_root -or $marker.package_fingerprint -cne $state.package_fingerprint -or $marker.data_dir -ine $state.data_dir) { throw 'storage_activation_requires_recovery' }
+      }
       Assert-StableLauncherIdentity $state
       Assert-OwnedRegistration $state.payload_root $state.data_dir $state.codex_home $currentCommand | Out-Null
       if($Action -eq 'Uninstall') {
@@ -1065,7 +1181,9 @@ try {
 } catch {
   $code=$_.Exception.Message
   if($code -notmatch '^[a-z][a-z0-9_]*$') { $code='installer_operation_failed' }
-  if(($Action -eq 'Commit' -or $ownsTransaction) -and (Test-Path -LiteralPath $transactionPath)) {
+  $activationMayHaveCommitted=Test-Path -LiteralPath (Join-Path $InstallDirectory '.setup-activation.json')
+  if($activationMayHaveCommitted -and $Action -eq 'Commit') { $code='storage_activation_requires_recovery' }
+  if(-not $activationMayHaveCommitted -and ($Action -eq 'Commit' -or $ownsTransaction) -and (Test-Path -LiteralPath $transactionPath)) {
     try { Rollback-Transaction (Read-Json $transactionPath) } catch { $code+='; rollback_requires_manual_recovery' }
   }
   if($Action -ne 'PreflightUninstall' -and ($Action -ne 'Prepare' -or (Test-Path -LiteralPath $statePath)) -and $validatedDirectory -and (Test-Path -LiteralPath $InstallDirectory -PathType Container)) {

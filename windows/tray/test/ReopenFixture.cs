@@ -55,6 +55,12 @@ internal static class ReopenFixture
         return condition();
     }
     static bool Visible(Process owner) { IntPtr window = Window(owner.Id); return window != IntPtr.Zero && IsWindowVisible(window); }
+    static bool HasStatus(Process owner, string expected)
+    {
+        bool found = false; IntPtr window = Window(owner.Id); if (window == IntPtr.Zero) return false;
+        EnumChildWindows(window, delegate(IntPtr child, IntPtr unused) { StringBuilder text = new StringBuilder(256); GetWindowText(child, text, 256); if (text.ToString() == expected) found = true; return true; }, IntPtr.Zero);
+        return found;
+    }
     static void Record(string phase, Process owner)
     {
         IntPtr window = Window(owner.Id); Evidence.Add(new { phase = phase, pid = owner.Id, exited = owner.HasExited, window = window.ToInt64(), visible = window != IntPtr.Zero && IsWindowVisible(window) });
@@ -96,11 +102,14 @@ internal static class ReopenFixture
     {
         Directory.CreateDirectory(Data); string version = FileVersionInfo.GetVersionInfo(Path.Combine(Root, "CodexDotsBridge.Tray.exe")).ProductVersion;
         File.WriteAllText(Path.Combine(Data, "fixture.json"), Json.Serialize(new { version = version, control = "start", state = "stopped", autostart = "disabled", inflight = 0, delay = 20, commandDelay = 20, invalid = false }));
+        File.WriteAllText(Path.Combine(Data, "config.json"), Json.Serialize(new { owner = "codex-dots-bridge", schema_version = 1, instance_id = "11111111-1111-4111-8111-111111111111" }));
+        File.WriteAllText(Path.Combine(Data, "supervisor-state.json"), Json.Serialize(new { owner = "fixture-supervisor", pid = Process.GetCurrentProcess().Id, phase = "stopped", cleanup_complete = true }));
     }
-    static void CheckAudit()
+    static void CheckAudit(bool baseline)
     {
         string path = Path.Combine(Data, "calls.log"); string[] calls = File.Exists(path) ? File.ReadAllLines(path) : new string[0];
         foreach (string call in calls) Assert(call == "status", "unexpected_cli_side_effect:" + call);
+        if (!baseline) Assert(calls.Length == 0, "periodic_query_started_cli");
         Evidence.Add(new { phase = "fake_cli_audit", calls = calls, backend_commands = 0 });
     }
     static int Run(bool baseline)
@@ -111,7 +120,7 @@ internal static class ReopenFixture
             WriteFixture(); owner = Tray("--background");
             Assert(Wait(delegate { return Window(owner.Id) != IntPtr.Zero; }), "initial_window_missing");
             // A HWND alone precedes Application.Run. Require posted status work and a responsive pump.
-            Assert(Wait(delegate { string calls = Path.Combine(Data, "calls.log"); return File.Exists(calls) && File.ReadAllText(calls).Contains("status"); }), "background_pump_status_missing");
+            Assert(Wait(delegate { if (!baseline) return HasStatus(owner, "后台已停止"); string calls = Path.Combine(Data, "calls.log"); return File.Exists(calls) && File.ReadAllText(calls).Contains("status"); }), "background_pump_status_missing");
             SendOwned(owner, Window(owner.Id), 0x0000, IntPtr.Zero); // WM_NULL, after status work was processed.
             Record("background_message_pump_ready", owner);
             Assert(!Visible(owner), "background_showed_after_pump"); Show(owner, "first_show");
@@ -146,7 +155,7 @@ internal static class ReopenFixture
         }
         catch (Exception error) { failure = error.ToString(); }
         finally { Cleanup(owner); }
-        try { CheckAudit(); } catch (Exception error) { failure = error.ToString(); }
+        try { CheckAudit(baseline); } catch (Exception error) { failure = error.ToString(); }
         Console.WriteLine(Json.Serialize(new { status = failure == null ? (baseline ? "baseline_failure_reproduced" : "passed") : "failed", baseline_failure_reproduced = reproduced, assertions = assertions, evidence = Evidence, failure = failure, production = "not_touched", cli = "isolated fake executable" }));
         return failure == null ? 0 : 1;
     }

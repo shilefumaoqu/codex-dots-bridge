@@ -1,5 +1,7 @@
 import type net from 'node:net';
-import { closeSync, fstatSync, lstatSync, openSync, readSync, statSync } from 'node:fs';
+import { setImmediate as yieldImmediate } from 'node:timers/promises';
+import { replyBindingSchema, type DesktopReplyBinding, type DesktopReplyInput, type DesktopReplyResult } from './desktop-reply.js';
+import { closeSync, fstatSync, lstatSync, openSync, readSync, statSync, type BigIntStats } from 'node:fs';
 import { dirname } from 'node:path';
 import { runDesktopMessageIpc, type DesktopIpcDiagnostic, type DesktopTimingStage, type DesktopIdleSnapshot, type DesktopBusySnapshot } from './desktop-echo-ipc.js';
 import { resolveConversationPath } from './desktop-conversation-path.js';
@@ -13,7 +15,7 @@ type Skip = { status: 'skipped_busy' | 'skipped_unknown' | 'skipped_unreachable'
 export interface ConversationResolvedTarget { thread_id: string; rollout_path: string }
 export interface ConversationTransportInput { threadId: string; rolloutPath?: string; codexHome?: string; onResolvedTarget?: (target: ConversationResolvedTarget) => void; signal: AbortSignal; deadline: number }
 export interface ConversationReadInput extends ConversationTransportInput {}
-export interface ConversationSendInput extends ConversationTransportInput { requestId: string; text: string; beforeSend: () => void; onAccepted: (turnId: string) => number | void; onStageTiming?: (stage: DesktopTimingStage, elapsedMs: number) => void; onDiagnostic?: (event: DesktopIpcDiagnostic) => void; afterTurn?: { id: string; startedAtMs: number; ownerHash: string }; onWaiting?: () => void }
+export interface ConversationSendInput extends ConversationTransportInput { requestId: string; text: string; beforeSend: () => void; onAccepted: (turnId: string) => number | void; onStageTiming?: (stage: DesktopTimingStage, elapsedMs: number) => void; onDiagnostic?: (event: DesktopIpcDiagnostic) => void; afterTurn?: { id: string; startedAtMs: number; ownerHash: string }; onWaiting?: () => void; onReplyBinding?: (binding: DesktopReplyBinding) => void }
 export type ConversationReadResult = { status: 'completed'; title?: string; context_json: string; source_complete: boolean; desktop_state: DesktopIdleSnapshot } | ({ status: 'completed' } & NativeStoredHistory) | Skip;
 export type ConversationSendResult = { status: 'completed'; turn_id: string; reply: string } | Skip | { status: 'uncertain'; reason: string };
 export interface ConversationTransportTesting { connect: () => net.Socket; pollMs?: number; nativeReader?: NativeReaderTesting; warmLoad?: (input: DesktopWarmLoadInput) => Promise<DesktopWarmLoadResult> }
@@ -46,12 +48,85 @@ function parse(line: Buffer): any {
   try { const item = JSON.parse(utf8.decode(line)); if (item && typeof item === 'object' && !Array.isArray(item)) return item; } catch {}
   throw failure('log_invalid');
 }
+
+function matchedReply(record: any, turnId: string, sentAt: number): string | undefined {
+  if (record.type !== 'event_msg' || record.payload?.turn_id !== turnId) return;
+  const event = record.payload;
+  if (['turn_aborted', 'task_failed'].includes(event.type)) throw failure('reply_failed');
+  if (event.type !== 'task_complete') return;
+  const start = stamp(event.started_at), complete = stamp(event.completed_at), now = Date.now();
+  if (typeof event.last_agent_message !== 'string' || !start || !complete || !Number.isFinite(event.duration_ms) || event.duration_ms < 0 || complete.ms < start.ms || [start, complete].some(time => time.ms < sentAt - time.quantization || time.ms > now + time.quantization)) throw failure('reply_invalid');
+  if (event.last_agent_message.length > MAX_TEXT) throw failure('reply_too_large');
+  return event.last_agent_message;
+}
+
+/** One bounded read-only pass. This function has no IPC, navigation or send capability. */
+export async function runReply(input: DesktopReplyInput): Promise<DesktopReplyResult> {
+  let fd: number | undefined;
+  try {
+    const binding = replyBindingSchema.parse(input.binding);
+    if (!UUID.test(input.turnId) || !Number.isFinite(input.deadline)) throw failure('invalid_input');
+    const checkBudget = () => { if (input.signal.aborted || Date.now() >= input.deadline) throw failure('closed'); };
+    checkBudget();
+    noSymlinks(binding.path); fd = openSync(binding.path, 'r');
+    const validate = () => {
+      noSymlinks(binding.path);
+      if (binding.version === 2) {
+        const path = statSync(binding.path, {bigint:true}), opened = fstatSync(fd!, {bigint:true});
+        for (const state of [path, opened]) if (!state.isFile() || state.dev.toString() !== binding.device || state.ino.toString() !== binding.inode || state.birthtimeNs.toString() !== binding.birthtime_ns || state.size < BigInt(binding.offset)) throw failure('log_changed');
+        return logSize(opened);
+      }
+      const path = statSync(binding.path), opened = fstatSync(fd!);
+      for (const state of [path, opened]) if (!state.isFile() || state.dev !== binding.device || state.ino !== binding.inode || state.birthtimeMs !== binding.birthtime_ms || state.size < binding.offset) throw failure('log_changed');
+      return opened.size;
+    };
+    const size = validate();
+    const first = Buffer.alloc(Math.min(65536, size));
+    const n = readSync(fd, first, 0, first.length, 0), newline = first.subarray(0,n).indexOf(10);
+    if (newline < 0) throw failure('log_binding_invalid');
+    const meta = parse(first.subarray(0,newline));
+    if (meta.type !== 'session_meta' || meta.payload?.id !== binding.thread_id || binding.offset < newline + 1) throw failure('log_binding_invalid');
+    const tail = Buffer.alloc(1);
+    if (readSync(fd, tail, 0, 1, binding.offset - 1) !== 1 || tail[0] !== 10) throw failure('log_eof_invalid');
+    let offset = binding.offset, committed = offset, parts: Buffer[] = [], bytes = 0, chunks = 0;
+    while (offset < size) {
+      checkBudget();
+      if (offset - binding.offset >= 8 * 1024 * 1024 && !bytes) break;
+      const chunk = Buffer.alloc(Math.min(65536, size - offset));
+      const count = readSync(fd, chunk, 0, chunk.length, offset);
+      if (!count) throw failure('log_unavailable');
+      for (let at = 0; at < count;) {
+        const end = chunk.subarray(0,count).indexOf(10,at), after = end < 0 ? count : end;
+        const part = chunk.subarray(at,after); parts.push(part); bytes += part.length;
+        if (bytes > MAX_LINE) throw failure('log_invalid');
+        if (end < 0) break;
+        const line = Buffer.concat(parts,bytes); parts = []; bytes = 0;
+        committed = offset + end + 1;
+        if (line.length) {
+          const reply = matchedReply(parse(line),input.turnId,binding.sent_at_ms);
+          if (reply !== undefined) { validate(); checkBudget(); return {status:'completed',turn_id:input.turnId,reply}; }
+        }
+        at = end + 1;
+      }
+      offset += count;
+      if (++chunks % 16 === 0) await yieldImmediate();
+    }
+    validate(); checkBudget();
+    return {status:'pending',next_offset:committed};
+  } catch (error) { return {status:'unavailable',reason:reason(error)}; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+function logSize(state: BigIntStats): number {
+  if (state.size < 0n || state.size > BigInt(Number.MAX_SAFE_INTEGER)) throw failure('log_invalid');
+  return Number(state.size);
+}
 /** Fixed handle bound to the exact native or explicitly configured path. */
 class ConversationLog {
-  private fd: number; private original: ReturnType<typeof fstatSync>; private offset: number; private maxSize: number; private bytes = Buffer.alloc(0);
+  private fd: number; private original: BigIntStats; private offset: number; private maxSize: number; private bytes = Buffer.alloc(0);
   constructor(private path: string, threadId: string) {
-    noSymlinks(path); this.fd = openSync(path, 'r'); this.original = fstatSync(this.fd); this.offset = this.maxSize = this.original.size;
+    noSymlinks(path); this.fd = openSync(path, 'r');
     try {
+      this.original = fstatSync(this.fd, {bigint:true}); this.offset = this.maxSize = logSize(this.original);
       if (!this.original.isFile() || !this.offset) throw failure('log_unavailable');
       const first = Buffer.alloc(Math.min(65536, this.offset)); const count = readSync(this.fd, first, 0, first.length, 0); const newline = first.subarray(0, count).indexOf(10);
       if (newline < 0) throw failure('log_binding_invalid'); const meta = parse(first.subarray(0, newline));
@@ -60,14 +135,17 @@ class ConversationLog {
     } catch (error) { closeSync(this.fd); throw error; }
   }
   validate() {
-    noSymlinks(this.path); const state = statSync(this.path), opened = fstatSync(this.fd);
-    if (state.dev !== this.original.dev || state.ino !== this.original.ino || state.birthtimeMs !== this.original.birthtimeMs || opened.dev !== state.dev || opened.ino !== state.ino || state.size < this.maxSize || opened.size < this.maxSize) throw failure('log_changed');
-    this.maxSize = Math.max(this.maxSize, state.size, opened.size); return opened.size;
+    noSymlinks(this.path); const state = statSync(this.path, {bigint:true}), opened = fstatSync(this.fd, {bigint:true});
+    if (state.dev !== this.original.dev || state.ino !== this.original.ino || state.birthtimeNs !== this.original.birthtimeNs || opened.dev !== state.dev || opened.ino !== state.ino || opened.birthtimeNs !== state.birthtimeNs || state.size < this.maxSize || opened.size < this.maxSize) throw failure('log_changed');
+    const size = logSize(opened); this.maxSize = Math.max(this.maxSize, logSize(state), size); return size;
   }
   captureEof() {
     const size = this.validate(), tail = Buffer.alloc(1);
     if (!size || readSync(this.fd, tail, 0, 1, size - 1) !== 1 || tail[0] !== 10) throw failure('log_eof_invalid');
     this.offset = size; this.bytes = Buffer.alloc(0); return Date.now();
+  }
+  binding(threadId: string, sentAt: number): DesktopReplyBinding {
+    return {version:2,path:this.path,thread_id:threadId,device:this.original.dev.toString(),inode:this.original.ino.toString(),birthtime_ns:this.original.birthtimeNs.toString(),offset:this.offset,sent_at_ms:sentAt};
   }
   close() { closeSync(this.fd); this.bytes = Buffer.alloc(0); }
   async reply(turnId: string, sentAt: number, input: ConversationTransportInput, pollMs: number): Promise<string> {
@@ -75,11 +153,8 @@ class ConversationLog {
       if (input.signal.aborted) throw failure('closed'); if (Date.now() >= input.deadline) throw failure('reply_timeout'); const size = this.validate(); const newline = this.bytes.indexOf(10);
       if (newline >= 0) {
         if (newline > MAX_LINE) throw failure('log_invalid'); const line = this.bytes.subarray(0, newline); this.bytes = this.bytes.subarray(newline + 1); if (!line.length) continue;
-        const record = parse(line); if (record.type !== 'event_msg' || record.payload?.turn_id !== turnId) continue; const event = record.payload;
-        if (['turn_aborted', 'task_failed'].includes(event.type)) throw failure('reply_failed'); if (event.type !== 'task_complete') continue;
-        const start = stamp(event.started_at), complete = stamp(event.completed_at), now = Date.now();
-        if (typeof event.last_agent_message !== 'string' || !start || !complete || !Number.isFinite(event.duration_ms) || event.duration_ms < 0 || complete.ms < start.ms || [start, complete].some(time => time.ms < sentAt - time.quantization || time.ms > now + time.quantization)) throw failure('reply_invalid');
-        if (event.last_agent_message.length > MAX_TEXT) throw failure('reply_too_large'); return event.last_agent_message;
+        const reply = matchedReply(parse(line), turnId, sentAt);
+        if (reply !== undefined) return reply;
       }
       if (this.bytes.length > MAX_LINE) throw failure('log_invalid');
       if (size > this.offset) { const chunk = Buffer.alloc(Math.min(65536, size - this.offset)); const n = readSync(this.fd, chunk, 0, chunk.length, this.offset); if (!n) throw failure('log_unavailable'); this.offset += n; this.bytes = Buffer.concat([this.bytes, chunk.subarray(0, n)]); continue; }
@@ -110,7 +185,8 @@ export async function runSend(input: ConversationSendInput, testing?: Conversati
     const sendOnce = () => runDesktopMessageIpc({ ...input, beforeSend: (meta?: { threadId: string; rolloutPath?: string }) => {
       try {
         check(input); const path = resolvedPath(input, meta); log = new ConversationLog(path, input.threadId); sentAt = log.captureEof();
-        input.onResolvedTarget?.({ thread_id: input.threadId, rollout_path: path }); input.beforeSend(); check(input); log.validate(); sent = true;
+        input.onResolvedTarget?.({ thread_id: input.threadId, rollout_path: path });
+        input.onReplyBinding?.(log.binding(input.threadId, sentAt)); input.beforeSend(); check(input); log.validate(); sent = true;
       } catch (error) { preflightError = error; throw error; }
     } }, testing);
     // Only definitive owner absence before any chat write enables one warm load.
@@ -125,8 +201,15 @@ export async function runSend(input: ConversationSendInput, testing?: Conversati
       // owned during that request needs a new discovery, not another navigation.
       while (ipc.status === 'skipped_unknown' && ipc.reason === 'native_owner_unavailable' && !sent && !preflightError) {
         await measure('owner_lookup', () => new Promise<void>(resolve => {
-          const done = () => { clearTimeout(timer); input.signal.removeEventListener('abort', done); resolve(); };
-          const timer = setTimeout(done, Math.max(1, Math.min(250, input.deadline - Date.now())));
+          const wakeAt = Math.min(Date.now() + 250, input.deadline);
+          let timer: NodeJS.Timeout;
+          const done = () => {
+            // Windows timers may wake just before the wall-clock deadline.
+            // Finish the pause before opening another owner lookup with no budget.
+            if (!input.signal.aborted && Date.now() < wakeAt) { timer = setTimeout(done, Math.max(1, wakeAt - Date.now())); return; }
+            clearTimeout(timer); input.signal.removeEventListener('abort', done); resolve();
+          };
+          timer = setTimeout(done, Math.max(1, wakeAt - Date.now()));
           input.signal.addEventListener('abort', done, { once: true });
           if (input.signal.aborted) done();
         }));
@@ -155,7 +238,7 @@ export async function runSend(input: ConversationSendInput, testing?: Conversati
     // Void callbacks retain the old transport contract. Service callbacks only
     // return a fresh deadline after the validated ACK has been saved.
     const replyInput = replyDeadline === undefined ? input : { ...input, deadline: replyDeadline };
-    const reply = await measure('reply_wait', () => log!.reply(ipc.turnId, sentAt!, replyInput, testing?.pollMs ?? 100));
+    const reply = await measure('reply_wait', () => log!.reply(ipc.turnId, sentAt!, replyInput, testing?.pollMs ?? 1000));
     return { status: 'completed', turn_id: ipc.turnId, reply };
   } catch (error) { return { status: sent ? 'uncertain' : 'skipped_unknown', reason: reason(error) }; }
   finally { log?.close(); }

@@ -58,6 +58,15 @@ jobs:
         run: |
           ./third-party/tunnel-client/build.ps1 -GoCompiler (Get-Command go).Source
           ./scripts/package.ps1 -IncludeTunnel -SkipTests
+      - name: Validate tray transport and refresh lifecycle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tray = @(Get-ChildItem artifacts/private/packages -Filter CodexDotsBridge.Tray.exe -Recurse)
+          if ($tray.Count -ne 1) { throw 'Expected one packaged tray executable.' }
+          ./test/tray-http.test.ps1 -TrayExecutable $tray[0].FullName
+          ./test/tray-refresh.test.ps1 -TrayExecutable $tray[0].FullName
+          ./test/tray-subscription.test.ps1 -TrayExecutable $tray[0].FullName
       - name: Build and validate single-file Setup
         shell: pwsh
         run: |
@@ -77,6 +86,9 @@ jobs:
           ./scripts/build-setup.ps1 -Compiler (Join-Path $compilerRoot 'ISCC.exe') -PackageRoot $payload[0].FullName -OutputDirectory artifacts/private/setup
           $testAppId = 'CodexDotsBridgeSetup.Test.' + [Guid]::NewGuid().ToString()
           ./scripts/test-ci.ps1 -SetupExecutable artifacts/private/setup/Setup.exe -InstallerAppId $testAppId -TestDirectory (Join-Path $env:RUNNER_TEMP 'dots-install-acceptance')
+          $acceptance = @(Get-ChildItem (Join-Path $env:RUNNER_TEMP 'dots-install-acceptance') -Filter acceptance-result.json -Recurse)
+          if ($acceptance.Count -ne 1) { throw 'Expected one completed installer acceptance receipt.' }
+          Copy-Item -LiteralPath $acceptance[0].FullName -Destination artifacts/private/setup/acceptance-result.json
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-candidate
@@ -85,4 +97,6 @@ jobs:
             artifacts/private/packages/*.sha256
             artifacts/private/setup/Setup.exe
             artifacts/private/setup/Setup.exe.sha256
+            artifacts/private/setup/setup-build.json
+            artifacts/private/setup/acceptance-result.json
           retention-days: 14

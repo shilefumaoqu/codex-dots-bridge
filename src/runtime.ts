@@ -161,15 +161,22 @@ export function acquireLock(dir:string) {
 }
 
 export const defaultProductionDataDir=()=>join(process.env.LOCALAPPDATA??join(homedir(),'.local','share'),'CodexDotsBridge','data');
-const productionSchema=z.object({
+const productionV1Schema=z.object({
   owner:z.literal('codex-dots-bridge'),schema_version:z.literal(1),instance_id:z.string().uuid(),endpoint:z.string().optional(),
   tunnel:z.object({tunnel_id:z.string().regex(/^tunnel_[A-Za-z0-9_-]+$/),organization_id:z.string().min(1),client_path:z.string().min(1),key_file:z.string().min(1),startup_wait_seconds:z.number().int().min(1).max(300).optional()}).strict().optional(),
   installation:z.object({root:z.string(),node_path:z.string()}).strict().optional(),
   plugin:z.object({subscription_verified_at:z.string().datetime().optional()}).strict().optional(),
 }).strict();
+const productionSchema=z.discriminatedUnion('schema_version',[
+  productionV1Schema,
+  productionV1Schema.extend({schema_version:z.literal(2),storage:z.object({
+    database_version:z.number().int().min(2),migration_id:z.string().uuid(),
+    phase:z.enum(['maintenance','ready']),
+  }).strict()}).strict(),
+]);
 export type ProductionConfig=z.infer<typeof productionSchema>;
-const productionFiles=new Set(['config.json','desktop-echo.json','desktop-conversations.json','owner-notification.json','caller.key','worker.key','tasks.sqlite','tasks.sqlite-wal','tasks.sqlite-shm','service.lock','supervisor.lock','supervisor-state.json','supervisor.stop','tunnel-health.url','installation.json','backup-manifest.json','tunnel-runtime.env']);
-const productionTempName=/^(?:supervisor-state|config|desktop-conversations)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tmp$/;
+const productionFiles=new Set(['config.json','desktop-echo.json','desktop-conversations.json','owner-notification.json','storage-migration.json','caller.key','worker.key','tasks.sqlite','tasks.sqlite-wal','tasks.sqlite-shm','service.lock','supervisor.lock','supervisor-state.json','supervisor.stop','tunnel-health.url','installation.json','backup-manifest.json','tunnel-runtime.env']);
+const productionTempName=/^(?:supervisor-state|config|desktop-conversations|storage-migration)\.[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\.tmp$/;
 export function readProductionConfig(dir:string):ProductionConfig {
   const config=productionSchema.parse(JSON.parse(readFileSync(join(dir,'config.json'),'utf8')));
   if(config.endpoint) {

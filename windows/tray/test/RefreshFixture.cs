@@ -55,7 +55,16 @@ internal static class RefreshHarness
     static void Set(string name, object value) { formType.GetField(name, BindingFlags.NonPublic | BindingFlags.Instance).SetValue(form, value); }
     static object Call(string name, params object[] args) { return formType.GetMethod(name, BindingFlags.NonPublic | BindingFlags.Instance).Invoke(form, args); }
     static void Assert(bool condition, string note) { assertions++; if (!condition) throw new Exception(note); }
-    static string[] Calls() { string p = Path.Combine(data, "calls.log"); return File.Exists(p) ? File.ReadAllLines(p) : new string[0]; }
+    static string[] Calls()
+    {
+        string p = Path.Combine(data, "calls.log"); if (!File.Exists(p)) return new string[0];
+        var lines = new List<string>();
+        // The child appends while the harness polls. ReadAllLines denies a
+        // concurrent writer on Windows and can make that child exit before logging.
+        using (var reader = new StreamReader(new FileStream(p, FileMode.Open, FileAccess.Read, FileShare.ReadWrite)))
+        { string line; while ((line = reader.ReadLine()) != null) lines.Add(line); }
+        return lines.ToArray();
+    }
     static int Count(string command) { int n = 0; foreach (string s in Calls()) if (s == command) n++; return n; }
     static string State(string field) { object s = Get("state"); return (string)snapshotType.GetField(field).GetValue(s); }
     static void PumpUntil(Func<bool> condition, int timeout = 12000)
@@ -66,6 +75,22 @@ internal static class RefreshHarness
     }
     static void Wait(Task task) { PumpUntil(delegate { return task.IsCompleted; }); task.GetAwaiter().GetResult(); }
     static Task Refresh(bool manual = false) { return (Task)Call("RefreshState", manual); }
+    // The UI coordination fixture injects a transport; production polling uses
+    // StatusClient exclusively. Fake CLI status remains a fixture convenience.
+    static TaskCompletionSource<bool> generationReceiptGate;
+    static int generationReceiptHeld;
+    static async Task<T> ReadFixture<T>()
+    {
+        TaskCompletionSource<bool> gate = generationReceiptGate;
+        object cli = Get("cli");
+        T receipt = await ((Task<T>)cli.GetType().GetMethod("Run").Invoke(cli, new object[] { "status --tray", 5500, true })).ConfigureAwait(false);
+        if (gate != null)
+        {
+            Interlocked.Increment(ref generationReceiptHeld);
+            await gate.Task.ConfigureAwait(false);
+        }
+        return receipt;
+    }
     static Dictionary<string, object> Config(string control = "start", int delay = 200, string auto = "disabled", int inflight = 0)
     {
         return new Dictionary<string, object> { {"version", version}, {"control", control}, {"state", control == "start" ? "stopped" : "ready"}, {"autostart", auto}, {"inflight", inflight}, {"delay", delay}, {"commandDelay", 120}, {"invalid", false} };
@@ -91,6 +116,10 @@ internal static class RefreshHarness
         data = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "data-" + name); Directory.CreateDirectory(data); Write(config);
         object options = Activator.CreateInstance(optionsType); optionsType.GetField("DataDir").SetValue(options, data);
         form = Activator.CreateInstance(formType, BindingFlags.Public | BindingFlags.Instance, null, new object[] {options, null, null}, null);
+        Type resultType = assembly.GetType("CodexDotsBridge.Tray.CommandResult");
+        Type readerType = typeof(Func<>).MakeGenericType(typeof(Task<>).MakeGenericType(resultType));
+        MethodInfo reader = typeof(RefreshHarness).GetMethod("ReadFixture", BindingFlags.NonPublic | BindingFlags.Static).MakeGenericMethod(resultType);
+        Set("statusReader", Delegate.CreateDelegate(readerType, reader));
         IntPtr handle = ((Form)form).Handle;
         // Do not Initialize: the harness does not create a NotifyIcon, poll timer, or named waits.
         if (initialScale.HasValue) { Call("ScalePresentation", initialScale.Value); AssertLayout("initial_" + initialScale.Value); }
@@ -133,7 +162,13 @@ internal static class RefreshHarness
             }
             checks.Add("initial 100/125/150/200 percent and runtime DPI/theme changes immediately fit preferred height, buttons and footer without text changes"); Close();
 
-            Create("steady", Config()); int[] changed = Changes();
+            Create("steady", Config());
+            // Hold the same writer sharing mode as AppendAllText. Polling must
+            // remain readable while an append owns the file, without retries.
+            using (var writer = new FileStream(Path.Combine(data, "calls.log"), FileMode.Open, FileAccess.Write, FileShare.Read))
+                Assert(Count("status") == 0, "log_poll_conflicts_with_writer");
+            checks.Add("log polling permits overlapping fixture writes");
+            int[] changed = Changes();
             for (int cycle = 0; cycle < 3; cycle++)
             {
                 Task read = Refresh(); Assert(((Button)Get("control")).Enabled && ((Button)Get("refresh")).Enabled && ((ToolStripMenuItem)Get("autoItem")).Enabled, "poll_disabled_buttons");
@@ -173,10 +208,16 @@ internal static class RefreshHarness
             Assert(dialogSeen && Count("run:--stop") == 0 && !(bool)Get("commandBusy") && ((Button)Get("control")).Enabled, "fresh_inflight_cancel_failed");
             checks.Add("fresh query raises real WinForms in-flight stop confirmation; Cancel sends no stop and restores controls"); Close();
 
-            Create("generation", Config("start")); Write(Config("stop", 300)); poll = Refresh();
-            PumpUntil(delegate { return Count("status") == 1; }); // Receipt has sampled the old fixture before invalidation.
+            Create("generation", Config("start")); Write(Config("stop", 0));
+            generationReceiptHeld = 0; generationReceiptGate = new TaskCompletionSource<bool>(); poll = Refresh();
+            // A calls.log entry alone does not prove the receipt is still in flight:
+            // DoEvents can process its completion before this test regains control.
+            // Hold the sampled receipt until after invalidation, independent of UI speed.
+            PumpUntil(delegate { return Interlocked.CompareExchange(ref generationReceiptHeld, 0, 0) == 1; });
+            Assert(Count("status") == 1 && (bool)Get("checking") && !poll.IsCompleted, "old_generation_receipt_not_held");
             Set("generation", (int)Get("generation") + 1); Set("state", snapshotType.GetMethod("Unknown").Invoke(null, new object[] { Get("state"), "resume_recheck" }));
-            Write(Config("start", 300)); PumpUntil(delegate { Assert(State("Control") != "stop", "old_generation_applied"); return Count("status") == 2; }); Wait(poll);
+            Write(Config("start", 0)); TaskCompletionSource<bool> releaseReceipt = generationReceiptGate; generationReceiptGate = null; releaseReceipt.SetResult(true);
+            PumpUntil(delegate { Assert(State("Control") != "stop", "old_generation_applied"); return Count("status") == 2; }); Wait(poll);
             Assert(State("Control") == "start" && Count("status") == 2, "generation_followup_failed");
             checks.Add("old-generation ready receipt discarded; one fresh follow-up applied"); Close();
 

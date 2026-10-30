@@ -6,10 +6,11 @@ import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { z } from 'zod';
-import { TaskStore } from '../src/task-store.js';
-import { chatSchemas } from '../src/chat.js';
+import { TaskStore, migrateTaskStorage } from '../src/task-store.js';
+import { ProbeError } from '../src/store.js';
+import { chatSchemas, type ChatReceipt } from '../src/chat.js';
 import { ProbeEvents } from '../src/events.js';
-import { callerInstructions, callerSchemas, createProductionService, workerSchemas } from '../src/bridge.js';
+import { callControl, callerInstructions, callerSchemas, createProductionService, workerSchemas } from '../src/bridge.js';
 
 const subId = (letter='a') => `sub_${letter.repeat(40)}`;
 function subscribe(store: TaskStore, id=subId(), expires=store.now()+3600000) {
@@ -24,6 +25,79 @@ function reply(store:TaskStore, text:string) {
   return task;
 }
 const counts=(store:TaskStore) => ['tasks','task_events','task_deliveries','bridge_chats','bridge_chat_messages'].map(table=>(store.db.prepare(`SELECT count(*) n FROM ${table}`).get() as {n:number}).n);
+const savedReply=({progress:_observation,...receipt}:ChatReceipt)=>receipt;
+
+test('worker refusals distinguish message expiry from stale routes while retaining the legacy error code',()=>{
+  for (const schema of [1,2]) {
+    const dir=mkdtempSync(join(tmpdir(),'dots-chat-test-')),path=join(dir,'tasks.sqlite'),start=Date.now();
+    let now=start,store=new TaskStore(path,()=>now);
+    try {
+      if(schema===2){migrateTaskStorage(store.db);store.close();store=new TaskStore(path,()=>now);}
+      subscribe(store);
+      const sent=store.chats.send({request_id:randomUUID(),text:'synthetic expiry'}),task=store.list()[0]!;
+      const refusal=(fn:()=>unknown,reason:string)=>assert.throws(fn,error=>{
+        assert.ok(error instanceof ProbeError);
+        assert.equal(error.code,'reply_subscription_unavailable');
+        assert.equal((error as ProbeError & {reason?:string}).reason,reason);
+        return true;
+      });
+      now+=300001;
+      refusal(()=>store.get(task.task_id,{worker:true}),'chat_message_expired');
+      refusal(()=>store.claim({task_id:task.task_id,claim_key:'too-late',response_mode:'compact'}),'chat_message_expired');
+      assert.equal(store.inspectChatTask(task.task_id).attempt,0);
+      assert.equal(store.chats.routeCurrent(sent.chat_id!),true);
+      for(const response_mode of ['full','compact'] as const){
+        const next=store.chats.send({request_id:randomUUID(),text:'synthetic owned expiry'});
+        const id=(store.db.prepare('SELECT task_id FROM bridge_chat_messages WHERE request_id=?').get(next.request_id) as {task_id:string}).task_id;
+        const claim=store.claim({task_id:id,claim_key:response_mode,response_mode});
+        now+=300001;
+        refusal(()=>store.checkpoint({task_id:id,claim_token:claim.claim_token,input_revision:1,response_mode}),'chat_message_expired');
+        assert.equal(store.inspectChatTask(id).attempt,1);
+        assert.equal(store.inspectChatTask(id).results.length,0);
+        // Resolve only this synthetic fixture before testing the other response mode.
+        store.resolve({task_id:id,resolution_key:response_mode,decision:'fail',basis:'isolated test: no work was executed'});
+      }
+      now=start+3600001;
+      refusal(()=>store.get(task.task_id,{worker:true}),'chat_route_unavailable');
+    }finally{store.close();rmSync(dir,{recursive:true,force:true});}
+  }
+});
+
+test('chat and caller queries share task progress without turning delivery failure or delay into a terminal result',async()=>{
+  let now=Date.now();const store=new TaskStore(':memory:',()=>now);
+  try {
+    subscribe(store);
+    const blocker=store.submit({idempotency_key:'blocker',title:'blocker',input:{text:'unrelated private input'}});
+    const sent=store.chats.send({request_id:randomUUID(),text:'synthetic chat'}),task=store.list({status:'queued'}).find(t=>t.bridge_chat_id===sent.chat_id)!;
+    assert.equal(sent.progress!.waiting_reason,'queued_behind_task');
+    const owned={task_id:blocker.task_id,claim_token:store.claim({task_id:blocker.task_id,claim_key:'blocker'}).claim_token};
+    assert.equal((await store.chats.status({request_id:sent.request_id})).progress!.waiting_reason,'execution_slot_occupied');
+    store.checkpoint({...owned,input_revision:1});store.complete({...owned,input_revision:1,completion_key:'blocker',result:{text:'done'}});
+    const event=store.pending().find(item=>JSON.parse(item.payload).data.task_id===task.task_id)!;
+    store.deliveryResult(event,200);now+=61000;
+    const chat=await store.chats.status({request_id:sent.request_id});
+    assert.equal(chat.status,'queued');assert.equal(chat.progress!.waiting_reason,'pickup_delayed');assert.equal(chat.progress!.waiting_ms,61000);
+    assert.equal(chat.progress!.observed_at,new Date(now).toISOString());
+    const queried=await callControl(store,'dots_get',{task_id:task.task_id}) as {progress:unknown};
+    const waited=await callControl(store,'dots_wait',{task_id:task.task_id,timeout_seconds:0}) as {task:{progress:unknown}};
+    assert.deepEqual(queried.progress,chat.progress);assert.deepEqual(waited.task.progress,chat.progress);
+    assert.equal(store.status({summary:true}).waiting_reason,chat.progress!.waiting_reason);
+    assert.ok(!JSON.stringify(chat).includes('unrelated private input'));
+    const claimed=store.claim({task_id:task.task_id,claim_key:'chat'});
+    assert.equal((await store.chats.status({request_id:sent.request_id})).progress!.phase,'working');
+    store.cancel({task_id:task.task_id,request_key:'cancel'});
+    const cancelling=await store.chats.status({request_id:sent.request_id});
+    assert.equal(cancelling.status,'unknown');assert.equal(cancelling.progress!.next_action,'wait_for_stop');
+    store.ackCancel({task_id:task.task_id,claim_token:claimed.claim_token,ack_key:'stopped'});
+    assert.equal((await store.chats.status({request_id:sent.request_id})).progress!.phase,'cancelled');
+    const next=store.chats.send({request_id:randomUUID(),chat_id:sent.chat_id,text:'explicit new message'});
+    const failedEvent=store.pending()[0]!;store.deliveryResult(failedEvent,410);
+    const failed=await store.chats.status({request_id:next.request_id});
+    assert.equal(failed.status,'queued');assert.equal(failed.progress!.waiting_reason,'event_delivery_failed');assert.equal(failed.progress!.next_action,'check_connection');
+    assert.equal(store.status({summary:true}).waiting_reason,failed.progress!.waiting_reason);
+    const before=counts(store);await store.chats.status({request_id:next.request_id});assert.deepEqual(counts(store),before);
+  }finally{store.close();}
+});
 
 test('chat sends only exact current text; source and handle never pretend to be a native or Codex identity',async()=>{
   const store=new TaskStore(':memory:');
@@ -39,7 +113,7 @@ test('chat sends only exact current text; source and handle never pretend to be 
     assert.equal(source.source_kind,'shared_worker_connection_chat'); assert.equal(source.scope,'reply_to_current_chat_message_only');
     assert.equal(source.human_identity_verified,false); assert.equal(source.native_approval_granted,false);
     reply(store,'Stored exact reply.');
-    assert.deepEqual(await store.chats.status({request_id}),{...first,status:'reply',text:'Stored exact reply.'});
+    assert.deepEqual(savedReply(await store.chats.status({request_id})),{...savedReply(first),status:'reply',text:'Stored exact reply.'});
     const second=store.chats.send({request_id:randomUUID(),chat_id:first.chat_id,text:'What was the color?'});
     assert.equal(second.chat_id,first.chat_id);
     const next=store.list({status:'queued'})[0]!;
@@ -55,7 +129,7 @@ test('same ID replays only its original record offline; changed text/route confl
     subscribe(store); const args={request_id:randomUUID(),text:'Exact whitespace\n is retained.'}, initial=store.chats.send(args);
     reply(store,'ONLY_THIS_REPLY'); const before=counts(store);
     store.unsubscribe(subId());
-    assert.deepEqual(store.chats.send(args),{...initial,status:'reply',text:'ONLY_THIS_REPLY'});
+    assert.deepEqual(savedReply(store.chats.send(args)),{...savedReply(initial),status:'reply',text:'ONLY_THIS_REPLY'});
     assert.deepEqual(counts(store),before);
     assert.throws(()=>store.chats.send({...args,text:'changed'}),/chat_idempotency_conflict/);
     assert.throws(()=>store.chats.send({...args,chat_id:randomUUID()}),/chat_idempotency_conflict/);
@@ -112,7 +186,7 @@ test('same-ID refresh retains route, while expiry/unsubscribe/replacement never 
     assert.equal(store.pending().length,0); assert.equal(counts(store)[2],deliveryCount);
     assert.throws(()=>store.chats.send({request_id:randomUUID(),chat_id:sent.chat_id,text:'transfer'}),/chat_route_unavailable/);
     assert.throws(()=>store.chats.send({request_id:randomUUID(),text:'Implicit new route'}),/chat_route_changed/);
-    assert.equal(store.chats.send({request_id:sent.request_id,text:'bound'}).status,'expired');
+    assert.equal(store.chats.send({request_id:sent.request_id,text:'bound'}).status,'unknown');
   } finally {store.close();}
   const expired=new TaskStore(':memory:',()=>now);
   try {
@@ -145,12 +219,12 @@ test('observed route expiry survives clock rollback and refresh without changing
     subscribe(store,subId(),start+1000); const args={request_id:randomUUID(),text:'Do not revive'},sent=store.chats.send(args),before=counts(store);
     const taskRows=()=>store.db.prepare('SELECT * FROM tasks').all(); const tasks=taskRows();
     now=start+1001;
-    assert.equal((await store.chats.status({request_id:sent.request_id})).status,'expired');
+    assert.equal((await store.chats.status({request_id:sent.request_id})).status,'unknown');
     assert.equal((store.db.prepare('SELECT invalidated FROM bridge_chats WHERE chat_id=?').get(sent.chat_id) as {invalidated:number}).invalidated,1);
     assert.deepEqual(taskRows(),tasks); assert.deepEqual(counts(store),before);
     now=start;
-    assert.equal((await store.chats.status({request_id:sent.request_id})).status,'expired'); assert.equal(store.pending().length,0);
-    assert.equal(store.chats.send(args).status,'expired'); assert.deepEqual(counts(store),before);
+    assert.equal((await store.chats.status({request_id:sent.request_id})).status,'unknown'); assert.equal(store.pending().length,0);
+    assert.equal(store.chats.send(args).status,'unknown'); assert.deepEqual(counts(store),before);
     subscribe(store,subId(),start+60000);
     assert.equal(store.chats.routeCurrent(sent.chat_id!),false); assert.equal(store.pending().length,0);
     assert.throws(()=>store.chats.send({request_id:randomUUID(),chat_id:sent.chat_id,text:'Do not revive old handle'}),/chat_route_unavailable/);
@@ -166,7 +240,7 @@ test('pending expiry observation is durable across restart and rollback, while o
     now=start+1001; assert.equal(store.pending().length,0);
     store.close(); now=start; store=new TaskStore(path,()=>now);
     assert.equal(store.chats.routeCurrent(sent.chat_id!),false); assert.equal(store.pending().length,0);
-    assert.equal(store.chats.send(args).status,'expired'); assert.equal((await store.chats.status({request_id:args.request_id})).status,'expired');
+    assert.equal(store.chats.send(args).status,'unknown'); assert.equal((await store.chats.status({request_id:args.request_id})).status,'unknown');
     assert.deepEqual(store.db.prepare('SELECT * FROM tasks').all(),tasks); assert.deepEqual(counts(store),before);
   } finally {
     store.close(); const owned=relative(resolve(tmpdir()),resolve(dir)); assert.ok(owned.startsWith('dots-chat-test-')&&!owned.includes('..')); rmSync(dir,{recursive:true,force:true});
@@ -183,7 +257,7 @@ test('failed send commits only observed expiry after its business transaction ro
     assert.throws(()=>store.chats.send({request_id:randomUUID(),chat_id:sent.chat_id,text:'Rejected new send'}),/chat_route_unavailable/);
     expireInsideTransaction=false;
     assert.equal((store.db.prepare('SELECT invalidated FROM bridge_chats WHERE chat_id=?').get(sent.chat_id) as {invalidated:number}).invalidated,1);
-    assert.equal(store.chats.send(args).status,'expired'); assert.equal(store.pending().length,0);
+    assert.equal(store.chats.send(args).status,'unknown'); assert.equal(store.pending().length,0);
     assert.deepEqual(store.db.prepare('SELECT * FROM tasks').all(),tasks); assert.deepEqual(counts(store),before);
   } finally {store.close();}
 });
@@ -222,13 +296,13 @@ test('message deadline expiry stays durable after rollback and restart while the
     subscribe(store); const args={request_id:randomUUID(),text:'Five minute message'},sent=store.chats.send(args),before=counts(store),tasks=store.db.prepare('SELECT * FROM tasks').all(),task=store.list()[0]!;
     now=start+300001;
     assert.equal(store.subscriptionCurrent(subId()),true); assert.equal(store.chats.routeCurrent(sent.chat_id!),true);
-    assert.equal((await store.chats.status({request_id:args.request_id})).status,'expired');
+    assert.equal((await store.chats.status({request_id:args.request_id})).status,'unknown');
     assert.equal((store.db.prepare('SELECT expired FROM bridge_chat_messages WHERE request_id=?').get(args.request_id) as {expired:number}).expired,1);
     assert.deepEqual(store.db.prepare('SELECT * FROM tasks').all(),tasks); assert.deepEqual(counts(store),before);
     store.close();now=start;store=new TaskStore(path,()=>now);
     assert.equal(store.subscriptionCurrent(subId()),true);assert.equal(store.chats.routeCurrent(sent.chat_id!),true);
-    assert.equal(store.chats.send(args).status,'expired');assert.equal(store.pending().length,0);
-    assert.throws(()=>store.get(task.task_id,{worker:true}),/reply_subscription_unavailable/);
+    assert.equal(store.chats.send(args).status,'unknown');assert.equal(store.pending().length,0);
+    assert.throws(()=>store.get(task.task_id,{worker:true}),error=>error instanceof ProbeError && error.code==='reply_subscription_unavailable' && (error as ProbeError & {reason?:string}).reason==='chat_message_expired');
     assert.deepEqual(store.db.prepare('SELECT * FROM tasks').all(),tasks);assert.deepEqual(counts(store),before);
   } finally {
     store.close();const owned=relative(resolve(tmpdir()),resolve(dir));assert.ok(owned.startsWith('dots-chat-test-')&&!owned.includes('..'));rmSync(dir,{recursive:true,force:true});
@@ -243,7 +317,7 @@ test('failed new send preserves observed message expiry even when its task sweep
     assert.throws(()=>store.chats.send({request_id:randomUUID(),chat_id:randomUUID(),text:'unknown handle'}),/chat_not_found/);
     now=start;
     assert.equal((store.db.prepare('SELECT expired FROM bridge_chat_messages WHERE request_id=?').get(args.request_id) as {expired:number}).expired,1);
-    assert.equal((await store.chats.status({request_id:sent.request_id})).status,'expired');assert.equal(store.chats.send(args).status,'expired');assert.equal(store.pending().length,0);
+    assert.equal((await store.chats.status({request_id:sent.request_id})).status,'unknown');assert.equal(store.chats.send(args).status,'unknown');assert.equal(store.pending().length,0);
     assert.equal(store.chats.routeCurrent(sent.chat_id!),true);assert.deepEqual(store.db.prepare('SELECT * FROM tasks').all(),tasks);assert.deepEqual(counts(store),before);
   }finally{store.close();}
 });
@@ -326,7 +400,7 @@ test('only a new first message on the same restored subscription gets a fresh ha
     assert.throws(()=>store.chats.send({request_id:randomUUID(),chat_id:first.chat_id,text:'old handle cannot revive'}),/chat_route_unavailable/);
     const nextArgs={request_id:randomUUID(),text:'Explicit new first message'},next=store.chats.send(nextArgs);
     assert.notEqual(next.chat_id,first.chat_id); assert.equal(next.continuity,'route_rebound_context_unverified');
-    assert.deepEqual(store.chats.send(oldArgs),oldReceipt);
+    assert.deepEqual(savedReply(store.chats.send(oldArgs)),savedReply(oldReceipt));
     assert.deepEqual(store.chats.send(nextArgs),next);
     assert.throws(()=>store.chats.send({request_id:randomUUID(),chat_id:first.chat_id,text:'still invalid'}),/chat_route_unavailable/);
     reply(store,'second reply'); const third=store.chats.send({request_id:randomUUID(),chat_id:next.chat_id,text:'continue new handle'});
@@ -338,7 +412,7 @@ test('an unknown old execution blocks route rebind; callback failure alone is no
   let now=Date.now(); const store=new TaskStore(':memory:',()=>now),events=new ProbeEvents(store,async()=>({status:413,body:''}),'tasks');
   try {
     subscribe(store); const args={request_id:randomUUID(),text:'first'},first=store.chats.send(args);
-    await events.pump(); assert.equal((await store.chats.status({request_id:first.request_id})).status,'error');
+    await events.pump(); assert.equal((await store.chats.status({request_id:first.request_id})).status,'queued');
     assert.throws(()=>store.chats.send({request_id:randomUUID(),text:'do not assume HTTP failure is stopped'}),/chat_previous_unresolved/);
     const task=store.list()[0]!;store.claim({task_id:task.task_id,claim_key:'claim'});
     store.unsubscribe(subId()); subscribe(store,subId());
@@ -355,7 +429,7 @@ test('questions, stale results and manual resolution never masquerade as accepte
     try {
       subscribe(store); const sent=store.chats.send({request_id:randomUUID(),text:'one exact message'}),task=store.list()[0]!,claim=store.claim({task_id:task.task_id,claim_key:'claim'});
       store.checkpoint({task_id:task.task_id,claim_token:claim.claim_token,input_revision:1});
-      if (mode==='question') store.requestInput({task_id:task.task_id,claim_token:claim.claim_token,question_key:'question',question:'Can I do something else?'});
+      if (mode==='question') {assert.throws(()=>store.requestInput({task_id:task.task_id,claim_token:claim.claim_token,question_key:'question',question:'Can I do something else?'}),/chat_text_reply_required/);assert.equal(store.inspectChatTask(task.task_id).status,'running');}
       else if (mode==='stale') {
         store.message({task_id:task.task_id,message_key:'altered',text:'changed after claim'});
         store.complete({task_id:task.task_id,claim_token:claim.claim_token,input_revision:1,completion_key:'stale',result:{text:'stale reply'}});
@@ -397,10 +471,10 @@ test('unavailable callback and message expiry do not create another send or tran
   let now=Date.now(); const store=new TaskStore(':memory:',()=>now),events=new ProbeEvents(store,async()=>({status:410,body:''}),'tasks');
   try {
     subscribe(store); const args={request_id:randomUUID(),text:'one'},sent=store.chats.send(args),before=counts(store);
-    await events.pump(); assert.equal((await store.chats.status({request_id:sent.request_id})).status,'expired');
+    await events.pump(); assert.equal((await store.chats.status({request_id:sent.request_id})).status,'unknown');
     subscribe(store,subId('b')); assert.equal(store.pending().length,0); assert.deepEqual(counts(store),before);
-    assert.equal(store.chats.send(args).status,'expired'); assert.deepEqual(counts(store),before);
-    now+=300001; assert.equal((await store.chats.status({request_id:sent.request_id})).status,'expired');
+    assert.equal(store.chats.send(args).status,'unknown'); assert.deepEqual(counts(store),before);
+    now+=300001; assert.equal((await store.chats.status({request_id:sent.request_id})).status,'unknown');
   } finally {store.close();}
 });
 

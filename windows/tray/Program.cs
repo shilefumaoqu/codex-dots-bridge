@@ -6,6 +6,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -64,7 +65,11 @@ namespace CodexDotsBridge.Tray
     {
         public string InstalledVersion, ServiceVersion, State = "unknown", Tone = "amber", Title = "正在检查", Reason = "正在读取当前连接状态。";
         public string Service = "未检查", Cloud = "未检查", Dot = "未检查", Control = "disabled", Autostart = "unknown", Error;
-        public DateTimeOffset? CheckedAt;
+        public DateTimeOffset? CheckedAt, LastBusinessAt, AutostartCheckedAt;
+        public string WaitingReason;
+        public string InstanceId, DataBinding, SubscriptionState = "unknown", SubscriptionId;
+        public int? SubscriptionActiveCount;
+        public DateTimeOffset? SubscriptionExpiresAt;
         public int? Inflight;
         public Dictionary<string, int> Counts = new Dictionary<string, int>();
         static readonly string[] CountKeys = { "queued", "running", "waiting_input", "cancel_requested", "reconciliation_required", "completed", "failed", "cancelled", "expired" };
@@ -105,8 +110,65 @@ namespace CodexDotsBridge.Tray
             if (!DateTimeOffset.TryParse(at, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed)) throw new FormatException("invalid_checked_at");
             if (Math.Abs((DateTimeOffset.UtcNow - parsed).TotalSeconds) > 45) throw new FormatException("stale_projection");
             s.CheckedAt = parsed;
+            s.InstanceId = OptionalToken(d, "instance_id", @"\A[0-9a-fA-F-]{36}\z");
+            s.DataBinding = OptionalToken(d, "data_binding", @"\A[a-f0-9]{64}\z");
+            object subscriptionValue;
+            if (d.TryGetValue("subscription", out subscriptionValue) && subscriptionValue != null)
+            {
+                Dictionary<string, object> sub = subscriptionValue as Dictionary<string, object>;
+                if (sub == null) throw new FormatException("invalid_subscription");
+                s.SubscriptionState = Text(sub, "state", 12);
+                if (Array.IndexOf(new string[] { "valid", "expiring", "expired", "missing", "unknown" }, s.SubscriptionState) < 0) throw new FormatException("invalid_subscription");
+                if (!sub.TryGetValue("active_count", out value)) throw new FormatException("invalid_subscription");
+                s.SubscriptionActiveCount = Number(value);
+                s.SubscriptionId = OptionalToken(sub, "id", @"\A[!-~]{1,256}\z");
+                if (!sub.TryGetValue("expires_at", out value)) throw new FormatException("invalid_subscription");
+                if (value != null)
+                {
+                    if (!(value is string) || !DateTimeOffset.TryParse((string)value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed)) throw new FormatException("invalid_subscription");
+                    s.SubscriptionExpiresAt = parsed;
+                }
+                if (s.SubscriptionState == "valid" || s.SubscriptionState == "expiring")
+                {
+                    if (!s.SubscriptionActiveCount.HasValue || s.SubscriptionActiveCount < 1 || s.SubscriptionId == null || !s.SubscriptionExpiresAt.HasValue || s.SubscriptionExpiresAt <= s.CheckedAt) throw new FormatException("invalid_subscription");
+                    // The receipt cannot promote an already elapsed lease to an expiry diagnosis.
+                    if (s.SubscriptionExpiresAt <= DateTimeOffset.UtcNow) s.SubscriptionState = "unknown";
+                }
+                if (s.SubscriptionState == "expired" && (s.SubscriptionActiveCount != 0 || s.SubscriptionId == null || !s.SubscriptionExpiresAt.HasValue || s.SubscriptionExpiresAt > s.CheckedAt || s.SubscriptionExpiresAt > DateTimeOffset.UtcNow)) throw new FormatException("invalid_subscription");
+                if (s.SubscriptionState == "missing" && (s.SubscriptionActiveCount != 0 || s.SubscriptionId != null || s.SubscriptionExpiresAt.HasValue)) throw new FormatException("invalid_subscription");
+            }
+            if (s.InstanceId == null || s.DataBinding == null || s.State == "unknown" || s.Error != null) s.SubscriptionState = "unknown";
+            if (d.TryGetValue("autostart_checked_at", out value) && value != null)
+            {
+                if (!(value is string) || !DateTimeOffset.TryParse((string)value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed)) throw new FormatException("invalid_autostart_time");
+                s.AutostartCheckedAt = parsed;
+                if (Math.Abs((DateTimeOffset.UtcNow - parsed).TotalSeconds) > 45) s.Autostart = "unknown";
+            }
+            if (d.TryGetValue("last_business_at", out value) && value != null)
+            {
+                if (!(value is string) || !DateTimeOffset.TryParse((string)value, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out parsed) || parsed > DateTimeOffset.UtcNow.AddSeconds(5)) throw new FormatException("invalid_business_time");
+                s.LastBusinessAt = parsed;
+            }
+            if (d.TryGetValue("waiting_reason", out value) && value != null)
+            {
+                switch (value as string)
+                {
+                    case "execution_slot_occupied": s.WaitingReason = "执行槽占用，任务排队中"; break;
+                    case "queued_behind_task": s.WaitingReason = "正在等待前面的任务"; break;
+                    case "route_unavailable": s.WaitingReason = "任务路由不可用，请检查连接"; break;
+                    case "event_delivery_failed": s.WaitingReason = "事件投递受阻，请检查连接"; break;
+                    case "awaiting_delivery": s.WaitingReason = "正在等待事件投递"; break;
+                    case "awaiting_pickup": s.WaitingReason = "事件已接收，正在等待 Dot 领取"; break;
+                    case "pickup_delayed": s.WaitingReason = "Dot 领取延迟"; break;
+                    case "pickup_stalled": s.WaitingReason = "Dot 尚未领取，请检查连接或路由"; break;
+                    case "execution_unverified": s.WaitingReason = "执行状态待核对，请检查原任务"; break;
+                    case "deadline_elapsed": s.WaitingReason = "任务期限已到，请核对原任务"; break;
+                    default: throw new FormatException("invalid_waiting_reason");
+                }
+            }
             if (!d.TryGetValue("error", out value)) throw new FormatException("invalid_projection");
             if (value != null) { string code = value as string; if (code == null || !Regex.IsMatch(code, @"\A[a-zA-Z0-9_:-]{1,100}\z")) throw new FormatException("invalid_error"); s.Error = code; }
+            if (s.Error != null) s.SubscriptionState = "unknown";
             if (!d.TryGetValue("task_counts", out value)) throw new FormatException("invalid_projection");
             Dictionary<string, object> counts = value as Dictionary<string, object>;
             if (counts == null) throw new FormatException("invalid_task_counts");
@@ -115,10 +177,29 @@ namespace CodexDotsBridge.Tray
             if (s.Tone == "green" && (s.Control != "stop" || s.ServiceVersion == null)) throw new FormatException("untrusted_ready_projection");
             return s;
         }
+        static string OptionalToken(Dictionary<string, object> d, string key, string pattern)
+        {
+            object value; if (!d.TryGetValue(key, out value) || value == null) return null;
+            string text = value as string; if (text == null || !Regex.IsMatch(text, pattern)) throw new FormatException("invalid_projection"); return text;
+        }
+        public bool SubscriptionReliable { get { return State != "unknown" && Error == null && InstanceId != null && DataBinding != null && CheckedAt.HasValue && Math.Abs((DateTimeOffset.UtcNow - CheckedAt.Value).TotalSeconds) <= 45 && SubscriptionState != "unknown" && ((SubscriptionState != "valid" && SubscriptionState != "expiring") || SubscriptionExpiresAt > DateTimeOffset.UtcNow); } }
+        public string SubscriptionText()
+        {
+            string text = !SubscriptionReliable ? "状态未知" : SubscriptionState == "valid" ? "订阅有效" : SubscriptionState == "expiring" ? "即将到期" : SubscriptionState == "expired" ? "订阅已失效" : "无有效订阅";
+            if (SubscriptionReliable && SubscriptionExpiresAt.HasValue) text += "\n有效至 " + SubscriptionExpiresAt.Value.ToLocalTime().ToString("MM-dd HH:mm");
+            return text;
+        }
         public Snapshot ForPreview() { CheckedAt = DateTimeOffset.UtcNow; return this; }
+        public string DisplayReason()
+        {
+            string text = Reason;
+            if (WaitingReason != null) text += "\n" + WaitingReason;
+            if (LastBusinessAt.HasValue) text += "\n最近业务事件 " + LastBusinessAt.Value.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") + "（不代表当前任务完成）";
+            return text;
+        }
         public static Snapshot Unknown(Snapshot last, string error)
         {
-            Snapshot s = new Snapshot(); s.Title = "状态未知"; s.Reason = error == "status_timeout" ? "检查超时，请刷新后重试。" : "未取得可靠状态，请刷新后重试。"; s.Error = error;
+            Snapshot s = new Snapshot(); s.Title = "状态未知"; s.Reason = error == "status_timeout" ? "检查超时，请刷新后重试。" : error == "subscription_projection_upgrade_required" ? "当前后台未提供订阅核验，请使用同一版本的维护入口更新。" : "未取得可靠状态，请刷新后重试。"; s.Error = error;
             if (last != null) { s.InstalledVersion = last.InstalledVersion; s.ServiceVersion = last.ServiceVersion; s.CheckedAt = last.CheckedAt; }
             return s;
         }
@@ -135,14 +216,352 @@ namespace CodexDotsBridge.Tray
             b.AppendLine("托盘版本: " + (trayVersion ?? "未取得")); b.AppendLine("安装版本: " + (InstalledVersion ?? "未取得")); b.AppendLine("后台版本: " + (ServiceVersion ?? "未取得"));
             b.AppendLine("状态: " + (effectiveTitle ?? Title)); b.AppendLine("本机服务: " + Service); b.AppendLine("云端连接: " + Cloud); b.AppendLine("Dot 订阅: " + Dot);
             b.AppendLine("登录自启: " + Autostart); b.AppendLine("检查时间: " + (CheckedAt.HasValue ? CheckedAt.Value.ToString("o") : "未取得"));
+            b.AppendLine("自启检查时间: " + (AutostartCheckedAt.HasValue ? AutostartCheckedAt.Value.ToString("o") : "未取得"));
             b.AppendLine("错误码: " + (Error ?? "无")); b.AppendLine("在途任务数: " + (Inflight.HasValue ? Inflight.Value.ToString(CultureInfo.InvariantCulture) : "未取得"));
             b.AppendLine("状态说明: " + Reason);
+            b.AppendLine("订阅状态: " + SubscriptionState); b.AppendLine("订阅有效至: " + (SubscriptionExpiresAt.HasValue ? SubscriptionExpiresAt.Value.ToString("o") : "未取得"));
+            b.AppendLine("当前实例: " + (InstanceId ?? "未取得")); b.AppendLine("数据位置标识: " + (DataBinding ?? "未取得"));
+            if (WaitingReason != null) b.AppendLine("任务等待: " + WaitingReason);
+            b.AppendLine("最近业务事件: " + (LastBusinessAt.HasValue ? LastBusinessAt.Value.ToString("o") : "未取得"));
             foreach (string key in CountKeys) if (Counts.ContainsKey(key)) b.AppendLine("任务 " + key + ": " + Counts[key].ToString(CultureInfo.InvariantCulture));
             b.Append("连接状态不证明任务或消息已成功。" ); return b.ToString();
         }
     }
 
     internal sealed class CommandResult { public string Output, Error; public bool TimedOut; public int ExitCode; }
+    // Polling has no CLI or child-process path. Lifecycle commands continue to use
+    // Cli below. The endpoint, credential, instance and observation are all bound
+    // to the same local installation before a response can reach the UI.
+    internal sealed class StatusClient
+    {
+        const int Limit = 131072, Timeout = 3000;
+        readonly string root, dataDir;
+        sealed class Local
+        {
+            public Dictionary<string, object> Config, Hint, Lock, ServiceLock;
+            public string ConfigText, HintText, LockText, ServiceText, Instance, Endpoint;
+        }
+        public StatusClient(string root, string dataDir) { this.root = Options.NormalizePath(root); this.dataDir = Options.NormalizePath(dataDir); }
+        static string Text(Dictionary<string, object> value, string key) { object item; return value != null && value.TryGetValue(key, out item) ? item as string : null; }
+        static Dictionary<string, object> Object(Dictionary<string, object> value, string key) { object item; return value != null && value.TryGetValue(key, out item) ? item as Dictionary<string, object> : null; }
+        static bool True(Dictionary<string, object> value, string key) { object item; return value != null && value.TryGetValue(key, out item) && item is bool && (bool)item; }
+        static int Pid(Dictionary<string, object> value, string key)
+        {
+            object item; if (value == null || !value.TryGetValue(key, out item) || (!(item is int) && !(item is long))) return 0;
+            long n = Convert.ToInt64(item, CultureInfo.InvariantCulture); return n > 0 && n <= Int32.MaxValue ? (int)n : 0;
+        }
+        static bool SamePath(string left, string right) { return left != null && right != null && String.Equals(Options.NormalizePath(left), Options.NormalizePath(right), StringComparison.OrdinalIgnoreCase); }
+        static void Safe(string path)
+        {
+            for (string current = Path.GetFullPath(path); !String.IsNullOrEmpty(current); current = Path.GetDirectoryName(current))
+            {
+                try { if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new FormatException("unsafe_local_state"); }
+                catch (FileNotFoundException) { }
+                catch (DirectoryNotFoundException) { }
+            }
+        }
+        static byte[] Bounded(Stream stream)
+        {
+            using (MemoryStream output = new MemoryStream())
+            {
+                byte[] buffer = new byte[4096]; int count;
+                while ((count = stream.Read(buffer, 0, Math.Min(buffer.Length, Limit + 1 - (int)output.Length))) > 0)
+                { output.Write(buffer, 0, count); if (output.Length > Limit) throw new FormatException("projection_too_large"); }
+                return output.ToArray();
+            }
+        }
+        static byte[] FileBytes(string path)
+        {
+            Safe(path);
+            try { using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)) return Bounded(stream); }
+            catch (FileNotFoundException) { return null; }
+            catch (DirectoryNotFoundException) { return null; }
+        }
+        static string FileText(string path) { byte[] bytes = FileBytes(path); return bytes == null ? null : new UTF8Encoding(false, true).GetString(bytes).TrimStart('\uFEFF'); }
+        static Dictionary<string, object> Json(string text)
+        {
+            if (text == null) return null;
+            JavaScriptSerializer serializer = new JavaScriptSerializer(); serializer.MaxJsonLength = Limit;
+            Dictionary<string, object> value = serializer.Deserialize<Dictionary<string, object>>(text);
+            if (value == null) throw new FormatException("invalid_local_state"); return value;
+        }
+        static Uri Endpoint(string text)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(text, UriKind.Absolute, out uri) || uri.Scheme != "http" || uri.Host != "127.0.0.1" || uri.Port < 1 || uri.IsDefaultPort ||
+                uri.AbsolutePath != "/" || uri.Query.Length != 0 || uri.Fragment.Length != 0 || uri.UserInfo.Length != 0 ||
+                !Regex.IsMatch(text, @"\Ahttp://127\.0\.0\.1:[0-9]+/\z")) throw new FormatException("invalid_local_endpoint");
+            return new Uri(uri, "control/tray_status");
+        }
+        Local ReadLocal()
+        {
+            Local state = new Local(); state.ConfigText = FileText(Path.Combine(dataDir, "config.json")); state.Config = Json(state.ConfigText);
+            Guid instance; string id = Text(state.Config, "instance_id");
+            if (Text(state.Config, "owner") != "codex-dots-bridge" || !Guid.TryParseExact(id, "D", out instance) ||
+                (Pid(state.Config, "schema_version") != 1 && Pid(state.Config, "schema_version") != 2)) throw new FormatException("invalid_local_config");
+            state.Instance = instance.ToString("D"); state.Endpoint = Text(state.Config, "endpoint"); if (state.Endpoint != null) Endpoint(state.Endpoint);
+            Dictionary<string, object> installation = Object(state.Config, "installation");
+            if (installation != null && !SamePath(Text(installation, "root"), root)) throw new FormatException("installation_binding_mismatch");
+            state.HintText = FileText(Path.Combine(dataDir, "supervisor-state.json")); state.Hint = Json(state.HintText);
+            state.LockText = FileText(Path.Combine(dataDir, "supervisor.lock")); state.Lock = Json(state.LockText);
+            state.ServiceText = FileText(Path.Combine(dataDir, "service.lock")); state.ServiceLock = Json(state.ServiceText);
+            if (state.Hint != null && (String.IsNullOrEmpty(Text(state.Hint, "owner")) || Pid(state.Hint, "pid") == 0)) throw new FormatException("invalid_local_state");
+            if (state.Lock != null && (state.Hint == null || Text(state.Lock, "owner") != Text(state.Hint, "owner") || Pid(state.Lock, "pid") != Pid(state.Hint, "pid"))) throw new FormatException("supervisor_ownership_mismatch");
+            if (state.ServiceLock != null && (String.IsNullOrEmpty(Text(state.ServiceLock, "owner")) || Pid(state.ServiceLock, "pid") == 0)) throw new FormatException("service_identity_unverified");
+            return state;
+        }
+        static int Presence(int pid)
+        {
+            if (pid < 1) return -1;
+            try { using (Process process = Process.GetProcessById(pid)) return process.HasExited ? 0 : 1; }
+            catch (ArgumentException) { return 0; }
+            catch { return -1; }
+        }
+        static bool AllGone(Local state)
+        {
+            if (state.Lock == null || Text(state.Hint, "phase") != "running" || True(state.Hint, "cleanup_complete") || Pid(state.Hint, "bridge_pid") == 0) return false;
+            if (state.ServiceLock != null && (Pid(state.ServiceLock, "pid") != Pid(state.Hint, "bridge_pid") || Text(state.ServiceLock, "owner") == Text(state.Hint, "owner"))) return false;
+            foreach (string key in new string[] { "pid", "bridge_pid", "guardian_pid", "tunnel_pid" })
+                if (state.Hint.ContainsKey(key) && Presence(Pid(state.Hint, key)) != 0) return false;
+            return true;
+        }
+        bool LauncherOwned(string launcher)
+        {
+            string payload = Path.GetDirectoryName(root), install = Path.GetDirectoryName(payload);
+            if (Path.GetFileName(payload) != "payload" || !SamePath(launcher, Path.Combine(install, "CodexDotsBridge.Launcher.exe"))) return false;
+            Safe(launcher); if (!File.Exists(launcher) || new FileInfo(launcher).Length > 32 * 1024 * 1024) return false;
+            Dictionary<string, object> state = Json(FileText(Path.Combine(install, "installation-state.json")));
+            if (Text(state, "owner") != "codex-dots-bridge-setup" || Pid(state, "schema") != 1 || !SamePath(Text(state, "install_directory"), install) || !SamePath(Text(state, "payload_root"), root) || !SamePath(Text(state, "data_dir"), dataDir)) return false;
+            using (SHA256 hash = SHA256.Create())
+            using (FileStream stream = File.OpenRead(launcher))
+                return Text(state, "launcher_sha256") == BitConverter.ToString(hash.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+        }
+        string Autostart(Local state)
+        {
+            try
+            {
+                Dictionary<string, object> manifest = Json(FileText(Path.Combine(dataDir, "installation.json")));
+                if (Text(manifest, "owner") != "codex-dots-bridge" || Text(manifest, "instance_id") != state.Instance) return "unknown";
+                Dictionary<string, object> mcp = Object(manifest, "mcp"); object argsValue;
+                if (mcp == null || Text(mcp, "name") != "codex-dots-bridge" || !mcp.TryGetValue("args", out argsValue)) return "unknown";
+                System.Collections.IList args = argsValue as System.Collections.IList; if (args == null || args.Count != 4 || (string)args[1] != "stdio" || (string)args[2] != "--data-dir" || !SamePath(args[3] as string, dataDir) || !SamePath(args[0] as string, Path.Combine(root, "dist", "main.js"))) return "unknown";
+                Dictionary<string, object> entry = Object(manifest, "autostart");
+                string launcher = Text(manifest, "autostart_launcher"), kind = Text(entry, "kind");
+                if (launcher != null && !LauncherOwned(launcher)) return "unknown";
+                bool link = launcher != null && (entry == null || kind == "startup-link");
+                string name = link ? "CodexDotsBridge.lnk" : "CodexDotsBridge.vbs";
+                string path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Startup), name);
+                byte[] bytes = FileBytes(path); if (bytes == null) return "disabled";
+                if (entry == null || !SamePath(Text(entry, "path"), path) || Text(entry, "content") != (link ? Convert.ToBase64String(bytes) : new UTF8Encoding(false, true).GetString(bytes))) return "unknown";
+                if (link && !SamePath(Text(entry, "launcher"), launcher)) return "unknown";
+                if (launcher == null) return "enabled";
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder", false))
+                {
+                    object value = key == null ? null : key.GetValue(name); if (value == null) return "enabled";
+                    byte[] approval = value as byte[]; if (approval == null || approval.Length < 12) return "unknown";
+                    return approval[0] == 2 || approval[0] == 6 ? "enabled" : approval[0] == 3 || approval[0] == 7 ? "disabled" : "unknown";
+                }
+            }
+            catch { return "unknown"; }
+        }
+        CommandResult Offline(Local local, string error, bool processGone)
+        {
+            string state = "unknown", tone = "amber", title = "状态未知", reason = "暂时无法核验当前服务状态", control = "disabled", service = "待确认";
+            if (True(local.Hint, "cleanup_complete") && local.Lock == null && local.ServiceLock == null)
+            {
+                bool failed = Text(local.Hint, "error") != null || Text(local.Hint, "phase") == "failed";
+                state = failed ? "failed" : "stopped"; tone = failed ? "red" : "gray"; title = failed ? "后台故障" : "后台已停止";
+                reason = failed ? "后台报告故障，需要检查" : "后台已停止，可随时启动"; control = "start"; service = "已停止"; error = failed ? "supervisor_failed" : null;
+                if (Text(local.Hint, "error") == "bridge_start_failed" || Text(local.Hint, "error") == "supervisor_spawn_failed") { title = "启动失败"; reason = "后台启动未成功，请检查连接设置"; }
+            }
+            else if (local.Hint == null && local.Lock == null && local.ServiceLock == null && local.Endpoint == null)
+            {
+                bool setup = Object(local.Config, "tunnel") == null; state = setup ? "setup" : "stopped"; tone = setup ? "amber" : "gray";
+                title = setup ? "等待连接设置" : "后台已停止"; reason = setup ? "请完成连接配置" : "后台已停止，可随时启动"; control = "start"; service = "已停止"; error = null;
+            }
+            else if (processGone && AllGone(local))
+            {
+                state = "failed"; tone = "red"; title = "后台连接中断"; reason = "记录的后台进程均已退出，可启动恢复；启动时会重新核验安全条件";
+                control = "start"; service = "连接已中断"; error = "background_connection_lost";
+            }
+            else if (local.Lock != null && Text(local.Hint, "phase") == "starting") { state = "starting"; title = "正在启动"; reason = "服务正在启动，请稍候"; service = "正在启动"; }
+            else if (local.Lock != null && Text(local.Hint, "phase") == "stopping")
+            {
+                string stopPath = Path.Combine(dataDir, "supervisor.stop");
+                Dictionary<string, object> stop = Json(FileText(stopPath));
+                bool old = stop != null && (DateTime.UtcNow - File.GetLastWriteTimeUtc(stopPath)).TotalSeconds > 35;
+                state = old ? "stop_unconfirmed" : "stopping"; title = old ? "停止尚未确认" : "正在停止";
+                reason = old ? "停止请求已发出，清理结果尚未确认" : "正在等待服务完成清理"; service = "正在停止";
+            }
+            else if (local.Lock != null && Text(local.Hint, "phase") == "failed")
+            {
+                state = "failed"; tone = "red"; title = "后台故障"; reason = "后台报告故障，需要检查"; service = "后台故障";
+                if (Text(local.Hint, "error") == "bridge_start_failed" || Text(local.Hint, "error") == "supervisor_spawn_failed") { title = "启动失败"; reason = "后台启动未成功，请检查连接设置"; }
+            }
+            string now = DateTimeOffset.UtcNow.ToString("o");
+            return new CommandResult { Output = new JavaScriptSerializer().Serialize(new { schema = 1, instance_id = local.Instance, installed_version = Program.Version,
+                service_version = (string)null, state = state, tone = tone, title = title, reason = reason, control = control, service = service, cloud = "未检查", dot = "未检查",
+                autostart = Autostart(local), autostart_checked_at = now, checked_at = now, task_counts = new Dictionary<string, int>(), inflight_count = (int?)null, error = error }) };
+        }
+        public Task<CommandResult> Read()
+        {
+            return Task.Run(delegate
+            {
+                try
+                {
+                    Local local = ReadLocal(); int presence = local.ServiceLock == null ? 0 : Presence(Pid(local.ServiceLock, "pid"));
+                    if (local.Endpoint == null || presence != 1) return Offline(local, presence < 0 ? "service_identity_unverified" : "service_not_running", presence == 0);
+                    string token = FileText(Path.Combine(dataDir, "caller.key")); token = token == null ? null : token.Trim();
+                    if (token == null || !Regex.IsMatch(token, @"\A[a-f0-9]{64}\z")) return new CommandResult { Error = "invalid_local_credential", ExitCode = -1 };
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(Endpoint(local.Endpoint));
+                    request.Proxy = null; request.AllowAutoRedirect = false; request.Method = "POST"; request.ContentType = "application/json";
+                    request.Headers[HttpRequestHeader.Authorization] = "Bearer " + token; request.Timeout = Timeout; request.ReadWriteTimeout = Timeout;
+                    request.ContentLength = 2; request.ServicePoint.Expect100Continue = false;
+                    // Abort is an overall deadline, including a server that drips body bytes.
+                    using (System.Threading.Timer deadline = new System.Threading.Timer(delegate { request.Abort(); }, null, Timeout, System.Threading.Timeout.Infinite))
+                    {
+                        try
+                        {
+                            using (Stream body = request.GetRequestStream()) body.Write(new byte[] { 123, 125 }, 0, 2);
+                            string json;
+                            using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                            {
+                                if (response.StatusCode != HttpStatusCode.OK || response.ContentLength > Limit) return new CommandResult { Error = "invalid_projection", ExitCode = -1 };
+                                using (Stream stream = response.GetResponseStream()) json = new UTF8Encoding(false, true).GetString(Bounded(stream));
+                            }
+                            Dictionary<string, object> projection = Json(json); Guid instance;
+                            if (!Guid.TryParseExact(Text(projection, "instance_id"), "D", out instance) || instance.ToString("D") != local.Instance) return new CommandResult { Error = "service_identity_unverified", ExitCode = -1 };
+                            if (Text(projection, "data_binding") == null) return new CommandResult { Error = "subscription_projection_upgrade_required", ExitCode = -1 };
+                            if (Text(projection, "data_binding") != DataBinding(dataDir, local.Instance)) return new CommandResult { Error = "data_binding_mismatch", ExitCode = -1 };
+                            Snapshot snapshot = Snapshot.Parse(json); // Includes the observation-time check.
+                            if (snapshot.InstalledVersion == null) return new CommandResult { Error = "service_version_unavailable", ExitCode = -1 };
+                            Local current = ReadLocal();
+                            if (current.ConfigText != local.ConfigText || current.LockText != local.LockText || current.ServiceText != local.ServiceText ||
+                                Text(current.Hint, "owner") != Text(local.Hint, "owner") || Pid(current.Hint, "pid") != Pid(local.Hint, "pid")) return new CommandResult { Error = "local_identity_changed", ExitCode = -1 };
+                            return new CommandResult { Output = json };
+                        }
+                        catch (WebException error)
+                        {
+                            if (error.Response != null) error.Response.Dispose();
+                            bool timeout = error.Status == WebExceptionStatus.Timeout || error.Status == WebExceptionStatus.RequestCanceled;
+                            // Re-read hints so a completed stop can safely expose Start. Never
+                            // convert reachability alone (or a live PID) to readiness.
+                            return Offline(ReadLocal(), timeout ? "status_timeout" : "local_service_unreachable", false);
+                        }
+                    }
+                }
+                catch { return new CommandResult { Error = "invalid_local_projection", ExitCode = -1 }; }
+            });
+        }
+        public static string DataBinding(string directory, string instance)
+        {
+            string source = directory.Replace('\\', '/');
+            if (source.StartsWith("//./", StringComparison.Ordinal) || (source.StartsWith("//?/", StringComparison.Ordinal) && !Regex.IsMatch(source, @"\A//\?/(?:[A-Za-z]:/|UNC/[^/]+/[^/]+(?:/|\z))", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant))) throw new FormatException("unsupported_data_path");
+            if (source.StartsWith("//?/UNC/", StringComparison.OrdinalIgnoreCase)) source = "//" + source.Substring(8);
+            else if (source.StartsWith("//?/", StringComparison.Ordinal)) source = source.Substring(4);
+            string normalized = Options.NormalizePath(source).Replace('\\', '/').ToLowerInvariant();
+            if (!Regex.IsMatch(normalized, @"\A[a-z]:/\z")) normalized = normalized.TrimEnd('/');
+            using (SHA256 hash = SHA256.Create()) return BitConverter.ToString(hash.ComputeHash(Encoding.UTF8.GetBytes(normalized + "\n" + instance.ToLowerInvariant()))).Replace("-", "").ToLowerInvariant();
+        }
+    }
+    // Tray-owned preferences live beside DataDir, never in the business database/configuration.
+    internal sealed class TrayPreferences
+    {
+        const int Limit = 16384;
+        readonly string path;
+        public string AutomationUrl, AutomationBinding;
+        readonly HashSet<string> notices = new HashSet<string>(StringComparer.Ordinal);
+        public TrayPreferences(string dataDir) { path = Options.NormalizePath(dataDir) + ".tray.json"; Load(); }
+        public static bool IsAutomationUrl(string value)
+        {
+            return value != null && value.Length <= 256 && Regex.IsMatch(value, @"\Ahttps://chatgpt\.com/scheduled/automation/[A-Za-z0-9_-]{1,128}\z", RegexOptions.CultureInvariant);
+        }
+        void Safe()
+        {
+            SecurityIdentifier user = WindowsIdentity.GetCurrent().User;
+            for (string current = path; !String.IsNullOrEmpty(current); current = Path.GetDirectoryName(current))
+            {
+                if (!File.Exists(current) && !Directory.Exists(current)) continue;
+                if ((File.GetAttributes(current) & FileAttributes.ReparsePoint) != 0) throw new IOException("unsafe_tray_preferences");
+            }
+            string parent = Path.GetDirectoryName(path);
+            if (!Directory.Exists(parent)) throw new IOException("unowned_tray_preferences");
+            PrivateAcl(Directory.GetAccessControl(parent), user);
+            if (File.Exists(path)) PrivateAcl(File.GetAccessControl(path), user);
+        }
+        static void PrivateAcl(System.Security.AccessControl.FileSystemSecurity security, SecurityIdentifier user)
+        {
+            if (!security.GetOwner(typeof(SecurityIdentifier)).Equals(user)) throw new IOException("unowned_tray_preferences");
+            var rights = System.Security.AccessControl.FileSystemRights.Write | System.Security.AccessControl.FileSystemRights.Delete | System.Security.AccessControl.FileSystemRights.ChangePermissions | System.Security.AccessControl.FileSystemRights.TakeOwnership | System.Security.AccessControl.FileSystemRights.DeleteSubdirectoriesAndFiles;
+            foreach (System.Security.AccessControl.FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                var sid = (SecurityIdentifier)rule.IdentityReference;
+                if (rule.AccessControlType == System.Security.AccessControl.AccessControlType.Allow && (rule.FileSystemRights & rights) != 0 && !sid.Equals(user) && !sid.IsWellKnown(WellKnownSidType.LocalSystemSid) && !sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) && !sid.IsWellKnown(WellKnownSidType.CreatorOwnerSid)) throw new IOException("shared_tray_preferences");
+            }
+        }
+        void Load()
+        {
+            try
+            {
+                Safe(); if (!File.Exists(path)) return;
+                string content;
+                using (FileStream stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    if (stream.Length > Limit) return;
+                    byte[] buffer = new byte[Limit + 1]; int total = 0, count;
+                    while (total < buffer.Length && (count = stream.Read(buffer, total, buffer.Length - total)) > 0) total += count;
+                    if (total > Limit) return; content = new UTF8Encoding(false, true).GetString(buffer, 0, total);
+                }
+                var json = new JavaScriptSerializer(); json.MaxJsonLength = Limit; var value = json.Deserialize<Dictionary<string, object>>(content); object item;
+                if (value == null || !value.TryGetValue("schema", out item) || !(item is int) || (int)item != 1) return;
+                if (value.TryGetValue("automation_url", out item) && IsAutomationUrl(item as string)) AutomationUrl = (string)item;
+                if (value.TryGetValue("automation_binding", out item) && item is string && Regex.IsMatch((string)item, @"\A[a-f0-9]{64}\z")) AutomationBinding = (string)item;
+                if (value.TryGetValue("notices", out item))
+                {
+                    System.Collections.IList saved = item as System.Collections.IList; if (saved == null || saved.Count > 32) return;
+                    foreach (object key in saved) if (key is string && Regex.IsMatch((string)key, @"\A[a-f0-9]{64}\z")) notices.Add((string)key);
+                }
+            }
+            catch { /* A damaged/unsafe preference never changes service state or opens a page. */ }
+        }
+        void Save()
+        {
+            Safe(); string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                string text = new JavaScriptSerializer().Serialize(new { schema = 1, automation_url = AutomationUrl, automation_binding = AutomationBinding, notices = new List<string>(notices) });
+                if (Encoding.UTF8.GetByteCount(text) > Limit) throw new IOException("tray_preferences_too_large");
+                using (FileStream stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                { byte[] bytes = Encoding.UTF8.GetBytes(text); stream.Write(bytes, 0, bytes.Length); stream.Flush(true); }
+                Safe(); if (File.Exists(path)) File.Replace(temporary, path, null); else File.Move(temporary, path);
+            }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        }
+        public bool SetAutomationUrl(string value, string binding)
+        {
+            if (!IsAutomationUrl(value) || binding == null || !Regex.IsMatch(binding, @"\A[a-f0-9]{64}\z")) return false;
+            string previous = AutomationUrl, previousBinding = AutomationBinding; AutomationUrl = value; AutomationBinding = binding;
+            try { Save(); return true; } catch { AutomationUrl = previous; AutomationBinding = previousBinding; return false; }
+        }
+        static string Key(Snapshot snapshot)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(snapshot.DataBinding + "\n" + (snapshot.SubscriptionId ?? "missing"));
+            using (SHA256 hash = SHA256.Create()) return BitConverter.ToString(hash.ComputeHash(bytes)).Replace("-", "").ToLowerInvariant();
+        }
+        public bool Observe(Snapshot snapshot)
+        {
+            if (!snapshot.SubscriptionReliable) return false;
+            if (snapshot.SubscriptionState == "valid" || snapshot.SubscriptionState == "expiring")
+            {
+                if (notices.Count > 0) { notices.Clear(); try { Save(); } catch { } }
+                return false;
+            }
+            if (snapshot.SubscriptionState != "expired" && snapshot.SubscriptionState != "missing") return false;
+            string key = Key(snapshot); if (notices.Contains(key) || notices.Count >= 32) return false;
+            notices.Add(key); try { Save(); } catch { /* Still suppress repeats for this process. */ }
+            return true;
+        }
+    }
     internal sealed class Cli
     {
         public readonly string Root, DataDir;
@@ -281,10 +700,19 @@ namespace CodexDotsBridge.Tray
     {
         public event EventHandler Exiting;
         readonly Options options; readonly Cli cli; readonly EventWaitHandle showEvent, exitEvent;
+        Func<Task<CommandResult>> statusReader;
+        readonly TrayPreferences preferences;
+        Action<string> openUrl;
+        Action<Snapshot> subscriptionNotice;
+        Func<string, string> automationLinkPrompt;
+        bool handlingSubscription, subscriptionActionNote;
+        DateTime lastAutomationOpen = DateTime.MinValue;
+        string lastAutomationUrl;
         RegisteredWaitHandle showWait, exitWait;
         readonly System.Windows.Forms.Timer poll = new System.Windows.Forms.Timer();
         readonly NotifyIcon tray = new NotifyIcon(); readonly ContextMenuStrip menu = new ContextMenuStrip();
         readonly Label heading = new Label(), reason = new Label(), service = new Label(), cloud = new Label(), dot = new Label(), versions = new Label(), autostart = new Label(), checkedAt = new Label();
+        readonly Label identity = new Label();
         readonly Button control = new PremiumButton(), refresh = new PremiumButton(); readonly LinkLabel copy = new LinkLabel();
         readonly PremiumButton closeButton = new PremiumButton(); readonly Label wordmark = new Label(); readonly PictureBox brandView = new PictureBox();
         readonly StatusBadge statusBadge = new StatusBadge(); readonly RoundedPanel components = new RoundedPanel(); readonly TableLayoutPanel header = new TableLayoutPanel();
@@ -309,6 +737,11 @@ namespace CodexDotsBridge.Tray
         public BridgeForm(Options o, EventWaitHandle show, EventWaitHandle exit)
         {
             options = o; showEvent = show; exitEvent = exit; cli = new Cli(AppDomain.CurrentDomain.BaseDirectory, o.DataDir);
+            statusReader = new StatusClient(cli.Root, o.DataDir).Read;
+            if (!o.Preview) preferences = new TrayPreferences(o.DataDir);
+            openUrl = delegate(string url) { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); };
+            subscriptionNotice = delegate(Snapshot snapshot) { tray.ShowBalloonTip(8000, "Codex Dots Bridge：订阅待处理", "当前实例已确认无有效订阅。点击托盘中的“检查并处理”核对原规则。", ToolTipIcon.Warning); };
+            automationLinkPrompt = PromptAutomationLink;
             Text = "Codex Dots Bridge"; Name = "CodexDotsBridgeStatus"; ShowInTaskbar = false; StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.None; MaximizeBox = false; MinimizeBox = false; AutoScaleMode = AutoScaleMode.None;
             AutoSize = false; Font = new Font("Microsoft YaHei UI", 10F); ClientSize = new Size(420, 480); MinimumSize = new Size(420, 0);
@@ -316,6 +749,8 @@ namespace CodexDotsBridge.Tray
             menu.Items.Add("打开状态窗", null, delegate { OpenWindow(); });
             controlItem.Click += async delegate { await ChangeService(); }; menu.Items.Add(controlItem);
             menu.Items.Add("刷新状态", null, async delegate { await RefreshState(); }); menu.Items.Add("复制诊断", null, delegate { CopyDiagnostics(); });
+            menu.Items.Add("检查并处理订阅", null, async delegate { await CheckAndHandleSubscription(); });
+            menu.Items.Add("设置原规则链接…", null, delegate { ConfigureAutomationLink(false); });
             menu.Items.Add(new ToolStripSeparator()); autoItem.Click += async delegate { await ChangeAutostart(); }; menu.Items.Add(autoItem);
             menu.Items.Add(new ToolStripSeparator()); menu.Items.Add("退出托盘", null, delegate { ExitTray(); });
             menu.Font = new Font("Microsoft YaHei UI", 9.5F); menu.Padding = new Padding(6); foreach (ToolStripItem item in menu.Items) if (!(item is ToolStripSeparator)) item.Padding = new Padding(6, 5, 12, 5);
@@ -356,11 +791,12 @@ namespace CodexDotsBridge.Tray
             TableLayoutPanel rows = new TableLayoutPanel(); rows.AutoSize = true; rows.ColumnCount = 2; rows.Dock = DockStyle.Top; rows.Margin = new Padding(0);
             rows.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 40)); rows.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
             AddRow(rows, "本机服务", service); AddRow(rows, "云端连接", cloud); AddRow(rows, "Dot 订阅", dot); components.Controls.Add(rows); outer.Controls.Add(components);
+            identity.AutoSize = true; identity.MaximumSize = new Size(366, 0); identity.Font = new Font("Microsoft YaHei UI", 8.5F); identity.Margin = new Padding(0, 0, 0, 12); outer.Controls.Add(identity);
             TableLayoutPanel actions = new TableLayoutPanel(); actions.ColumnCount = 2; actions.AutoSize = true; actions.Dock = DockStyle.Fill; actions.Margin = new Padding(0, 0, 0, 22); actions.TabIndex = 0;
             actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50)); actions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
             control.AutoSize = refresh.AutoSize = false; control.MinimumSize = refresh.MinimumSize = new Size(100, 40); control.Height = refresh.Height = 40; control.Dock = refresh.Dock = DockStyle.Fill;
-            control.Margin = new Padding(0, 0, 5, 0); refresh.Margin = new Padding(5, 0, 0, 0); refresh.Text = "刷新状态"; control.TabIndex = 0; refresh.TabIndex = 1;
-            control.Click += async delegate { await ChangeService(); }; refresh.Click += async delegate { await RefreshState(); }; actions.Controls.Add(control, 0, 0); actions.Controls.Add(refresh, 1, 0); outer.Controls.Add(actions);
+            control.Margin = new Padding(0, 0, 5, 0); refresh.Margin = new Padding(5, 0, 0, 0); refresh.Text = "检查并处理"; control.TabIndex = 0; refresh.TabIndex = 1;
+            control.Click += async delegate { await ChangeService(); }; refresh.Click += async delegate { await CheckAndHandleSubscription(); }; actions.Controls.Add(control, 0, 0); actions.Controls.Add(refresh, 1, 0); outer.Controls.Add(actions);
             footer.ColumnCount = 2; footer.RowCount = 3; footer.AutoSize = false; footer.Dock = DockStyle.Top; footer.Padding = new Padding(0, 14, 0, 0); footer.Margin = new Padding(0); footer.TabIndex = 1;
             footer.RowStyles.Add(new RowStyle(SizeType.AutoSize)); footer.RowStyles.Add(new RowStyle(SizeType.AutoSize)); footer.RowStyles.Add(new RowStyle(SizeType.AutoSize));
             footer.Paint += delegate(object sender, PaintEventArgs e) { using (Pen pen = new Pen(components.LineColor)) e.Graphics.DrawLine(pen, 0, 0, footer.Width, 0); };
@@ -496,7 +932,7 @@ namespace CodexDotsBridge.Tray
                 do
                 {
                     int checkGeneration = generation; lastCheck = DateTime.UtcNow;
-                    CommandResult result = await cli.Run("status --tray", 5500, true);
+                    CommandResult result = await statusReader();
                     if (shuttingDown) return;
                     if (generation != checkGeneration) queuedRefresh = true;
                     else
@@ -507,6 +943,9 @@ namespace CodexDotsBridge.Tray
                             try { state = Snapshot.Parse(result.Output); state.CheckVersions(Program.Version); }
                             catch { state = Snapshot.Unknown(state, "invalid_projection"); }
                         }
+                        if (preferences != null && VersionsMatch && preferences.Observe(state))
+                        { try { subscriptionNotice(state); } catch { /* Notification failure never retries business activity. */ } }
+                        if (!handlingSubscription && subscriptionActionNote) { actionNote = null; subscriptionActionNote = false; }
                         if (pendingControl == "stop" && state.Control == "start" && (state.State == "stopped" || state.State == "failed")) { pendingControl = null; actionNote = null; }
                         if (pendingControl == "start" && (state.Control == "stop" || state.Tone == "red")) { pendingControl = null; actionNote = null; }
                         if (pendingAutostart != null && state.Autostart == pendingAutostart) { pendingAutostart = null; actionNote = null; }
@@ -522,9 +961,70 @@ namespace CodexDotsBridge.Tray
         {
             get { return Program.Version != null && state.InstalledVersion == Program.Version && (state.ServiceVersion == null || state.ServiceVersion == Program.Version); }
         }
+        async Task CheckAndHandleSubscription()
+        {
+            if (options.Preview || shuttingDown || handlingSubscription || commandBusy) return;
+            handlingSubscription = true; subscriptionActionNote = true; actionNote = "正在核对当前实例与订阅…"; Render();
+            try
+            {
+                Task active = refreshTask; if (active != null) await active;
+                if (shuttingDown) return;
+                int expectedGeneration = generation;
+                await RefreshState(false);
+                if (shuttingDown) return;
+                if (generation != expectedGeneration || !state.SubscriptionReliable || !VersionsMatch)
+                { actionNote = state.Error == "subscription_projection_upgrade_required" ? "当前后台尚不提供订阅核验，请使用同一版本的维护入口更新后重试。" : "订阅状态尚未核实，请稍后再检查。"; return; }
+                if (state.SubscriptionState == "valid" || state.SubscriptionState == "expiring")
+                { actionNote = state.SubscriptionState == "valid" ? "订阅有效。平台续期后会自动刷新显示。" : "订阅即将到期，正在等待平台续期；托盘会自动检查。"; return; }
+                if (state.SubscriptionState != "expired" && state.SubscriptionState != "missing") { actionNote = "订阅状态尚未核实，请稍后再检查。"; return; }
+                if ((!TrayPreferences.IsAutomationUrl(preferences.AutomationUrl) || preferences.AutomationBinding != state.DataBinding) && !ConfigureAutomationLink(true)) return;
+                // A modal link prompt may span sleep, expiry or a changed service observation.
+                if (generation != expectedGeneration || !state.SubscriptionReliable || (state.SubscriptionState != "expired" && state.SubscriptionState != "missing"))
+                { actionNote = "状态已变化，请重新检查后处理。"; return; }
+                OpenAutomationLink(preferences.AutomationUrl);
+            }
+            catch { actionNote = "处理未完成，请检查后重试。"; }
+            finally { handlingSubscription = false; if (!shuttingDown) Render(); }
+        }
+        void OpenAutomationLink(string url)
+        {
+            if (!TrayPreferences.IsAutomationUrl(url)) { actionNote = "原规则链接无效，请重新设置。"; return; }
+            if (lastAutomationUrl == url && (DateTime.UtcNow - lastAutomationOpen).TotalSeconds < 2) { actionNote = "已请求打开原规则，请在 ChatGPT 核对；尚未确认续订。"; return; }
+            try { openUrl(url); lastAutomationUrl = url; lastAutomationOpen = DateTime.UtcNow; actionNote = "已请求打开原规则。请在 ChatGPT 核对或处理；尚未确认续订。"; }
+            catch { actionNote = "未能打开原规则，请稍后重试。"; }
+        }
+        bool ConfigureAutomationLink(bool opening)
+        {
+            if (options.Preview || shuttingDown || preferences == null || (handlingSubscription && !opening)) return false;
+            subscriptionActionNote = true;
+            if (state.DataBinding == null || state.InstanceId == null || state.State == "unknown" || !VersionsMatch)
+            { actionNote = "请先检查当前实例，再设置原规则链接。"; Render(); return false; }
+            string binding = state.DataBinding;
+            string url = automationLinkPrompt(opening ? "保存并打开" : "保存链接");
+            if (url == null) { actionNote = "尚未打开原规则。"; Render(); return false; }
+            if (state.DataBinding != binding || !preferences.SetAutomationUrl(url, binding)) { actionNote = "链接无效、实例已变化或无法保存。请检查后粘贴原规则的完整 https 链接。"; Render(); return false; }
+            actionNote = "原规则链接已保存到本机托盘偏好。"; Render(); return true;
+        }
+        string PromptAutomationLink(string buttonText)
+        {
+            using (Form dialog = new Form())
+            using (Label label = new Label())
+            using (TextBox input = new TextBox())
+            using (Button save = new Button())
+            using (Button cancel = new Button())
+            {
+                dialog.Text = "设置已绑定的原规则链接"; dialog.ClientSize = new Size(520, 154); dialog.StartPosition = FormStartPosition.CenterParent; dialog.FormBorderStyle = FormBorderStyle.FixedDialog; dialog.MaximizeBox = dialog.MinimizeBox = false; dialog.ShowInTaskbar = false;
+                label.Text = "粘贴你已绑定的 ChatGPT 原规则链接。仅保存本机偏好，不会续订或修改规则。"; label.SetBounds(16, 12, 488, 40);
+                input.SetBounds(16, 56, 488, 25); input.MaxLength = 256; input.Text = preferences.AutomationBinding == state.DataBinding ? preferences.AutomationUrl ?? "" : "";
+                save.Text = buttonText; save.SetBounds(294, 108, 100, 30); save.DialogResult = DialogResult.OK;
+                cancel.Text = "取消"; cancel.SetBounds(404, 108, 100, 30); cancel.DialogResult = DialogResult.Cancel;
+                dialog.Controls.AddRange(new Control[] { label, input, save, cancel }); dialog.AcceptButton = save; dialog.CancelButton = cancel;
+                return dialog.ShowDialog(this) == DialogResult.OK ? input.Text : null;
+            }
+        }
         async Task ChangeService()
         {
-            if (options.Preview || shuttingDown || commandBusy || pendingControl != null || state.Control == "disabled" || !VersionsMatch) return;
+            if (options.Preview || shuttingDown || commandBusy || handlingSubscription || pendingControl != null || state.Control == "disabled" || !VersionsMatch) return;
             string action = state.Control;
             // Reserve this intent before awaiting; never reverse a click after the state changes.
             commandBusy = true; Render();
@@ -547,7 +1047,7 @@ namespace CodexDotsBridge.Tray
         }
         async Task ChangeAutostart()
         {
-            if (options.Preview || shuttingDown || commandBusy || pendingAutostart != null || state.Autostart == "unknown" || !VersionsMatch) return;
+            if (options.Preview || shuttingDown || commandBusy || handlingSubscription || pendingAutostart != null || state.Autostart == "unknown" || !VersionsMatch) return;
             string previous = state.Autostart, target = previous == "enabled" ? "disabled" : "enabled";
             commandBusy = true; Render();
             Task activeCheck = refreshTask; if (activeCheck != null) await activeCheck;
@@ -568,21 +1068,23 @@ namespace CodexDotsBridge.Tray
             catch (ExternalException) { actionNote = "剪贴板暂不可用，请重试。"; }
             Render();
         }
-        string EffectiveTone { get { return pendingControl != null ? "amber" : state.Tone; } }
-        string EffectiveTitle { get { if (pendingControl == "stop") return commandBusy ? "正在停止" : "停止尚未确认"; if (pendingControl == "start") return commandBusy ? "正在启动" : "启动尚未确认"; return state.Title; } }
+        string EffectiveTone { get { return pendingControl != null || (state.SubscriptionReliable && state.SubscriptionState == "expiring" && state.Tone == "green") ? "amber" : state.Tone; } }
+        string EffectiveTitle { get { if (pendingControl == "stop") return commandBusy ? "正在停止" : "停止尚未确认"; if (pendingControl == "start") return commandBusy ? "正在启动" : "启动尚未确认"; if (state.SubscriptionReliable && state.SubscriptionState == "expiring" && state.Tone == "green") return "订阅即将到期"; return state.Title; } }
         void Render()
         {
             string title = EffectiveTitle, tone = EffectiveTone;
-            bool layoutChanged = layoutDirty || heading.Text != title || reason.Text != (actionNote ?? state.Reason) || service.Text != state.Service || cloud.Text != state.Cloud || dot.Text != state.Dot;
+            string subscriptionText = state.SubscriptionText();
+            string identityText = "当前实例：" + (state.InstanceId ?? "未核实") + "\n数据位置：" + options.DataDir;
+            bool layoutChanged = layoutDirty || heading.Text != title || reason.Text != (actionNote ?? state.DisplayReason()) || service.Text != state.Service || cloud.Text != state.Cloud || dot.Text != subscriptionText || identity.Text != identityText;
             heading.Text = title; heading.ForeColor = ForeColor;
             Color statusColor = ToneColor(tone);
             if (statusBadge.Tone != tone || statusBadge.StatusColor != statusColor) { statusBadge.Tone = tone; statusBadge.StatusColor = statusColor; statusBadge.Invalidate(); }
-            reason.Text = actionNote ?? state.Reason; reason.Visible = reason.Text.Length > 0;
-            service.Text = state.Service; cloud.Text = state.Cloud; dot.Text = state.Dot;
+            reason.Text = actionNote ?? state.DisplayReason(); reason.Visible = reason.Text.Length > 0;
+            service.Text = state.Service; cloud.Text = state.Cloud; dot.Text = subscriptionText; identity.Text = identityText;
             string button = state.Control == "start" ? "启动后台" : "停止后台";
             if (pendingControl == "start") button = "正在启动"; else if (pendingControl == "stop") button = "正在停止";
-            control.Text = controlItem.Text = button; control.Enabled = controlItem.Enabled = !options.Preview && !commandBusy && pendingControl == null && state.Control != "disabled" && VersionsMatch;
-            refresh.Enabled = !commandBusy; autoItem.Enabled = !options.Preview && !commandBusy && pendingAutostart == null && state.Autostart != "unknown" && VersionsMatch;
+            control.Text = controlItem.Text = button; control.Enabled = controlItem.Enabled = !options.Preview && !commandBusy && !handlingSubscription && pendingControl == null && state.Control != "disabled" && VersionsMatch;
+            refresh.Enabled = !commandBusy && !handlingSubscription; autoItem.Enabled = !options.Preview && !commandBusy && !handlingSubscription && pendingAutostart == null && state.Autostart != "unknown" && VersionsMatch;
             autoItem.Text = state.Autostart == "unknown" ? "登录 Windows 后自动启动（未确认）" : "登录 Windows 后自动启动";
             autoItem.CheckState = state.Autostart == "enabled" ? CheckState.Checked : state.Autostart == "unknown" ? CheckState.Indeterminate : CheckState.Unchecked;
             string oldAutostart = autostart.Text, oldVersions = versions.Text;
@@ -636,7 +1138,7 @@ namespace CodexDotsBridge.Tray
             components.LineColor = SystemInformation.HighContrast ? fg : dark ? Color.FromArgb(57, 78, 89) : Color.FromArgb(217, 226, 233);
             foreach (Control row in components.Controls) { ThemeControl(row, components.BackColor, fg); TableLayoutPanel table = row as TableLayoutPanel; if (table != null) foreach (Control cell in table.Controls) if (table.GetColumn(cell) == 0) cell.ForeColor = muted; }
             ((PremiumButton)control).ApplyPalette(dark, true, false); ((PremiumButton)refresh).ApplyPalette(dark, false, false); closeButton.ApplyPalette(dark, false, true);
-            reason.ForeColor = versions.ForeColor = autostart.ForeColor = checkedAt.ForeColor = muted; copy.LinkColor = copy.ActiveLinkColor = fg; copy.VisitedLinkColor = fg;
+            reason.ForeColor = versions.ForeColor = autostart.ForeColor = checkedAt.ForeColor = identity.ForeColor = muted; copy.LinkColor = copy.ActiveLinkColor = fg; copy.VisitedLinkColor = fg;
             menu.BackColor = bg; menu.ForeColor = fg; menu.Renderer = SystemInformation.HighContrast ? (ToolStripRenderer)new ToolStripSystemRenderer() : new PremiumMenuRenderer(dark);
             foreach (ToolStripItem item in menu.Items) { item.ForeColor = fg; item.BackColor = bg; }
             if (IsHandleCreated) try { int enabled = dark && !SystemInformation.HighContrast ? 1 : 0; DwmSetWindowAttribute(Handle, 20, ref enabled, 4); int corner = SystemInformation.HighContrast ? 1 : 2; DwmSetWindowAttribute(Handle, 33, ref corner, 4); } catch (DllNotFoundException) { }

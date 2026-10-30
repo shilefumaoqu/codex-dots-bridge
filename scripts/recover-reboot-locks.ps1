@@ -259,7 +259,7 @@ function Invoke-DotsRebootRecovery([string]$Directory) {
         $opened['config.json'].Dispose()
         $config = $configText | ConvertFrom-Json
         $instance = [Guid]::Empty
-        if ($config.owner -ne 'codex-dots-bridge' -or $config.schema_version -ne 1 -or -not [Guid]::TryParse([string]$config.instance_id,[ref]$instance)) { throw 'unowned_data' }
+        if ($config.owner -ne 'codex-dots-bridge' -or $config.schema_version -notin @(1,2) -or -not [Guid]::TryParse([string]$config.instance_id,[ref]$instance)) { throw 'unowned_data' }
         if (-not $opened['supervisor-state.json']) { throw 'requires_manual_recovery' }
         $stateText = $opened['supervisor-state.json'].Read()
         $opened['supervisor-state.json'].Dispose()

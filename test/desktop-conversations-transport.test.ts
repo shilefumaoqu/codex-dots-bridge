@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type net from 'node:net';
 import Database from 'better-sqlite3';
-import { runRead, runSend } from '../src/desktop-conversations-transport.js';
+import { runRead, runReply, runSend } from '../src/desktop-conversations-transport.js';
+import type { DesktopReplyBinding } from '../src/desktop-reply.js';
 import { DesktopConversationsService } from '../src/desktop-conversations.js';
 import { readerFixture } from './desktop-conversation-reader-fixture.js';
 import { fixedEchoPrompt, runDesktopEchoIpc } from '../src/desktop-echo-ipc.js';
@@ -79,6 +80,21 @@ test('legacy new reads require official local mode and never open IPC or logs', 
   }, mode);
 });
 
+test('send persists source identity and original EOF before the only frame, then accepts the exact turn',async()=>fixture(async f=>{
+  const order:string[]=[],before=statSync(f.rolloutPath,{bigint:true});let binding:DesktopReplyBinding|undefined;
+  f.onStart(()=>f.append(f.complete()));
+  const result=await f.send({onReplyBinding:(value:DesktopReplyBinding)=>{order.push('binding');binding=value;},beforeSend:()=>{order.push('intent');f.persist();},onAccepted:()=>{order.push('ack');}});
+  assert.equal(result.status,'completed');assert.deepEqual(order,['binding','intent','ack']);
+  assert.equal(binding?.offset,Number(before.size));assert.equal(binding?.inode,before.ino.toString());assert.equal(binding?.path,f.rolloutPath);assert.equal(binding?.thread_id,f.threadId);
+  assert.deepEqual(await runReply({binding:binding!,turnId:f.turnId,signal:f.controller.signal,deadline:Date.now()+1000}),{status:'completed',turn_id:f.turnId,reply:'普通回复🌟'});
+  assert.equal(f.socket.frames.filter(frame=>frame.method==='thread-follower-start-turn').length,1);
+}));
+
+test('source-binding persistence failure prevents the native send frame',async()=>fixture(async f=>{
+  const result=await f.send({onReplyBinding:()=>{throw new Error('private storage error');}});
+  assert.equal(result.status,'skipped_unknown');assert.equal(f.before(),0);assert.equal(f.socket.frames.filter(frame=>frame.method==='thread-follower-start-turn').length,0);
+}));
+
 test('saved legacy read receipt retains idle evidence, chunks and identity after reopen', async () => fixture(async f => {
   (Object.values(f.history.turnHistory.history.entitiesByKey)[0] as any).items[0].content[0].text = '原文🌟'.repeat(15000);
   const dbPath = join(f.root, 'receipts.sqlite'), config = { enabled: true, targets: [{ thread_id: f.threadId, rollout_path: f.rolloutPath }] };
@@ -122,6 +138,15 @@ test('send rechecks a native state change during beforeSend before writing the s
   const result = await f.send({ beforeSend: () => { f.socket.receive({ type: 'broadcast', method: 'thread-stream-state-changed', version: 11, sourceClientId: 'owner', targetClientIds: ['follower'], params: { conversationId: f.threadId, hostId: 'local', change: { type: 'update' } } }); } });
   assert.equal(result.status, 'skipped_unknown'); assert(!f.socket.frames.some(frame => frame.method === 'thread-follower-start-turn'));
 }));
+
+test('matching abort or failure in the fast reply path retains the ACK and sends only once',async()=>{
+  for(const type of ['turn_aborted','task_failed'])await fixture(async f=>{
+    f.onStart(()=>f.append({type:'event_msg',payload:{type,turn_id:f.turnId}}));
+    assert.deepEqual(await f.send(),{status:'uncertain',reason:'reply_failed'});
+    assert.equal(f.accepted(),f.turnId);
+    assert.equal(f.socket.frames.filter(frame=>frame.method==='thread-follower-start-turn').length,1);
+  });
+});
 
 test('custom message inherits settings, persists before write, binds ACK and accepts arbitrary exact-turn reply', async () => fixture(async f => {
   f.append(f.complete(f.turnId, 'HISTORY_MUST_NOT_WIN', Date.now() - 10000));
@@ -212,9 +237,12 @@ test('autoload readiness preserves the service request and persisted acceptance 
   try {
     const args = { request_id: f.requestId, thread_id: f.threadId, text: 'same persisted request' };
     service.send(args); const result = await service.get({ request_id: f.requestId, wait_seconds: 2 });
-    assert.equal(result.status, 'completed'); assert.equal(result.request_id, f.requestId); assert.equal(result.reply, '普通回复🌟');
+    assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.request_id, f.requestId); assert.equal(result.reply, '普通回复🌟');
     const stored = JSON.parse((db.prepare('SELECT data FROM desktop_conversation_requests WHERE request_id = ?').get(f.requestId) as { data: string }).data);
     assert.equal(stored.accepted_turn_id, f.turnId); assert.equal(stored.sent, true);
+    const identity = statSync(f.nativePath, {bigint:true});
+    assert.equal(stored.reply_binding.version, 2); assert.equal(stored.reply_binding.inode, identity.ino.toString());
+    assert.equal(stored.reply_binding.device, identity.dev.toString()); assert.equal(stored.reply_binding.birthtime_ns, identity.birthtimeNs.toString());
     assert.equal(service.send(args).status, 'completed'); assert.equal(executions, 1); assert.equal(connects, 3); assert.equal(navigations, 1); assert.equal(f.before(), 1);
     assert.equal(f.socket.frames.filter(frame => frame.method === 'thread-follower-start-turn').length, 1);
   } finally { await service.close(); db.close(); }
@@ -235,7 +263,7 @@ test('warm loading consumes pre-send time but durable ACK opens a fresh real log
   try {
     const args = { request_id: f.requestId, thread_id: f.threadId, text: 'slow warm, fresh reply' };
     service.send(args); const result = await service.get({ request_id: f.requestId, wait_seconds: 2 });
-    assert.equal(result.status, 'completed'); assert.equal(result.reply, '普通回复🌟'); assert.equal(ackSaves, 1);
+    assert.equal(result.status, 'completed', JSON.stringify(result)); assert.equal(result.reply, '普通回复🌟'); assert.equal(ackSaves, 1);
     assert.equal(result.timing.stages_ms?.busy_wait, undefined);
     for (const stage of ['owner_lookup', 'autoload', 'send_ack', 'reply_wait'] as const) assert(Number.isFinite(result.timing.stages_ms?.[stage]));
     assert(result.timing.stages_ms!.autoload! >= 500); assert(result.timing.stages_ms!.reply_wait! >= 50);

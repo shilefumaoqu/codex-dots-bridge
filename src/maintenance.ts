@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, lstatSync, copyFileSync, unlinkSync, rmdirSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readSync, readFileSync, writeFileSync, mkdirSync, readdirSync, lstatSync, copyFileSync, unlinkSync, rmdirSync } from 'node:fs';
 import { join, resolve, dirname, relative, sep } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -8,8 +8,13 @@ import Database from 'better-sqlite3';
 import { initProduction, readProductionConfig, readOwnerNotificationConfig, writeProductionConfig, protectProductionDirectory } from './runtime.js';
 import { ProbeError } from './store.js';
 import { tunnelHealthSnapshot, type TunnelConnectionDiagnostic } from './tunnel-diagnostics.js';
+import { inspectMaintenanceActivity, validateMaintenanceConfiguration } from './storage-migration.js';
 
-const digest=(path:string)=>createHash('sha256').update(readFileSync(path)).digest('hex');
+const digest=(path:string)=>{
+  const hash=createHash('sha256'),fd=openSync(path,'r'),chunk=Buffer.allocUnsafe(1024*1024);
+  try {let bytes:number;while((bytes=readSync(fd,chunk,0,chunk.length,null))>0)hash.update(chunk.subarray(0,bytes));return hash.digest('hex');}
+  finally {closeSync(fd);}
+};
 function regular(path:string) { if(lstatSync(path).isSymbolicLink() || !lstatSync(path).isFile()) throw new ProbeError('unsafe_file'); }
 export function processIsAlive(pid:number) { if(!Number.isSafeInteger(pid)||pid<1)throw new ProbeError('invalid_process_id');try {process.kill(pid,0);return true;}catch(e){if((e as NodeJS.ErrnoException).code==='ESRCH')return false;return true;} }
 export function assertStopped(dir:string) {
@@ -23,16 +28,22 @@ export function statusData(dir:string) {
   const config=readProductionConfig(dir);
   const service=existsSync(join(dir,'service.lock'))?JSON.parse(readFileSync(join(dir,'service.lock'),'utf8')) as {pid:number}:undefined;
   const counts:Record<string,number>={};let subscriptions=0;
+  let activity={tasks:0,desktop_sends:0,desktop_reads:0,desktop_echo:0,context_reads:0,total:0};
   const dbPath=join(dir,'tasks.sqlite');
   if(existsSync(dbPath)) {
     regular(dbPath);const db=new Database(dbPath,{readonly:true,fileMustExist:true});
     try {
       const tables=(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as {name:string}[]).map(t=>t.name);
-      if(tables.includes('tasks')) for(const row of db.prepare('SELECT data FROM tasks').all() as {data:string}[]) {const task=JSON.parse(row.data) as {status:string};counts[task.status]=(counts[task.status]??0)+1;}
-      if(tables.includes('task_subscriptions')) for(const row of db.prepare('SELECT data FROM task_subscriptions').all() as {data:string}[]) {const sub=JSON.parse(row.data) as {active:boolean;expires_at:number};if(sub.active&&sub.expires_at>Date.now())subscriptions++;}
+      if(tables.includes('tasks')) {
+        const indexed=(db.pragma('table_xinfo(tasks)') as {name:string}[]).some(column=>column.name==='status');
+        const status=indexed?'status':"json_extract(data,'$.status')";
+        for(const row of db.prepare(`SELECT ${status} AS status,COUNT(*) AS count FROM tasks GROUP BY ${status}`).all() as {status:string;count:number}[]) counts[row.status]=row.count;
+      }
+      if(tables.includes('task_subscriptions')) subscriptions=(db.prepare("SELECT COUNT(*) AS n FROM task_subscriptions WHERE json_extract(data,'$.active')=1 AND json_extract(data,'$.expires_at')>?").get(Date.now()) as {n:number}).n;
+      activity=inspectMaintenanceActivity(db);
     } finally {db.close();}
   }
-  return {instance_id:config.instance_id,service:service?(processIsAlive(service.pid)?'running':'stale_lock'):'stopped',endpoint:config.endpoint??null,tunnel_configured:!!config.tunnel,plugin_subscription:subscriptions?'active':'missing_or_expired',tasks:counts,codex_tools:'requires_real_call_after_restart',task_bodies:'redacted'};
+  return {instance_id:config.instance_id,service:service?(processIsAlive(service.pid)?'running':'stale_lock'):'stopped',endpoint:config.endpoint??null,tunnel_configured:!!config.tunnel,plugin_subscription:subscriptions?'active':'missing_or_expired',tasks:counts,maintenance_activity:activity,storage:config.schema_version===2?config.storage:{database_version:1,phase:'ready'},codex_tools:'requires_real_call_after_restart',task_bodies:'redacted'};
 }
 export async function connectionDiagnosticsData(dir:string) {
   const config=readProductionConfig(dir);
@@ -54,7 +65,7 @@ export async function doctorData(dir:string) {
   checks.account_authorization='requires_official_account_flow';checks.dot_binding='requires_target_dot_subscription_and_real_task';
   return checks;
 }
-interface BackupManifest {owner:'codex-dots-bridge-backup';schema_version:1;instance_id:string;files:Record<string,string>}
+interface BackupManifest {owner:'codex-dots-bridge-backup';schema_version:1|2;instance_id:string;files:Record<string,string>}
 function pathsOverlap(a:string,b:string) {
   const key=(path:string)=>process.platform==='win32'?resolve(path).toLowerCase():resolve(path);
   const left=key(a),right=key(b);
@@ -64,9 +75,13 @@ export async function backupData(dir:string,destination:string) {
   protectProductionDirectory(dir);const config=readProductionConfig(dir),target=resolve(destination);
   if(pathsOverlap(dir,target))throw new ProbeError('backup_path_conflict');
   if(existsSync(target)&&readdirSync(target).length)throw new ProbeError('backup_destination_not_empty');
+  validateMaintenanceConfiguration(dir);
   initProduction(target);
   const files=['config.json','caller.key','worker.key'];
   for(const name of ['caller.key','worker.key'])copyFileSync(join(dir,name),join(target,name));
+  for(const name of ['desktop-conversations.json','desktop-echo.json','storage-migration.json'])if(existsSync(join(dir,name))) {
+    copyFileSync(join(dir,name),join(target,name));files.push(name);
+  }
   if(existsSync(join(dir,'owner-notification.json'))) {
     readOwnerNotificationConfig(dir); // Validate only; never import executable code.
     copyFileSync(join(dir,'owner-notification.json'),join(target,'owner-notification.json'));
@@ -75,6 +90,8 @@ export async function backupData(dir:string,destination:string) {
   if(existsSync(join(dir,'tasks.sqlite'))) {
     const db=new Database(join(dir,'tasks.sqlite'),{readonly:true,fileMustExist:true});
     try {await db.backup(join(target,'tasks.sqlite'));}finally{db.close();}files.push('tasks.sqlite');
+    const check=new Database(join(target,'tasks.sqlite'),{readonly:true,fileMustExist:true});
+    try {if(check.pragma('quick_check',{simple:true})!=='ok')throw new ProbeError('backup_database_integrity_failed');}finally{check.close();}
   }
   const {endpoint:_endpoint,installation:_installation,...saved}=config;
   if(saved.tunnel) {
@@ -82,7 +99,7 @@ export async function backupData(dir:string,destination:string) {
     saved.tunnel={...saved.tunnel,key_file:join(target,'tunnel-runtime.env')};files.push('tunnel-runtime.env');
   }
   writeProductionConfig(target,saved);
-  const manifest:BackupManifest={owner:'codex-dots-bridge-backup',schema_version:1,instance_id:config.instance_id,files:Object.fromEntries(files.map(name=>[name,digest(join(target,name))]))};
+  const manifest:BackupManifest={owner:'codex-dots-bridge-backup',schema_version:2,instance_id:config.instance_id,files:Object.fromEntries(files.map(name=>[name,digest(join(target,name))]))};
   writeFileSync(join(target,'backup-manifest.json'),JSON.stringify(manifest,null,2),{mode:0o600,flag:'wx'});protectProductionDirectory(target);
   return {backup_directory:target,consistent_sqlite:true,recovery_credentials_included:!!saved.tunnel,contains_secrets:true};
 }
@@ -92,13 +109,14 @@ export function restoreData(backup:string,targetDir:string) {
   assertStopped(target);
   protectProductionDirectory(source);
   const manifest=JSON.parse(readFileSync(join(source,'backup-manifest.json'),'utf8')) as BackupManifest;
-  if(manifest.owner!=='codex-dots-bridge-backup'||manifest.schema_version!==1)throw new ProbeError('invalid_backup_manifest');
-  const allowed=new Set(['config.json','owner-notification.json','caller.key','worker.key','tasks.sqlite','tunnel-runtime.env']);
+  if(manifest.owner!=='codex-dots-bridge-backup'||![1,2].includes(manifest.schema_version))throw new ProbeError('invalid_backup_manifest');
+  const allowed=new Set(['config.json','owner-notification.json','desktop-conversations.json','desktop-echo.json','storage-migration.json','caller.key','worker.key','tasks.sqlite','tunnel-runtime.env']);
   if(!manifest.files['config.json']||!manifest.files['caller.key']||!manifest.files['worker.key'])throw new ProbeError('incomplete_backup');
   for(const [name,sum] of Object.entries(manifest.files)) {if(!allowed.has(name))throw new ProbeError('invalid_backup_entry');regular(join(source,name));if(digest(join(source,name))!==sum)throw new ProbeError('backup_integrity_failed');}
   const config=readProductionConfig(source);if(config.instance_id!==manifest.instance_id)throw new ProbeError('backup_instance_mismatch');
   if(config.tunnel&&!manifest.files['tunnel-runtime.env'])throw new ProbeError('backup_key_missing');
   const notificationConfig=manifest.files['owner-notification.json']?readOwnerNotificationConfig(source):undefined;
+  validateMaintenanceConfiguration(source);
   if(existsSync(target)&&readdirSync(target).length)throw new ProbeError('restore_destination_not_empty');
   initProduction(target);
   for(const name of Object.keys(manifest.files))if(name!=='config.json')copyFileSync(join(source,name),join(target,name));

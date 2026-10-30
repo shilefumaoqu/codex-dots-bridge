@@ -7,18 +7,18 @@
 <p align="center">Hand work to your Dot, follow it in Codex, and retrieve the result.</p>
 
 <p align="center">
-  <a href="README.md">简体中文</a> · <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">v0.2.0-alpha.32</a> · Windows x64 · <a href="LICENSE">MIT</a>
+  <a href="README.md">简体中文</a> · 0.3.0-alpha.2 pre-release · Windows x64 · <a href="LICENSE">MIT</a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.2.0-alpha.32/Codex-Dots-Bridge-0.2.0-alpha.32-Setup.exe"><strong>Download the Windows installer</strong></a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/download/v0.3.0-alpha.2/Codex-Dots-Bridge-0.3.0-alpha.2-Setup.exe"><strong>Download the alpha.2 Windows installer</strong></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.2.0-alpha.32">Windows ZIP, SHA256 files and full release notes</a>
+  <a href="https://github.com/shilefumaoqu/codex-dots-bridge/releases/tag/v0.3.0-alpha.2">Windows ZIP, SHA256 files and full release notes</a>
 </p>
 
-> **Current release: 0.2.0-alpha.32 (experimental prerelease).** Builds on alpha.31 with deterministic Windows PowerShell built-in module loading, Unicode shortcuts, rollback identity protection and CI release/installer acceptance fixes. Includes a locally patched Tunnel build, not the unmodified official release; existing tray, history and handoff features are retained. ChatGPT-to-Dot continuous chat has not passed; later natural Events samples also expired without pickup. Read [acceptance and limits](ACCEPTANCE.md). A ready service does not prove a message round trip.
+> **Current version: 0.3.0-alpha.2, an experimental pre-release.** This release fixes the Windows reboot-recovery rejection for schema 2 data directories and adds real Windows recovery regressions. Alpha 0.2.0-alpha.32 cannot open migrated databases; follow the [migration and acceptance notes](ACCEPTANCE.md). Events accepted with HTTP 200 but never claimed, extended live chains and 72-hour stability remain separately tracked; a ready service does not prove a message round trip.
 
 Codex Dots Bridge connects Codex to your existing Dot. Delegate a text task, then use the same task ID to follow progress, answer questions, add requirements and retrieve the result.
 
@@ -60,6 +60,8 @@ You can also choose to let your Dot read the stored history of a local Codex con
 
 The alpha.21 program rendered this image with a synthetic status; “Connection ready” does not mean a specific message succeeded. Left-click to open status. Right-click to toggle start-at-login; closing the tray leaves the backend running.
 
+This source candidate adds [subscription checks and a recovery entry](docs/托盘订阅检查.md): expiry display, an amber warning near expiry, and one local notification for a confirmed outage. A click rechecks the current instance and can open the saved original rule. It never resends tasks or treats opening the rule as a successful renewal.
+
 For your first task, ask Codex:
 
 > Give the text below to my Dot, organize it into three bullet points, and tell me the task ID once submitted.
@@ -79,13 +81,11 @@ Reading uses the official local App Server to page through saved history. Sendin
 - **Read example:** “Read the stored history at this Codex conversation link and summarize the confirmed requirements.”
 - **Send example:** “Send `17 × 19` to this Codex conversation and retrieve its reply from that turn.”
 
-Reading all stored history pages does not guarantee the original model context is complete or recover material removed during compaction. If sending encounters a busy conversation, Bridge reports the state and asks you whether to wait for the next turn; adding to the current turn is unsupported. It does not automatically resend when the target is offline, unknown or the wait conditions change.
+Reading all stored history pages does not guarantee complete original model context or recover material removed during compaction. A new send is rejected before persistence while another send owns that target. A next-turn choice requires an exact busy turn and owner; adding to the current turn is unsupported. After a confirmed send, background retrieval can read the exact reply under the original request for up to 24 hours. Missing evidence remains unknown; there is no resend or automatic posting to another chat.
 
 ## Current status and experimental boundaries
 
-Alpha.30 has targeted startup checks, dedicated review, package and local-upgrade evidence; see ACCEPTANCE.md. Historical alpha.21 passed its Windows installer, upgrade and recovery checks. A synthetic Codex-to-Dot task completed and was retrieved, and one user-initiated local-conversation send returned a real reply. Timely automatic Events pickup, busy/offline edge cases, recovery after a real reboot and long-term operation are not fully validated. A prior host tool-catalog rejection has no confirmed root cause; a later successful sample does not show that the issue is resolved.
-
-[Historical alpha.21 Windows CI run](https://github.com/shilefumaoqu/codex-dots-bridge/actions/runs/38419703662) passed 35 of 38 checks; three legacy Git-history tests failed. The same source passed 38/38 locally, but the environment difference is unexplained and later CI build steps were skipped. A separate public-content privacy scan of 149 source files and 286 historical Git blobs found no issues; that does not mean the full CI passed.
+Candidate validation uses isolated temporary databases for logic, migration and synthetic performance. Windows artifacts, cross-version installation, at least 30 real round trips per chain and a 72-hour stability run remain separate acceptance requirements. Simple chat supports a reliable single text round trip without promising native conversation continuity. Pickup delay is an observation, not task completion. Historical evidence remains in the [changelog](CHANGELOG.md) and does not validate this candidate.
 
 The alpha is designed for one user, one Windows computer and one existing Dot, with default concurrency of 1. It is intended for testers willing to configure it and report issues; it is not a claim of compatibility with every account, device policy or unattended long-running setup.
 

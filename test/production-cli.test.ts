@@ -5,6 +5,7 @@ import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync
 import { tmpdir } from 'node:os';
 import { join, resolve, relative, isAbsolute } from 'node:path';
 import test from 'node:test';
+import { VERSION } from '../src/bridge.js';
 import { readProductionConfig, readToken, writeProductionConfig } from '../src/runtime.js';
 
 const delay=(ms:number)=>new Promise<void>(r=>setTimeout(r,ms));
@@ -67,7 +68,7 @@ test('foreground caller status reports actual local Tunnel health without exposi
 test('production CLI help/version are available without creating data',async()=>{
   const f=fixture();try {
     const help=await cli(['--help','--data-dir',f.dir]);assert.equal(help.code,0);assert.match(help.stdout,/tasks list\|get\|submit\|message\|followup\|cancel\|ack\|wait/);assert.match(help.stdout,/setup/);assert.equal(existsSync(f.dir),false);
-    const version=json(await cli(['--version','--data-dir',f.dir]));assert.equal(version.name,'codex-dots-bridge');assert.match(version.version,/^0\.2\./);assert.equal(existsSync(f.dir),false);
+    const version=json(await cli(['--version','--data-dir',f.dir]));assert.equal(version.name,'codex-dots-bridge');assert.equal(version.version,VERSION);assert.equal(existsSync(f.dir),false);
   }finally{f.close();}
 });
 

@@ -2,17 +2,18 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, relative, isAbsolute } from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import test from 'node:test';
 import { createMcpHandler } from '@modelcontextprotocol/server';
 import { TaskStore } from '../src/task-store.js';
 import { ProbeEvents } from '../src/events.js';
-import { callerSchemas, createProductionService, productionWorker, VERSION, type RuntimeStatusProvider } from '../src/bridge.js';
+import { callerSchemas, createProductionService, productionCall, productionWorker, VERSION, type RuntimeStatusProvider } from '../src/bridge.js';
 import { DesktopConversationsError, type DesktopConversationsService } from '../src/desktop-conversations.js';
 import { writeProductionConfig, acquireLock } from '../src/runtime.js';
 import { ProbeError } from '../src/store.js';
+import { requestFailure } from '../src/request-policy.js';
 
 const tokens={caller:'a'.repeat(64),worker:'b'.repeat(64)};
 const meta={'io.modelcontextprotocol/protocolVersion':'2026-07-28','io.modelcontextprotocol/clientCapabilities':{}};
@@ -58,6 +59,53 @@ async function fixture(runtimeStatus?:RuntimeStatusProvider, conversations?:Desk
     worker:async(name:string,args:unknown)=>unpack((await rpc('tools/call',{name,arguments:args})).body),
     async close(){await closeService();store.close();removeOwnTemp(dir);}};
 }
+test('actual tool discovery and compact calls preserve retries, work input and result identity',async()=>{
+  const f=await fixture();
+  try {
+    const catalog=(await f.rpc('tools/list')).body.result.tools;
+    assert.deepEqual(catalog.find((tool:any)=>tool.name==='claim_task').inputSchema.properties.response_mode.enum,['full','compact']);
+    const submitted={idempotency_key:'compact-wire',title:'Compact workflow',input:{text:'Return a synthetic text reply'},response_mode:'compact'};
+    const receipt=(await f.control('dots_submit',submitted)).body;
+    assert.equal(receipt.status,'queued');assert.equal(receipt.input,undefined);
+    const summary=(await f.control('dots_status',{summary:true})).body;
+    assert.deepEqual(summary.tasks,[]);assert.equal(summary.task_counts.queued,1);
+    assert.deepEqual((await f.control('dots_submit',submitted)).body,receipt);
+    const conflict=await f.control('dots_submit',{...submitted,response_mode:'full'});
+    assert.equal(conflict.status,409);assert.equal(conflict.body.error,'idempotency_conflict');
+    const claimArgs={task_id:receipt.task_id,claim_key:'compact-claim',response_mode:'compact'};
+    const claim=await f.worker('claim_task',claimArgs);
+    assert.equal(claim.input.text,submitted.input.text);assert.equal(claim.worker_rules.bridge_version,VERSION);
+    assert.ok(claim.deadline);assert.ok(claim.claim_token);assert.deepEqual(claim.messages,[]);
+    assert.equal((await f.worker('claim_task',claimArgs)).claim_token,claim.claim_token);
+    await f.worker('checkpoint_task',{task_id:receipt.task_id,claim_token:claim.claim_token,input_revision:claim.input_revision,response_mode:'compact'});
+    const completion={task_id:receipt.task_id,claim_token:claim.claim_token,input_revision:claim.input_revision,completion_key:'compact-complete',result:{text:'Synthetic reply'},response_mode:'compact'};
+    const completed=await f.worker('complete_task',completion);
+    assert.equal(completed.status,'completed');assert.equal(completed.accepted_as_final,true);assert.equal(completed.results,undefined);
+    assert.deepEqual(await f.worker('complete_task',completion),completed);
+    const details=(await f.control('dots_get',{task_id:receipt.task_id})).body;
+    assert.equal(details.result.text,'Synthetic reply');assert.equal(details.result_id,completed.result_id);
+    for(const row of f.store.db.prepare('SELECT response FROM task_operations').all() as {response:string}[]) {
+      assert.ok(!row.response.includes('Synthetic reply'));assert.ok(!row.response.includes('Return a synthetic text reply'));
+    }
+  }finally{await f.close();}
+});
+
+test('chat compact claim carries text-only rules and rejects request_input without releasing its claim',async()=>{
+  const f=await fixture();
+  try {
+    f.store.saveSubscription({id:'sub_'+'a'.repeat(40),url:'https://example.com/callback',secret:'s'.repeat(32),active:true,expires_at:Date.now()+3_600_000,verified_until:Date.now()+300_000,generation:1});
+    const message=await f.worker('dots_chat_send',{request_id:randomUUID(),text:'Clarify in one final text'});
+    const task=f.store.list({status:'queued'})[0]!;
+    const claim=await f.worker('claim_task',{task_id:task.task_id,claim_key:'chat-text',response_mode:'compact'});
+    assert.equal(claim.worker_rules.chat_scope,'single_text_reply');
+    await f.worker('checkpoint_task',{task_id:task.task_id,claim_token:claim.claim_token,input_revision:claim.input_revision});
+    const rejected=await f.rpc('tools/call',{name:'request_input',arguments:{task_id:task.task_id,claim_token:claim.claim_token,question_key:'forbidden',question:'Which one?'}});
+    toolError(rejected.body,'chat_text_reply_required');assert.equal(f.store.get(task.task_id).status,'running');
+    await f.worker('complete_task',{task_id:task.task_id,claim_token:claim.claim_token,input_revision:claim.input_revision,completion_key:'clarification-as-text',result:{text:'Which one do you mean?'},response_mode:'compact'});
+    const result=await f.worker('dots_chat_status',{request_id:message.request_id});
+    assert.equal(result.status,'reply');assert.equal(result.text,'Which one do you mean?');
+  }finally{await f.close();}
+});
 test('worker protocol audit correlates bounded received/responded metadata without RPC IDs, content or secrets',async()=>{
   let sends=0;
   const conversations={enabled:true,read:async()=>({text:'SECRET_RESPONSE'}),send:async()=>{sends++;return {text:'SECRET_RESPONSE'};},get:async()=>({text:'SECRET_RESPONSE'}),close:async()=>{}} as unknown as DesktopConversationsService;
@@ -66,10 +114,10 @@ test('worker protocol audit correlates bounded received/responded metadata witho
     const request_id=randomUUID(),thread_id=randomUUID(),rpcId=randomUUID();
     const sent=await f.rpc('tools/call',{name:'codex_send_message',arguments:{request_id,thread_id,text:'SECRET_BODY'}},rpcId);
     assert.equal(sent.status,200);assert.equal(unpack(sent.body).text,'SECRET_RESPONSE');assert.equal(sends,1);
-    const raw=()=>f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind IN ('worker_protocol_request','worker_protocol_response') ORDER BY id").all() as {detail:string}[];
+    const raw=()=>f.store.db.prepare("SELECT detail FROM task_diagnostics WHERE kind IN ('worker_protocol_request','worker_protocol_response') ORDER BY id").all() as {detail:string}[];
     const expected={method:'tools/call',tool_name:'codex_send_message',bridge_version:VERSION};
     assert.deepEqual(raw().map(row=>JSON.parse(row.detail)),[{...expected,phase:'received'},{...expected,request_id,phase:'responded',http_status:200}]);
-    assert.equal((f.store.db.prepare("SELECT COUNT(*) AS n FROM task_evidence WHERE kind='worker_protocol_request'").get() as {n:number}).n,1,'response metadata must not double-count original requests');
+    assert.equal((f.store.db.prepare("SELECT COUNT(*) AS n FROM task_diagnostics WHERE kind='worker_protocol_request'").get() as {n:number}).n,1,'response metadata must not double-count original requests');
     assert.deepEqual(f.store.evidence().filter(row=>row.kind.startsWith('worker_protocol_')).map(row=>JSON.parse(row.detail)),raw().map(row=>JSON.parse(row.detail)));
     const malicious=await f.rpc('tools/call',{name:'SECRET_TOOL',arguments:{request_id:'SECRET_INVALID_ID',thread_id,text:'SECRET_BODY',token:'SECRET_TOKEN',keys:{SECRET_KEY:'SECRET_VALUE'}}},rpcId);
     assert.ok(malicious.body.error||malicious.body.result?.isError);
@@ -134,9 +182,9 @@ test('worker ingress observes auth and parsing boundaries with private correlati
     const hostStatus=await new Promise<number>((resolve,reject)=>{
       const request=httpRequest(new URL('mcp/dot?SECRET_QUERY',f.endpoint),{method:'POST',headers:{host:'SECRET_HOST.example','content-type':'application/json','X-Codex-Dots-Worker-Token':tokens.worker}},response=>{response.resume();response.once('end',()=>resolve(response.statusCode!));});request.once('error',reject);request.end(body);
     });assert.equal(hostStatus,403);
-    // Existing custom error handling intentionally returns 500 for parser failures.
-    assert.equal(await raw('{SECRET_BAD_JSON'),500);
-    assert.equal(await raw(JSON.stringify({text:'SECRET_BODY'.repeat(30_000)})),500);
+    // Invalid JSON and transport limits have distinct client errors.
+    assert.equal(await raw('{SECRET_BAD_JSON'),400);
+    assert.equal(await raw(JSON.stringify({text:'SECRET_BODY'.repeat(210_000)})),413);
     assert.deepEqual(rows().filter(d=>d.stage==='body_rejected').map(d=>d.reason),['invalid_json','body_too_large']);
     assert.deepEqual(rows().filter(d=>d.stage==='auth_rejected').map(d=>d.reason),['worker_token_rejected','origin_rejected','host_rejected']);
     const before=rows().length;
@@ -145,7 +193,7 @@ test('worker ingress observes auth and parsing boundaries with private correlati
     await f.rpc('SECRET_METHOD',{name:'SECRET_TOOL',arguments:{task_id:deniedId}});
     await f.rpc('tools/call',{name:'get_task',arguments:{task_id:deniedId,text:'SECRET_EXTRA'}});
     await raw(JSON.stringify({jsonrpc:'SECRET_BAD_RPC',method:'tools/call',params:{name:'get_task',arguments:{task_id:deniedId}}}));
-    const diagnosticRows=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
+    const diagnosticRows=f.store.db.prepare("SELECT detail FROM task_diagnostics WHERE kind LIKE 'worker_%'").all();
     for(const observed of [JSON.stringify(diagnosticRows),JSON.stringify(f.store.evidence())]) {
       for(const secret of [deniedId,rpcId,'SECRET_QUERY','SECRET_VALUE','SECRET_TOKEN','SECRET_ORIGIN','SECRET_HOST','SECRET_BAD_JSON','SECRET_BODY','SECRET_PATH','SECRET_METHOD','SECRET_TOOL','SECRET_EXTRA']) assert.ok(!observed.includes(secret),secret);
     }
@@ -196,7 +244,7 @@ test('worker diagnostic UUIDs are collected only inside SDK-accepted tool callba
   let sends=0,workerReads=0;
   const conversations={enabled:true,send:async()=>{sends++;return {status:'synthetic_once'};},close:async()=>{}} as unknown as DesktopConversationsService;
   const f=await fixture(undefined,conversations);
-  const raw=()=>f.store.db.prepare("SELECT task_id,detail FROM task_evidence WHERE kind LIKE 'worker_%' ORDER BY id").all() as {task_id:string|null;detail:string}[];
+  const raw=()=>f.store.db.prepare("SELECT task_id,detail FROM task_diagnostics WHERE kind LIKE 'worker_%' ORDER BY id").all() as {task_id:string|null;detail:string}[];
   try {
     const task=(await f.control('dots_submit',{idempotency_key:'sdk-diagnostic-validation',title:'Synthetic',input:{text:'SECRET_BODY'}})).body;
     const originalGet=f.store.get.bind(f.store);
@@ -273,7 +321,7 @@ test('worker invocation correlation stays isolated across concurrent requests an
     const response=await handler.fetch(new Request('http://localhost/mcp/dot',{method:'POST',headers:{'content-type':'application/json',accept:'application/json, text/event-stream','MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/call','Mcp-Name':'codex_send_message'},body:JSON.stringify({jsonrpc:'2.0',id:1,method:'tools/call',params:{_meta:meta,name:'codex_send_message',arguments:{request_id:randomUUID(),thread_id:randomUUID(),text:'SECRET_SEND_TEXT'}}})}));
     assert.equal(response.status,200);assert.deepEqual(unpack(await response.json()),{status:'synthetic_once'});
     assert.equal(observerCalls,1);assert.equal(sends,4);
-    const raw=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
+    const raw=f.store.db.prepare("SELECT detail FROM task_diagnostics WHERE kind LIKE 'worker_%'").all();
     for(const observed of [JSON.stringify(raw),JSON.stringify(f.store.evidence())])for(const hidden of ['SECRET_BODY','SECRET_SEND_TEXT','SECRET_OBSERVER_FAILURE','SECRET_WRITE_FAILURE'])assert.ok(!observed.includes(hidden));
   } finally {await handler.close();await f.close();}
 });
@@ -306,7 +354,11 @@ test('task finish distinguishes returned tools from missing, expired, FIFO and o
     const chat=f.store.chats.send({request_id:randomUUID(),text:'SECRET_CHAT'});
     const chatTask=f.store.db.prepare('SELECT task_id FROM bridge_chat_messages WHERE request_id=?').get(chat.request_id) as {task_id:string};
     f.store.db.prepare("UPDATE tasks SET data=json_set(data,'$.deadline',?) WHERE id=?").run(new Date(now-1).toISOString(),chatTask.task_id);
-    await check('get_task',{task_id:chatTask.task_id},'reply_subscription_unavailable');
+    const expired=await check('get_task',{task_id:chatTask.task_id},'reply_subscription_unavailable');
+    assert.deepEqual(JSON.parse(expired.body.result.content[0].text),{error:'reply_subscription_unavailable',category:'state',retryable:false,reason:'chat_message_expired'});
+    f.store.chats.subscriptionStopped(sub);
+    const stale=await check('get_task',{task_id:chatTask.task_id},'reply_subscription_unavailable');
+    assert.deepEqual(JSON.parse(stale.body.result.content[0].text),{error:'reply_subscription_unavailable',category:'state',retryable:false,reason:'chat_route_unavailable'});
     assert.equal(f.store.inspectChatTask(chatTask.task_id).attempt,0);assert.equal(f.store.inspectChatTask(first.task_id).attempt,1);
   } finally {await f.close();}
 });
@@ -333,7 +385,7 @@ test('task returned means callback return, including non-final completion and a 
     const finished=taskIngress(f.store).filter(row=>row.stage==='tool_finished');
     assert.ok(finished.every(row=>row.outcome==='returned'&&row.error_code===undefined));
     assert.ok(['complete_task','fail_task','checkpoint_task','request_input','ack_cancel'].every(name=>finished.some(row=>row.tool_name===name)));
-    const raw=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
+    const raw=f.store.db.prepare("SELECT detail FROM task_diagnostics WHERE kind LIKE 'worker_%'").all();
     for(const observed of [JSON.stringify(raw),JSON.stringify(f.store.evidence())])assert.ok(!observed.includes('SECRET_'));
   } finally {await f.close();}
 });
@@ -418,7 +470,7 @@ test('task error diagnostics allow fixed codes only and never parse secret error
       const finished=taskIngress(f.store).slice(before).filter(row=>row.stage==='tool_finished');
       assert.equal(finished.length,1);assert.equal(finished[0].outcome,'error');assert.equal(finished[0].error_code,'unclassified_tool_error');
     } finally {f.store.fail=originalFail;}
-    const raw=f.store.db.prepare("SELECT detail FROM task_evidence WHERE kind LIKE 'worker_%'").all();
+    const raw=f.store.db.prepare("SELECT detail FROM task_diagnostics WHERE kind LIKE 'worker_%'").all();
     for(const observed of [JSON.stringify(raw),JSON.stringify(f.store.evidence())])assert.ok(!observed.includes('SECRET_'));
     f.store.audit('worker_ingress',null,{stage:'tool_finished',outcome:'SECRET_OUTCOME',error_code:'SECRET_CODE',message:'SECRET_MESSAGE',stack:'SECRET_STACK',result:{text:'SECRET_RESULT'}});
     assert.deepEqual(JSON.parse(f.store.evidence().at(-1)!.detail),{stage:'tool_finished'});
@@ -435,7 +487,7 @@ test('worker tools/list definitions remain identical across task state changes a
     const task=(await f.control('dots_submit',{idempotency_key:'stable-catalog',title:'Synthetic catalog specimen',input:{text:'Synthetic only'}})).body;
     await check();
     const claimArgs={task_id:task.task_id,claim_key:'stable-claim'};
-    const claim=await f.worker('claim_task',claimArgs);assert.deepEqual(await f.worker('claim_task',claimArgs),claim);await check();
+    const claim=await f.worker('claim_task',claimArgs);assert.equal((await f.worker('claim_task',claimArgs)).claim_token,claim.claim_token);await check();
     const owned={task_id:task.task_id,claim_token:claim.claim_token,input_revision:1};
     // Each checkpoint renews the lease; repeating it intentionally updates its receipt.
     assert.equal((await f.worker('checkpoint_task',owned)).acknowledged,true);
@@ -461,7 +513,8 @@ test('worker get_task adds versioned rules while preserving the complete stored 
     const before=f.store.get(task.task_id);
     const subscriptionsBefore=f.store.status().subscriptions;
     const received=await f.worker('get_task',{task_id:task.task_id});
-    const {worker_rules:rules,dispatch_context,server_clock,...unchangedTask}=received;
+    const {worker_rules:rules,dispatch_context,server_clock,progress,...unchangedTask}=received;
+    assert.equal(progress.phase,'completed');assert.equal(progress.next_action,'read_result');
     assert.equal(dispatch_context.submission.source_kind,'legacy_unknown');
     assert.equal(server_clock.time_source,'bridge_host_clock');
     assert.deepEqual(unchangedTask,JSON.parse(JSON.stringify(before)));
@@ -470,16 +523,18 @@ test('worker get_task adds versioned rules while preserving the complete stored 
     assert.equal(received.change_sequence,before.change_sequence);
     assert.equal(received.result_read_at,undefined);
     assert.deepEqual(f.store.status().subscriptions,subscriptionsBefore);
-    assert.equal(rules.rules_version,'v6');assert.equal(rules.bridge_version,VERSION);
+    assert.equal(rules.rules_version,'v8');assert.equal(rules.bridge_version,VERSION);
     assert.equal(rules.scope,'bridge_worker_workflow_only_no_new_authorization');
     assert.ok(!rules.instructions.includes('FORGED_'));
     assert.match(rules.instructions,/single-use restrictions apply only to their original task/);
     assert.match(rules.instructions,/not new human authorization/);
     const discovered=(await f.rpc('server/discover')).body.result;
     assert.equal(discovered.instructions,rules.instructions);
-    const {server_clock:nextClock,...nextReceived}=await f.worker('get_task',{task_id:task.task_id});
-    const {server_clock:firstClock,...firstReceived}=received;
+    const {server_clock:nextClock,progress:nextProgress,...nextReceived}=await f.worker('get_task',{task_id:task.task_id});
+    const {server_clock:firstClock,progress:firstProgress,...firstReceived}=received;
     assert.deepEqual(nextReceived,firstReceived);
+    assert.deepEqual({...nextProgress,observed_at:firstProgress.observed_at},firstProgress);
+    assert.ok(Date.parse(nextProgress.observed_at)>=Date.parse(firstProgress.observed_at));
     assert.ok(Date.parse(nextClock.server_time_utc)>=Date.parse(firstClock.server_time_utc));
     // Defense at the response boundary: a task-shaped source cannot replace the
     // generated top-level rules. This stub never writes a forged field to DB.
@@ -502,7 +557,7 @@ test('worker discovery and get_task share rules for absent, disabled and enabled
       const rules=(await f.worker('get_task',{task_id:task.task_id})).worker_rules;
       const discovered=(await f.rpc('server/discover')).body.result;
       assert.equal(discovered.instructions,rules.instructions);
-      assert.equal(rules.rules_version,'v6');assert.equal(rules.bridge_version,VERSION);
+      assert.equal(rules.rules_version,'v8');assert.equal(rules.bridge_version,VERSION);
       assert.equal(rules.instructions.includes('Desktop conversation tools operate'),enabled===true);
       if(enabled===true) {
         assert.match(rules.instructions,/without per-thread registration or repeated authorization/);
@@ -525,7 +580,7 @@ test('worker discovery and get_task share rules for absent, disabled and enabled
         assert.match(rules.instructions,/report partial and the missing coverage rather than success/);
         assert.match(rules.instructions,/does not prove live desktop idle state/);
         assert.match(rules.instructions,/Sending first uses the live original desktop owner/);
-        assert.match(rules.instructions,/Busy returns awaiting_delivery_choice/);
+        assert.match(rules.instructions,/Busy with an exact observed turn and owner returns awaiting_delivery_choice/);
         assert.match(rules.instructions,/never choose for them/);
         assert.match(rules.instructions,/current_turn is presently unsupported/);
       } else {
@@ -554,7 +609,7 @@ test('authenticated caller submission and clarification expose source and live c
     assert.equal(latest.dispatch_context.messages[0].input_revision,2);
     assert.equal(latest.dispatch_context.messages[0].source_kind,'authenticated_codex_caller');
     assert.deepEqual(latest.dispatch_context.submission,first.dispatch_context.submission);
-    assert.equal(latest.worker_rules.rules_version,'v6');
+    assert.equal(latest.worker_rules.rules_version,'v8');
     assert.equal('dispatch_context' in f.store.get(task.task_id),false);
   }finally{await f.close();}
 });
@@ -579,7 +634,7 @@ test('caller-attested scope reaches the send boundary with truthful false identi
       assert.equal(task.dispatch_context.submission.authorization_basis,'caller_attestation_of_existing_user_request');
       assert.equal(task.dispatch_context.submission.human_identity_verified,false);
       assert.equal(task.dispatch_context.submission.native_approval_granted,false);
-      assert.equal(task.worker_rules.rules_version,'v6');
+      assert.equal(task.worker_rules.rules_version,'v8');
       const claim=await f.worker('claim_task',{task_id:task.task_id,claim_key:'scoped-claim'});
       await f.worker('checkpoint_task',{task_id:task.task_id,claim_token:claim.claim_token,input_revision:1});
       const response=await f.rpc('tools/call',{name:'codex_send_message',arguments:{request_id,thread_id,text}});
@@ -675,6 +730,50 @@ test('service shutdown interrupts an active status provider and handles its late
     assert.ok(!JSON.stringify(response.body).includes('PRIVATE_'));
   }finally{await f.close();}
 });
+test('productionCall, real CLI and stdio retain only allowlisted chat refusal reasons',async t=>{
+  const f=await fixture();let caller:ReturnType<typeof stdio>|undefined,body:Record<string,unknown>={};
+  let requests=0;
+  // A real local HTTP boundary supplies hostile error extras, not a real Dot failure.
+  const endpoint=createServer((request,response)=>{
+    assert.equal(request.url,'/control/dots_get');assert.equal(request.headers.authorization,'Bearer '+tokens.caller);
+    requests++;request.resume();response.writeHead(409,{'content-type':'application/json'});response.end(JSON.stringify(body));
+  });
+  try {
+    await new Promise<void>(resolve=>endpoint.listen(0,'127.0.0.1',resolve));
+    const address=endpoint.address();assert.ok(address&&typeof address==='object');
+    writeProductionConfig(f.dir,{owner:'codex-dots-bridge',schema_version:1,instance_id:randomUUID(),endpoint:`http://127.0.0.1:${address.port}/`});
+    caller=stdio(f.dir);await caller.initialize();const task_id=randomUUID();
+    for(const item of [
+      {name:'message expiry',reason:'chat_message_expired',expected:'chat_message_expired'},
+      {name:'route invalidation',reason:'chat_route_unavailable',expected:'chat_route_unavailable'},
+      {name:'legacy omission'},
+      {name:'unknown reason',reason:'PRIVATE_REASON'},
+      {name:'object reason',reason:{text:'PRIVATE_REASON'}},
+      {name:'array reason',reason:['chat_message_expired']},
+      {name:'reason bound to a different error',code:'task_not_found',reason:'chat_message_expired'},
+    ])await t.test(item.name,async()=>{
+      const code=item.code??'reply_subscription_unavailable';
+      body={error:code,reason:item.reason,category:'PRIVATE_CATEGORY',retryable:true,isError:false,activity:'PRIVATE_ACTIVITY',message:'PRIVATE_BODY',secret:tokens.caller};
+      const expected={error:code,category:'state',retryable:false,...(item.expected?{reason:item.expected}:{})};
+      const before=requests;
+      await assert.rejects(productionCall(f.dir,'dots_get',{task_id}),error=>{
+        assert.ok(error instanceof ProbeError);assert.equal(error.code,code);assert.equal(error.message,code);assert.equal(error.reason,item.expected);
+        assert.deepEqual(requestFailure(error,code),{status:409,body:expected});assert.ok(!JSON.stringify(error).includes('PRIVATE_'));return true;
+      });
+      const rpc=await caller!.call('tools/call',{name:'dots_get',arguments:{task_id}});
+      toolError(rpc,code);assert.deepEqual(JSON.parse(rpc.result.content[0].text),expected);
+      const cli=await new Promise<{error:Error|null;stdout:string;stderr:string}>(resolve=>{
+        execFile(process.execPath,['--import','tsx','src/main.ts','tasks','get','--data-dir',f.dir,'--task',task_id],{cwd:process.cwd(),windowsHide:true,timeout:10000},(error,stdout,stderr)=>resolve({error,stdout,stderr}));
+      });
+      assert.equal((cli.error as {code?:number})?.code,1);assert.deepEqual(JSON.parse(cli.stdout),expected);
+      for(const secret of ['PRIVATE_',tokens.caller])assert.ok(!(cli.stdout+cli.stderr+JSON.stringify(rpc)).includes(secret));
+      assert.equal(requests-before,3,'each caller performs one HTTP request without retrying');
+    });
+  } finally {
+    try {if(caller)await caller.close();} finally {endpoint.closeAllConnections();await new Promise<void>(resolve=>endpoint.close(()=>resolve()));await f.close();}
+  }
+});
+
 function stdio(dir:string) {
   const child=spawn(process.execPath,['--import','tsx','src/main.ts','stdio','--data-dir',dir],{cwd:process.cwd(),stdio:['pipe','pipe','pipe'],windowsHide:true});
   let buffer='',sequence=0,stdout='',stderr='';const parseErrors:string[]=[];

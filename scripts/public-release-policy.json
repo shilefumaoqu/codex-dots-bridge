@@ -8,6 +8,7 @@
     "docs/上下文接续.md",
     "docs/Dot执行说明.md",
     "docs/维护与故障排查.md",
+    "docs/托盘订阅检查.md",
     "docs/稳定启动入口与升级恢复.md",
     "docs/兼容性与已知限制.md",
     "docs/发布与升级.md",

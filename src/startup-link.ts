@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { ProbeError } from './store.js';
@@ -36,13 +36,27 @@ export function inspectStartupLink(launcher:string,action:'inspect'|'enable'|'di
   const args=['--startup',action,...(expected===undefined?[]:['--expected',expected])];
   let text:string;
   try{text=execFileSync(launcher,args,{encoding:'utf8',windowsHide:true,stdio:'pipe',timeout:15000});}
-  catch(error){
-    try{const value=JSON.parse(String((error as {stdout?:unknown}).stdout??''));if(typeof value.error==='string'&&/^[a-z][a-z0-9_]*$/.test(value.error))throw new ProbeError(value.error);}catch(parsed){if(parsed instanceof ProbeError)throw parsed;}
-    throw new ProbeError('startup_link_operation_failed');
-  }
+  catch(error){throw operationError((error as {stdout?:unknown}).stdout);}
+  return inspectionReceipt(text);
+}
+function operationError(stdout:unknown):ProbeError {
+  try{const value=JSON.parse(String(stdout??''));if(typeof value.error==='string'&&/^[a-z][a-z0-9_]*$/.test(value.error))return new ProbeError(value.error);}catch{}
+  return new ProbeError('startup_link_operation_failed');
+}
+function inspectionReceipt(text:string):LinkInspection {
   let value:LinkInspection;try{value=JSON.parse(text.replace(/^\uFEFF/,'').trim()) as LinkInspection;}catch{throw new ProbeError('invalid_startup_link_receipt');}
   if(value.schema!==1||value.path!==startupPath()||typeof value.exists!=='boolean'||typeof value.owned!=='boolean'||!['enabled','disabled','unknown'].includes(value.windows)||!['enabled','disabled','unknown'].includes(value.legacy_windows)||(value.exists&&(typeof value.content!=='string'||!value.content.length)))throw new ProbeError('invalid_startup_link_receipt');
   return value;
+}
+/** Read-only service inspection. The native helper never blocks the HTTP event loop. */
+export async function inspectStartupLinkAsync(launcher:string):Promise<LinkInspection> {
+  assertLauncherIdentity(launcher);
+  const text=await new Promise<string>((resolve,reject)=>{
+    execFile(launcher,['--startup','inspect'],{encoding:'utf8',windowsHide:true,timeout:2500,maxBuffer:64*1024},(error,stdout)=>{
+      if(error)reject(operationError(stdout));else resolve(stdout);
+    });
+  });
+  return inspectionReceipt(text);
 }
 export function prepareStartupLink(launcher:string,expected?:AutostartEntry):LinkAutostart {
   const current=inspectStartupLink(launcher);

@@ -25,7 +25,10 @@ async function terminal(f: ReturnType<typeof fixture>) {
 }
 test('durable single reservation: concurrent duplicates, exact ACK turn and future marker, nonce, unchanged forward tables', async () => {
   let calls = 0; let f: ReturnType<typeof fixture>;
-  f = fixture({ runIpc: async input => {
+  // This checks reservation/identity semantics, not a 100ms performance deadline.
+  // Leave room for Windows filesystem and runner scheduling; timeout cases keep
+  // the short fixture budget. The production 60-second limit is unchanged.
+  f = fixture({ timeoutMs: 2000, runIpc: async input => {
     calls++; assert.equal(input.threadId, f.thread); assert.equal(input.requestId, f.request);
     const stored = JSON.parse((f.db.prepare('SELECT data FROM desktop_echo_requests WHERE request_id=?').get(f.request) as {data: string}).data);
     assert.equal(stored.result.status, 'pending'); assert.equal(stored.sent, false);
@@ -36,7 +39,7 @@ test('durable single reservation: concurrent duplicates, exact ACK turn and futu
   try {
     const values = await Promise.all(Array.from({ length: 20 }, async () => f.service.start({ request_id: f.request })));
     assert(values.every(value => value.status === 'pending')); const result = await terminal(f);
-    assert.equal(result.status, 'completed_match'); assert.equal(result.verification, 'exact_turn_echo'); assert.equal(result.echo, echoMarker(f.request)); assert.match(result.receipt_nonce!, /^[a-f0-9]{64}$/);
+    assert.equal(result.status, 'completed_match', JSON.stringify(result)); assert.equal(result.verification, 'exact_turn_echo'); assert.equal(result.echo, echoMarker(f.request)); assert.match(result.receipt_nonce!, /^[a-f0-9]{64}$/);
     assert.deepEqual(f.service.start({ request_id: f.request }), result); assert.equal(calls, 1);
     const stored = JSON.parse((f.db.prepare('SELECT data FROM desktop_echo_requests WHERE request_id=?').get(f.request) as {data:string}).data);
     assert.equal(stored.turn_id, f.turn); assert.match(stored.acknowledged_at, /^\d{4}-/);
